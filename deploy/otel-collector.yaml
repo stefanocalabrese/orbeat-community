@@ -1,0 +1,38 @@
+# OpenTelemetry Collector for the LOCAL dev stack (fable-audit §7 #17).
+# Profile-gated: nothing here runs unless `--profile observability` is named.
+#
+# Traces go to Jaeger for a UI; metrics go to the debug exporter. The metrics
+# side is not decoration — it is why this collector exists at all. Jaeger
+# accepts OTLP traces natively but answers Unimplemented for OTLP metrics, and
+# internal/telemetry points BOTH exporters at one endpoint with no
+# otel.SetErrorHandler installed, so a Jaeger-only stack would make api and
+# gateway emit an unstructured gRPC error every export cycle forever.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  # NOT `jaeger:` — that exporter was REMOVED from the Collector and the
+  # obvious spelling fails at startup with `unknown type: "jaeger"`.
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

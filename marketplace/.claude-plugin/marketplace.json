@@ -1,0 +1,14 @@
+{
+  "name": "orbeat",
+  "owner": {
+    "name": "orbeat"
+  },
+  "description": "orbeat - governed AI-agent capabilities",
+  "plugins": [
+    {
+      "name": "orbeat-gateway",
+      "source": "./plugins/orbeat-gateway",
+      "description": "Connect to your entitled orbeat MCP gateway (SSO/OAuth)."
+    }
+  ]
+}

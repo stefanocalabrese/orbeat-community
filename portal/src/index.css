@@ -1,0 +1,96 @@
+@import "tailwindcss";
+
+/* ---- design tokens (brand: black · blue · purple; cool-slate neutrals) ---- */
+:root {
+  --bg: #f5f6f9; --surface: #ffffff; --surface-2: #eef0f5; --inset: #f8f9fb;
+  --border: #e2e5ee; --border-strong: #d2d6e2;
+  --text: #16161c; --muted: #565c6e; --faint: #676d81;
+  --accent: #412a4f; --accent-weak: #ece4ef; --accent-ink: #2f1c39;
+  --blue: #1d4ed8; --blue-weak: #e6edfd; --blue-ink: #1c3fa8;
+  --ok: #0f7a54; --ok-weak: #e2f4ec; --ok-solid: #0a6042;
+  --warn: #9a5a08; --warn-weak: #fbeed9;
+  --danger: #b21739; --danger-weak: #fbe4ea;
+  --info: #0b6f88; --info-weak: #ddf1f6;
+  --shadow: 0 1px 2px rgba(24,28,45,.05), 0 6px 20px -12px rgba(24,28,45,.18);
+  --shadow-sm: 0 1px 2px rgba(24,28,45,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0c0c11; --surface: #15161d; --surface-2: #1c1e27; --inset: #101017;
+    --border: #262a36; --border-strong: #333846;
+    --text: #e7e9f1; --muted: #9aa0b1; --faint: #828a9e;
+    --accent: #8360a0; --accent-weak: #241a2e; --accent-ink: #c9b0dd;
+    --blue: #6ea8fe; --blue-weak: #13223f; --blue-ink: #9cc3ff;
+    --ok: #35d39a; --ok-weak: #10231d; --ok-solid: #0d8054;
+    --warn: #f2b45a; --warn-weak: #241c10;
+    --danger: #fb7793; --danger-weak: #26121a;
+    --info: #37c9e6; --info-weak: #0c1f26;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.6);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f5f6f9; --surface: #ffffff; --surface-2: #eef0f5; --inset: #f8f9fb;
+  --border: #e2e5ee; --border-strong: #d2d6e2;
+  --text: #16161c; --muted: #565c6e; --faint: #676d81;
+  --accent: #412a4f; --accent-weak: #ece4ef; --accent-ink: #2f1c39;
+  --blue: #1d4ed8; --blue-weak: #e6edfd; --blue-ink: #1c3fa8;
+  --ok: #0f7a54; --ok-weak: #e2f4ec; --ok-solid: #0a6042;
+  --warn: #9a5a08; --warn-weak: #fbeed9; --danger: #b21739; --danger-weak: #fbe4ea;
+  --info: #0b6f88; --info-weak: #ddf1f6;
+  --shadow: 0 1px 2px rgba(24,28,45,.05), 0 6px 20px -12px rgba(24,28,45,.18);
+  --shadow-sm: 0 1px 2px rgba(24,28,45,.06);
+}
+:root[data-theme="dark"] {
+  --bg: #0c0c11; --surface: #15161d; --surface-2: #1c1e27; --inset: #101017;
+  --border: #262a36; --border-strong: #333846;
+  --text: #e7e9f1; --muted: #9aa0b1; --faint: #828a9e;
+  --accent: #8360a0; --accent-weak: #241a2e; --accent-ink: #c9b0dd;
+  --blue: #6ea8fe; --blue-weak: #13223f; --blue-ink: #9cc3ff;
+  --ok: #35d39a; --ok-weak: #10231d; --ok-solid: #0d8054;
+  --warn: #f2b45a; --warn-weak: #241c10; --danger: #fb7793; --danger-weak: #26121a;
+  --info: #37c9e6; --info-weak: #0c1f26;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.6);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+}
+
+/* ---- expose tokens to Tailwind's utility namespace (theme-adaptive) ---- */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-inset: var(--inset);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-weak: var(--accent-weak);
+  --color-accent-ink: var(--accent-ink);
+  --color-blue: var(--blue);
+  --color-blue-weak: var(--blue-weak);
+  --color-blue-ink: var(--blue-ink);
+  --color-ok: var(--ok);
+  --color-ok-weak: var(--ok-weak);
+  --color-ok-solid: var(--ok-solid);
+  --color-warn: var(--warn);
+  --color-warn-weak: var(--warn-weak);
+  --color-danger: var(--danger);
+  --color-danger-weak: var(--danger-weak);
+  --color-info: var(--info);
+  --color-info-weak: var(--info-weak);
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+
+/* ---- base ---- */
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 { letter-spacing: -0.02em; text-wrap: balance; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }

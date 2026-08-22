@@ -1,0 +1,30 @@
+# A minimal, pushable git server over the git:// protocol, used ONLY by
+# scripts/smoke-remote.sh to exercise the marketplace publisher's REMOTE push
+# path (isRemote()==true), which the default stack never runs (it publishes
+# commit-in-place to a local path).
+#
+# Why git:// and not file:// or https://
+#   - The real api runs on gcr.io/distroless/static-debian12 — no git binary,
+#     no shell. go-git's file:// and ssh transports SHELL OUT to git-*-pack
+#     binaries (plumbing/transport/file/client.go), so they CANNOT run on the
+#     distroless image. http/https and git:// are PURE-GO transports and do.
+#   - Production uses https://; git:// exercises the same transport-agnostic
+#     publisher logic with a fraction of the infra (no CGI/web server). Auth
+#     (credential-ref resolution) is out of scope here — this smoke gates the
+#     push-gate fix, which is above the transport, not credential handling.
+FROM alpine:3.20
+
+# git-daemon is a separate Alpine subpackage — the base `git` package does NOT
+# ship the `git daemon` subcommand.
+RUN apk add --no-cache git git-daemon
+
+COPY deploy/gitserver-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 9418
+
+# Healthy once the daemon answers a ref advertisement for the served repo.
+HEALTHCHECK --interval=3s --timeout=3s --start-period=2s --retries=15 \
+  CMD git ls-remote git://localhost:9418/marketplace.git >/dev/null 2>&1 || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

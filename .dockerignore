@@ -1,0 +1,24 @@
+.git
+bin
+.env
+*.local
+docs
+*.md
+.github
+.idea
+.vscode
+.DS_Store
+# Frontend build/test artifacts. portal/node_modules is ~200 MB of host
+# (darwin-arm64) modules that `COPY portal/ .` would otherwise merge OVER the
+# image's fresh Linux `npm ci` install — a platform-path collision CI can't
+# reproduce. The rest are local-only outputs that bloat the build context.
+portal/node_modules
+portal/dist
+portal/coverage
+portal/test-results
+portal/playwright-report
+# Agent/tooling state and the generated marketplace tree (not copied into any
+# image; the api renders its own at runtime).
+.remember
+.claude
+marketplace

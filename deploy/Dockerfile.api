@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+# Pin the Go minor line to match go.mod (1.26.x); the patch still floats
+# within 1.26, but Go's toolchain directive reconciles it to go.mod's exact
+# version. The major-only `golang:1-alpine` tag silently pulls a whole newer
+# minor at build time — an unpinned network fetch that can drift the build.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+# go.sum is copied if present; harmless when absent at this stage.
+COPY go.su[m] ./
+# Cache the module download + build caches across builds (BuildKit cache mounts).
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+# VERSION defaults to "dev" so a plain local `docker build` (no --build-arg)
+# still produces a working, honestly-labeled image; release.yml's images job
+# passes the real tag via --build-arg. -ldflags -X is the only thing that
+# makes internal/version.Version (served in GET /openapi.yaml's info.version)
+# anything other than "dev" (fable-audit §7 #15).
+ARG VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -ldflags "-X github.com/stefanocalabrese/orbeat/internal/version.Version=${VERSION}" -o /out/orbeat-api ./cmd/api
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/orbeat-api /orbeat-api
+EXPOSE 8080
+USER nonroot:nonroot
+# Container healthcheck via the binary's own self-probe (distroless has no shell
+# or curl). Compose wires HEALTHCHECK; kept here as the image-level default too.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=20 \
+  CMD ["/orbeat-api", "-healthcheck"]
+ENTRYPOINT ["/orbeat-api"]

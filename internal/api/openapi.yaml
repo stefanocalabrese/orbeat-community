@@ -1,0 +1,1890 @@
+openapi: 3.0.3
+info:
+  title: orbeat-api
+  description: >-
+    orbeat-api — the governed catalog / entitlements / artifacts / audit control-plane API.
+    OAuth 2.1 resource server (audience `orbeat-api`); most routes require a bearer access token,
+    admin routes additionally require the `orbeat-admin` realm role.
+  # Deliberately not a real version: internal/api's openapi_version.go
+  # substitutes this exact placeholder for internal/version.Version at
+  # serve time (openapi.yaml can't take a linker -ldflags substitution the
+  # way a Go binary can — see that file's doc comment). If you ever see this
+  # literal value served from GET /openapi.yaml, the substitution broke.
+  version: 0.0.0-UNSET
+servers:
+  - url: /
+    description: The orbeat-api server (relative to its deployed origin).
+tags:
+  - name: meta
+    description: Unauthenticated liveness/self-description endpoints.
+  - name: identity
+    description: Caller identity introspection.
+  - name: catalog
+    description: The self-service, RBAC-filtered MCP server catalog.
+  - name: sync
+    description: Channel-2 (orbeat-sync client) entitled-artifact + config endpoints.
+  - name: servers
+    description: Admin CRUD over the MCP server catalog.
+  - name: roles
+    description: Admin CRUD over roles.
+  - name: users
+    description: Admin removal of a catalog user (identity resolved from the IdP; no create/update, see the DELETE operation description).
+  - name: entitlements
+    description: Admin CRUD over role → MCP-server entitlements.
+  - name: artifacts
+    description: Admin CRUD + approval-workflow transitions over catalog artifacts (skills/subagents/rules).
+  - name: artifact-entitlements
+    description: Admin CRUD over role → artifact entitlements (role-visibility distribution).
+  - name: audit
+    description: Admin read + export of the audit log.
+  - name: marketplace
+    description: Admin control of the Channel-1 (native marketplace) publish pipeline.
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      tags: [meta]
+      summary: Liveness probe.
+      security: []
+      responses:
+        "200":
+          description: OK.
+  /openapi.yaml:
+    get:
+      tags: [meta]
+      summary: This OpenAPI document.
+      security: []
+      responses:
+        "200":
+          description: The OpenAPI 3.0 spec (YAML).
+          content:
+            application/yaml: {}
+
+  /v1/me:
+    get:
+      tags: [identity]
+      summary: Return the caller's token-derived identity.
+      description: >-
+        Authenticated only (no DB resolve/RBAC) — reflects the validated bearer token's
+        subject/email/realm-roles as-is.
+      responses:
+        "200":
+          description: The caller's identity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/catalog:
+    get:
+      tags: [catalog]
+      summary: List the MCP servers the caller is entitled to.
+      description: >-
+        RBAC-filtered by the caller's resolved roles; only `active` servers are returned.
+        `allowedTools: null` means all tools on that server are permitted.
+      responses:
+        "200":
+          description: The caller's visible catalog.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/sync/artifacts:
+    get:
+      tags: [sync]
+      summary: List the caller's entitled role-visibility artifacts, rendered to final file content.
+      description: >-
+        Content is ready-to-write (e.g. subagent memory frontmatter already injected).
+        Org-visibility artifacts are never returned here — they ship via the Channel-1 plugin.
+      responses:
+        "200":
+          description: The caller's entitled artifacts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncArtifactsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/sync/config:
+    get:
+      tags: [sync]
+      summary: Advertise client bootstrap config (currently just the gateway resource URL).
+      responses:
+        "200":
+          description: Sync client bootstrap config.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncConfigResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/servers:
+    post:
+      tags: [servers]
+      summary: Create an MCP server catalog entry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServerInput"
+      responses:
+        "201":
+          description: The created server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMCPServer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/PaymentRequired"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [servers]
+      summary: List MCP server catalog entries for the tenant, keyset-paginated.
+      parameters:
+        - $ref: "#/components/parameters/ListLimit"
+        - $ref: "#/components/parameters/ListCursor"
+      responses:
+        "200":
+          description: A page of catalog entries (admin view, includes disabled/draft).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListServersResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/servers/{id}:
+    get:
+      tags: [servers]
+      summary: Fetch one MCP server catalog entry.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: The server.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMCPServer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    put:
+      tags: [servers]
+      summary: Replace an MCP server catalog entry.
+      description: >-
+        Requires If-Match (optimistic concurrency, spec §5) — obtain the
+        current row_version from GET's `ETag` header or `rowVersion` body
+        field first.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServerInput"
+      responses:
+        "200":
+          description: The updated server.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMCPServer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/PaymentRequired"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    delete:
+      tags: [servers]
+      summary: Delete an MCP server catalog entry.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/roles:
+    post:
+      tags: [roles]
+      summary: Create a role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoleInput"
+      responses:
+        "201":
+          description: The created role.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Role"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/PaymentRequired"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [roles]
+      summary: List roles for the tenant, keyset-paginated.
+      parameters:
+        - $ref: "#/components/parameters/ListLimit"
+        - $ref: "#/components/parameters/ListCursor"
+      responses:
+        "200":
+          description: A page of roles.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListRolesResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/roles/{id}:
+    delete:
+      tags: [roles]
+      summary: Delete a role.
+      description: >-
+        CASCADES: deletes every entitlement AND artifact entitlement granted to this role
+        (ON DELETE CASCADE in the schema — one statement, no application code involved).
+        This is intentional — the protection is legibility, not prevention. The response
+        reports exactly what was revoked, and the same counts plus the revoked servers'
+        and artifacts' names are recorded in the audit log (action `role.delete`) so a
+        mistaken deletion is recoverable by inspection (an operator can read what was
+        revoked and re-grant it) — it is NOT reversible; there is no undo. Unlike its
+        sibling deletes (servers, entitlements), this returns 200 with the revoked counts
+        rather than 204: the caller cannot compute them client-side, since the entitlement
+        and artifact-entitlement lists are capped by default pagination. No If-Match is
+        required — a DELETE is an explicit destructive act, not a replay of stale field
+        values (spec §2 "Out — If-Match").
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: Deleted; the counts of what the cascade revoked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleDeleteResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/users/{id}:
+    delete:
+      tags: [users]
+      summary: Delete a user.
+      description: >-
+        Removes a catalog user row (the identity created by an authenticated request via
+        UpsertUser). There is no create/update: a user row is populated only by
+        authentication, never by an admin API call. Unlike DELETE /v1/admin/roles/{id},
+        this has no cascade to revoke: no table in the schema holds a foreign key to
+        users.id (role membership is reconciled from token claims on every request, not
+        a stored user-role table), so this returns 200 with the identity it destroyed
+        (subject, email, displayName) rather than a count of revoked grants, and the
+        same identity is recorded in the audit log (action `user.delete`). Deletion is
+        not a ban: a deleted subject who authenticates again is upserted afresh and
+        consumes a Community seat again if one is free. No If-Match is required, matching
+        the other admin deletes (spec §2 "Out, with reasons, not oversights").
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: Deleted; the identity that was removed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserDeleteResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/entitlements:
+    post:
+      tags: [entitlements]
+      summary: Grant a role access to an MCP server.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EntitlementInput"
+      responses:
+        "201":
+          description: The created entitlement.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entitlement"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [entitlements]
+      summary: List entitlements for the tenant, keyset-paginated.
+      parameters:
+        - $ref: "#/components/parameters/ListLimit"
+        - $ref: "#/components/parameters/ListCursor"
+      responses:
+        "200":
+          description: A page of entitlements (admin view).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListEntitlementsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/entitlements/{id}:
+    delete:
+      tags: [entitlements]
+      summary: Revoke an entitlement.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/audit:
+    get:
+      tags: [audit]
+      summary: List audit events, newest first, keyset-paginated.
+      parameters:
+        - name: limit
+          in: query
+          description: Page size (default 100, capped at 1000). Must be a positive integer.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: cursor
+          in: query
+          description: Opaque keyset cursor from a prior response's `nextCursor` (base64url("<unixNano>:<id>")).
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of audit events.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditPageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/audit/export:
+    get:
+      tags: [audit]
+      summary: Stream all audit events in an optional date range as JSON or CSV.
+      description: >-
+        Row-by-row streaming (no full-result materialization). Response is a bare JSON array
+        (not wrapped in an envelope) for `format=json`, or a CSV document for `format=csv`.
+        A truncation is signaled via the `X-Orbeat-Export-Truncated` response header (set before
+        any body byte is written), never via a change to the 200 status.
+      parameters:
+        - name: from
+          in: query
+          description: Inclusive lower bound — a date (YYYY-MM-DD) or RFC3339 timestamp. Omit for unbounded.
+          required: false
+          schema:
+            type: string
+        - name: to
+          in: query
+          description: >-
+            Inclusive upper bound — a date (YYYY-MM-DD, extended to end-of-day) or RFC3339
+            timestamp. Omit for unbounded.
+          required: false
+          schema:
+            type: string
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [json, csv]
+            default: json
+      responses:
+        "200":
+          description: The exported audit events.
+          headers:
+            X-Orbeat-Export-Truncated:
+              description: Present with value "true" when more rows matched than the export row cap.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AuditEvent"
+            text/csv:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts:
+    post:
+      tags: [artifacts]
+      summary: Create a catalog artifact (skill, subagent, or rule) as a draft.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ArtifactInput"
+      responses:
+        "201":
+          description: The created artifact.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [artifacts]
+      summary: List artifacts for the tenant, keyset-paginated and slim by default.
+      description: >-
+        Rows omit the heavy content fields (content, approvedContent, memorySeed,
+        approvedMemorySeed — each present as an empty string) unless `include=content`
+        is passed.
+      parameters:
+        - $ref: "#/components/parameters/ListLimit"
+        - $ref: "#/components/parameters/ListCursor"
+        - name: state
+          in: query
+          description: >-
+            Filter to a single approval state. Omit for all states. The four values
+            are exhaustive, not aspirational — migration 00006_artifact_approval.sql
+            puts a CHECK on artifact.approval_state restricting it to exactly these,
+            so a fifth value can never exist in the database. NOTE: the HTTP layer
+            itself does not validate ?state, though — an unrecognized value (e.g. a
+            typo) is not rejected with 400; it simply matches zero rows in SQL and
+            returns an empty 200 page. The enum is safe (it can never under- or
+            over-match), just not authoritative for the API's error behavior.
+          required: false
+          schema:
+            type: string
+            enum: [draft, pending, approved, rejected]
+        - name: include
+          in: query
+          description: >-
+            Pass `content` to restore the heavy fields (content, approvedContent,
+            memorySeed, approvedMemorySeed) that list rows omit by default. Any
+            other non-empty value is rejected with 400.
+          required: false
+          schema:
+            type: string
+            enum: [content]
+      responses:
+        "200":
+          description: A page of artifacts (admin view).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListArtifactsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts/{id}:
+    get:
+      tags: [artifacts]
+      summary: Fetch one artifact.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: The artifact.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    put:
+      tags: [artifacts]
+      summary: Replace an artifact's working copy (returns it to draft).
+      description: >-
+        While a live approved snapshot exists, name/type/visibility are locked — withdraw
+        first to change them. Content/memory edits are always allowed. Requires If-Match
+        (optimistic concurrency, spec §5) — obtain the current row_version from GET's
+        `ETag` header or `rowVersion` body field first.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ArtifactInput"
+      responses:
+        "200":
+          description: The updated artifact.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    delete:
+      tags: [artifacts]
+      summary: Delete an artifact.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts/{id}/submit:
+    post:
+      tags: [artifacts]
+      summary: Submit a draft/rejected artifact for review.
+      description: >-
+        Scans the row-locked working copy inside the transition transaction. A blocking
+        governance finding aborts with 422 and no state change.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: The artifact, now pending review.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ScanBlocked"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts/{id}/approve:
+    post:
+      tags: [artifacts]
+      summary: Approve a pending artifact, freezing the working content into the distributed snapshot.
+      description: >-
+        Separation of duties: the approver must differ from the submitter, else 403.
+        Requires If-Match (optimistic concurrency, spec §1, §5): the reviewer's precondition
+        is checked before the pending-state and self-approve checks, so ANY change to the row
+        since the reviewer's read — including one that also flipped approval_state away from
+        pending — surfaces as 412 ("the content you're approving isn't what you reviewed"),
+        never as a plain 409 ("nothing changed, but this was never approvable").
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "200":
+          description: The artifact, now approved and re-published.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts/{id}/reject:
+    post:
+      tags: [artifacts]
+      summary: Reject a pending artifact, preserving the working copy for edit + resubmit.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectInput"
+      responses:
+        "200":
+          description: The artifact, now rejected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts/{id}/withdraw:
+    post:
+      tags: [artifacts]
+      summary: Clear the approved snapshot, pulling the artifact from distribution.
+      description: >-
+        Unilateral — no approval-state precondition beyond the artifact existing. Returns
+        the working copy to a clean draft (nulls reject reason / submitter / findings).
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: The artifact, now withdrawn (draft, no live snapshot).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts/{id}/revisions:
+    get:
+      tags: [artifacts]
+      summary: List an artifact's approved-version history, newest first, keyset-paginated.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/ListLimit"
+        - $ref: "#/components/parameters/ListCursor"
+      responses:
+        "200":
+          description: A page of the artifact's revision history.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListArtifactRevisionsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts/{id}/rollback:
+    post:
+      tags: [artifacts]
+      summary: Restore a prior approved revision to distribution.
+      description: >-
+        Reverts only the distributed snapshot; the working copy is preserved. Re-publishes
+        to Channel-1. Single-admin action (the target was already approved once).
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RollbackInput"
+      responses:
+        "200":
+          description: The artifact, with the target revision now live.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/marketplace/publish:
+    post:
+      tags: [marketplace]
+      summary: Enqueue a Channel-1 marketplace publish.
+      responses:
+        "202":
+          description: Publish queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MarketplacePublishResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/marketplace/status:
+    get:
+      tags: [marketplace]
+      summary: Report the last publish attempt/success for the tenant's marketplace target.
+      responses:
+        "200":
+          description: The publish status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifact-entitlements:
+    post:
+      tags: [artifact-entitlements]
+      summary: Grant a role access to a role-visibility artifact.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ArtifactEntitlementInput"
+      responses:
+        "201":
+          description: The created artifact entitlement.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactEntitlement"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [artifact-entitlements]
+      summary: List artifact entitlements for the tenant, keyset-paginated.
+      parameters:
+        - $ref: "#/components/parameters/ListLimit"
+        - $ref: "#/components/parameters/ListCursor"
+      responses:
+        "200":
+          description: A page of artifact entitlements (admin view).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListArtifactEntitlementsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifact-entitlements/{id}:
+    delete:
+      tags: [artifact-entitlements]
+      summary: Revoke an artifact entitlement.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdPathParam:
+      name: id
+      in: path
+      required: true
+      description: Resource UUID.
+      schema:
+        type: string
+        format: uuid
+    ListLimit:
+      name: limit
+      in: query
+      description: >-
+        Page size (default 100). Must be a positive integer — 0 or negative is
+        rejected with 400 (`minimum: 1` below IS enforced this way). NOTE:
+        `maximum: 500` is NOT enforced the same way — a limit above 500 is
+        silently clamped to 500 server-side, never rejected. One schema, two
+        different guarantees; do not assume both bounds behave alike.
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+    ListCursor:
+      name: cursor
+      in: query
+      description: >-
+        Opaque keyset cursor from a prior response's `nextCursor`
+        (base64url of a JSON array of the sort-key values plus the row id).
+        Distinct from the /v1/admin/audit cursor format.
+      required: false
+      schema: { type: string }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: >-
+        Optimistic-concurrency precondition (design doc
+        docs/specs/2026-08-11-orbeat-optimistic-concurrency-design.md §5). A
+        strong entity-tag carrying the resource's row_version as the caller
+        last observed it — obtained from a prior response's `ETag` header or
+        `rowVersion` body field, e.g. `"3"`. Required on every request to
+        this operation. Absent, or the literal `*`, is refused with 428
+        Precondition Required: an unconditional overwrite is not permitted
+        here, even though `*` is well-formed per RFC 9110 §13.1.1 — this is
+        a deliberate policy choice, not a parser limitation. A malformed
+        value (unquoted, not a positive integer, or more than one
+        entity-tag) is rejected with 400. A well-formed value that does not
+        match the resource's current row_version is rejected with 412
+        Precondition Failed.
+      schema:
+        type: string
+        example: '"3"'
+  headers:
+    ETag:
+      description: >-
+        The resource's row_version after this response, as a strong
+        entity-tag (e.g. `"3"`). Echo it back as `If-Match` on the next
+        write to this resource.
+      schema:
+        type: string
+        example: '"3"'
+    RetryAfter:
+      description: >-
+        Seconds until the caller's per-principal token bucket has a token
+        available again (RFC 9110 §10.2.3), rounded up with a floor of 1.
+        Deliberately not exposed cross-origin (docs/specs/2026-08-12-orbeat-rate-limiting-design.md
+        §5.1) — nothing in the portal or `orbeat-sync` currently reads it.
+      schema:
+        type: integer
+        example: 5
+  responses:
+    BadRequest:
+      description: Invalid request (malformed body, missing/invalid field).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing, expired, or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Caller lacks the required realm role, or violates separation of duties (self-approval).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource does not exist (or belongs to another tenant).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: State conflict — e.g. a lifecycle transition from the wrong state, or a name/slug collision.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Request body exceeds the 1 MiB cap.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ScanBlocked:
+      description: Submission blocked by the governance content scanner.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ScanBlockedError"
+    PreconditionFailed:
+      description: >-
+        If-Match is well-formed but does not match the resource's current
+        row_version (RFC 9110 §13.1.1) — someone else changed it since you
+        read it. Reload and reapply your change; do not silently retry
+        (a no-op retry of an identical write still bumps row_version, so a
+        retried write can itself 412 even though nothing else changed).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PreconditionRequired:
+      description: >-
+        If-Match was missing, or was the literal `*` (refused rather than
+        honoured — see the IfMatch parameter description). RFC 6585 §3.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TooManyRequests:
+      description: >-
+        The caller's per-principal (subject + OAuth client) token bucket is
+        exhausted (docs/specs/2026-08-12-orbeat-rate-limiting-design.md §5.1).
+        Every authenticated route is limited, including GET /v1/me — it sits
+        outside the shared middleware closures and is wired individually.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PaymentRequired:
+      description: >-
+        A Community edition write-time cap has been reached (docs/specs/2026-08-19-
+        orbeat-community-caps-design.md §5). Never returned by an Enterprise
+        build, which carries no limit. The body names which cap fired, the
+        limit, the current count and a contact address, since 402 is rare
+        enough that some client libraries handle it poorly.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/LimitError"
+  schemas:
+    Error:
+      type: object
+      description: The error envelope returned on any 4xx/5xx.
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+      required: [error]
+
+    ScanBlockedError:
+      type: object
+      description: The error envelope for a scanner-blocked submission, with the findings that caused it.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            findings:
+              type: array
+              items:
+                $ref: "#/components/schemas/ScanFinding"
+      required: [findings]
+
+    ScanFinding:
+      type: object
+      description: One governance-scanner finding (internal/govern.Finding).
+      properties:
+        rule:
+          type: string
+        severity:
+          type: string
+          enum: [block, warn, info]
+        message:
+          type: string
+
+    LimitError:
+      type: object
+      description: The error envelope for a Community edition write-time cap (402), with the limit that was hit.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            limit:
+              $ref: "#/components/schemas/LimitDetail"
+      required: [limit]
+
+    LimitDetail:
+      type: object
+      description: >-
+        Which Community edition cap was hit, and enough to render a
+        "you hit the free limit" message without parsing the error text.
+      properties:
+        resource:
+          type: string
+          enum: [seats, servers, roles]
+        max:
+          type: integer
+        current:
+          type: integer
+        contact:
+          type: string
+      required: [resource, max, current, contact]
+
+    MeResponse:
+      type: object
+      properties:
+        subject:
+          type: string
+        email:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+          nullable: true
+      required: [subject, email, roles]
+
+    MCPServer:
+      type: object
+      description: The RBAC-filtered catalog projection of an MCP server (never exposes secrets or connection internals).
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        transport:
+          type: string
+          enum: [stdio, http, sse]
+        version:
+          type: string
+        protocolVersion:
+          type: string
+        status:
+          type: string
+          enum: [active, disabled]
+        allowedTools:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: "null means all tools on this server are permitted to the caller."
+      required: [id, name, description, transport, version, protocolVersion, status, allowedTools]
+
+    AdminMCPServer:
+      type: object
+      description: The admin projection of an MCP server — includes the endpoint/command, never the secret value itself.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        transport:
+          type: string
+          enum: [stdio, http, sse]
+        endpointOrCommand:
+          type: string
+        version:
+          type: string
+        protocolVersion:
+          type: string
+        status:
+          type: string
+          enum: [active, disabled]
+        hasSecret:
+          type: boolean
+        hasTlsCa:
+          type: boolean
+          description: >-
+            True when this server carries a tls_ca_ref (design doc
+            docs/specs/2026-08-17-orbeat-gateway-upstream-tls-design.md §4).
+            The gateway verifies this upstream against that CA instead of the
+            system trust pool. Never echoes the reference itself.
+        rowVersion:
+          type: integer
+          format: int64
+          description: >-
+            Optimistic-concurrency token (design doc
+            docs/specs/2026-08-11-orbeat-optimistic-concurrency-design.md §4),
+            maintained by a database trigger and bumped on every UPDATE. Echo
+            it back as `If-Match: "<rowVersion>"` on PUT /v1/admin/servers/{id}.
+      required:
+        [id, name, description, transport, endpointOrCommand, version, protocolVersion, status, hasSecret, hasTlsCa, rowVersion]
+
+    ServerInput:
+      type: object
+      description: >-
+        Admin write DTO for MCP server create/update. secretRef and tlsCaRef are both
+        scheme-prefixed provider references — "env:NAME", "vault:<mount>/<path>#<field>",
+        or "awssm:<name-or-arn>#<jsonkey>" — never a raw secret.
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        transport:
+          type: string
+          enum: [http, sse]
+          description: >-
+            stdio is NOT accepted on write: orbeat-gateway is a remote broker and cannot
+            dial a local stdio subprocess, so such an entry would list in the catalog and
+            yield zero tools. Pre-existing stdio rows remain readable (see the response
+            schema) but can no longer be created or updated — delete them.
+        endpointOrCommand:
+          type: string
+          description: >-
+            For transport http/sse: an absolute http(s) URL with a host and no embedded
+            credentials (userinfo is rejected). Validated at write time — a value that is
+            not such a URL returns 400. For transport stdio this is a command line, not a
+            URL, and only the non-empty requirement applies.
+          example: http://upstream:8000/mcp
+        version:
+          type: string
+        protocolVersion:
+          type: string
+        secretRef:
+          type: string
+          description: >-
+            Optional scheme-prefixed reference to the upstream credential; omit or send an
+            empty string for an unauthenticated upstream. The scheme must be one the server
+            has a provider registered for, and the locator must have that provider's shape
+            ("vault:" needs <mount>/<path>#<field> with all three non-empty, "awssm:" needs
+            a non-empty secret id, "env:" a non-empty variable name). Validated at write
+            time without being resolved, so an unreachable secret backend does not block a
+            write; a malformed reference returns 400. Never echoed back — responses expose
+            only hasSecret.
+          example: vault:kv/orbeat/github#token
+        tlsCaRef:
+          type: string
+          description: >-
+            Optional scheme-prefixed reference to a CA certificate (PEM) used to verify
+            this upstream's TLS certificate instead of the system trust pool; omit or send
+            an empty string to use the system pool. Same scheme/locator rules as secretRef,
+            validated structurally at write time (NOT resolved, and the bytes are not
+            checked to parse as a certificate — that happens at dial time). A malformed
+            reference returns 400. Never echoed back — responses expose only hasTlsCa.
+          example: env:INTERNAL_CA_PEM
+        status:
+          type: string
+          enum: [active, disabled]
+      required: [name, transport, endpointOrCommand, status]
+
+    ListServersResponse:
+      type: object
+      properties:
+        servers:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminMCPServer"
+        limit:
+          type: integer
+          description: The effective page size after clamping.
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [servers, limit, nextCursor]
+
+    CatalogResponse:
+      type: object
+      properties:
+        servers:
+          type: array
+          items:
+            $ref: "#/components/schemas/MCPServer"
+      required: [servers]
+
+    Role:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+      required: [id, name]
+
+    RoleInput:
+      type: object
+      properties:
+        name:
+          type: string
+      required: [name]
+
+    ListRolesResponse:
+      type: object
+      properties:
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/Role"
+        limit:
+          type: integer
+          description: The effective page size after clamping.
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [roles, limit, nextCursor]
+
+    RoleDeleteResponse:
+      type: object
+      description: >-
+        Counts of what deleting a role cascaded away (see the DELETE
+        /v1/admin/roles/{id} operation description). Both fields are always
+        present, even 0 — a role deleted with no grants still reports {0, 0}.
+      properties:
+        entitlementsRevoked:
+          type: integer
+          description: How many MCP-server entitlements this role's deletion cascaded away.
+        artifactEntitlementsRevoked:
+          type: integer
+          description: How many artifact entitlements this role's deletion cascaded away.
+      required: [entitlementsRevoked, artifactEntitlementsRevoked]
+
+    UserDeleteResponse:
+      type: object
+      description: >-
+        The identity deleting a user destroyed (see the DELETE /v1/admin/users/{id}
+        operation description). Unlike RoleDeleteResponse, this carries no cascade
+        counts: a user row has nothing downstream to revoke.
+      properties:
+        subject:
+          type: string
+          description: The IdP subject claim that identified this user.
+        email:
+          type: string
+        displayName:
+          type: string
+      required: [subject, email, displayName]
+
+    Entitlement:
+      type: object
+      description: Grants a role access to an MCP server, optionally narrowed to a set of tools.
+      properties:
+        id:
+          type: string
+          format: uuid
+        roleId:
+          type: string
+          format: uuid
+        mcpServerId:
+          type: string
+          format: uuid
+        allowedTools:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: "null means all tools are allowed."
+        permissions:
+          type: array
+          items:
+            type: string
+      required: [id, roleId, mcpServerId, allowedTools, permissions]
+
+    EntitlementInput:
+      type: object
+      properties:
+        roleId:
+          type: string
+          format: uuid
+        mcpServerId:
+          type: string
+          format: uuid
+        allowedTools:
+          type: array
+          items:
+            type: string
+          nullable: true
+        permissions:
+          type: array
+          items:
+            type: string
+      required: [roleId, mcpServerId]
+
+    ListEntitlementsResponse:
+      type: object
+      properties:
+        entitlements:
+          type: array
+          items:
+            $ref: "#/components/schemas/Entitlement"
+        limit:
+          type: integer
+          description: The effective page size after clamping.
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [entitlements, limit, nextCursor]
+
+    Artifact:
+      type: object
+      description: >-
+        The admin read projection of a catalog artifact (skill/subagent/rule). ApprovalState
+        tracks the working copy; the approved* fields are the frozen snapshot served to
+        clients (absent when no approved snapshot exists yet).
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [skill, subagent, rule]
+        name:
+          type: string
+        description:
+          type: string
+        content:
+          type: string
+          description: >-
+            The artifact body. On GET /v1/admin/artifacts (list), this is an empty
+            string unless the request passed `include=content`; always present on
+            GET /v1/admin/artifacts/{id}.
+        memoryScope:
+          type: string
+          enum: ["", user, project, local]
+        memorySeed:
+          type: string
+          description: >-
+            Governed seed memory body. Same list-vs-single omission as `content`.
+        version:
+          type: string
+        visibility:
+          type: string
+          enum: [org, role]
+        approvalState:
+          type: string
+          enum: [draft, pending, approved, rejected]
+        approved:
+          type: boolean
+          description: Whether a live approved snapshot exists.
+        approvedContent:
+          type: string
+          description: >-
+            The frozen distributed snapshot. Same list-vs-single omission as
+            `content`.
+        approvedMemoryScope:
+          type: string
+        approvedMemorySeed:
+          type: string
+          description: >-
+            The frozen distributed seed memory. Same list-vs-single omission as
+            `content`.
+        submittedBy:
+          type: string
+        approvedBy:
+          type: string
+        rejectReason:
+          type: string
+        scanFindings:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScanFinding"
+        rowVersion:
+          type: integer
+          format: int64
+          description: >-
+            Optimistic-concurrency token (design doc
+            docs/specs/2026-08-11-orbeat-optimistic-concurrency-design.md §4),
+            maintained by a database trigger and bumped on every UPDATE
+            (edit, submit, approve, reject, withdraw, rollback). Echo it back
+            as `If-Match: "<rowVersion>"` on PUT /v1/admin/artifacts/{id} or
+            POST /v1/admin/artifacts/{id}/approve.
+        roleGrants:
+          $ref: "#/components/schemas/ArtifactRoleGrants"
+      required:
+        [id, type, name, description, content, version, visibility, approvalState, approved, rowVersion]
+
+    ArtifactRoleGrants:
+      type: object
+      description: >-
+        The per-role grants (artifact_entitlement rows) attached to one artifact.
+        Returned by GET /v1/admin/artifacts/{id} and PUT /v1/admin/artifacts/{id}
+        only; it is absent on the list route, where a per-row count would cost one
+        query per artifact. Absent therefore means "not derived on this route", not
+        "zero grants": where it is returned it is always present, count 0 and an
+        empty roles array included.
+
+        These grants are LIVE while `visibility` is `role` and DORMANT while it is
+        `org`, because only role-visibility artifacts are distributed through
+        entitlements (GET /v1/sync/artifacts). Changing visibility never deletes
+        them, so a flip back to `role` revives every one of them at once. That is
+        what makes a mistaken flip recoverable, and it is why this field exists: an
+        admin about to flip back needs to see what is about to be restored. The
+        transition itself is recorded in the artifact.update audit event
+        (visibilityFrom / visibilityTo / roleGrantsAffected / roleGrantsEffect /
+        roles).
+      properties:
+        count:
+          type: integer
+          description: Exact number of roles holding a grant on this artifact.
+        roles:
+          type: array
+          description: >-
+            Role names, capped at 50. `truncated` reports whether the cap bit;
+            `count` stays exact either way.
+          items:
+            type: string
+        truncated:
+          type: boolean
+      required: [count, roles, truncated]
+
+    ArtifactInput:
+      type: object
+      description: Admin write DTO for artifact create/update (full replace).
+      properties:
+        type:
+          type: string
+          enum: [skill, subagent, rule]
+        name:
+          type: string
+          description: Slug (lowercase, digits, dashes).
+        description:
+          type: string
+        content:
+          type: string
+          description: The on-disk file body (frontmatter + body for skill/subagent; plain text for rule). Hard-capped at 64KiB.
+        memoryScope:
+          type: string
+          enum: ["", user, project, local]
+          description: Subagents only.
+        memorySeed:
+          type: string
+          description: Governed seed memory body; subagents with memoryScope user/project only. Hard-capped at 16KiB.
+        version:
+          type: string
+        visibility:
+          type: string
+          enum: ["", org, role]
+          description: Empty defaults to org.
+      required: [type, name, content]
+
+    ListArtifactsResponse:
+      type: object
+      properties:
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Artifact"
+        limit:
+          type: integer
+          description: The effective page size after clamping.
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [artifacts, limit, nextCursor]
+
+    ArtifactRevision:
+      type: object
+      description: One immutable, once-distributed version of an artifact.
+      properties:
+        revision:
+          type: integer
+        source:
+          type: string
+          enum: [approval, rollback]
+        restoredFrom:
+          type: integer
+          nullable: true
+        content:
+          type: string
+        memoryScope:
+          type: string
+        memorySeed:
+          type: string
+        approvedBy:
+          type: string
+        approvedAt:
+          type: string
+          format: date-time
+        isCurrent:
+          type: boolean
+      required: [revision, source, content, approvedBy, approvedAt, isCurrent]
+
+    ListArtifactRevisionsResponse:
+      type: object
+      properties:
+        revisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRevision"
+        limit:
+          type: integer
+          description: The effective page size after clamping.
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [revisions, limit, nextCursor]
+
+    RejectInput:
+      type: object
+      description: >-
+        Rejection reason. Required, and must be non-empty after trimming
+        whitespace: an absent body, an empty string, or a string of only
+        whitespace is rejected with 400. A present-but-blank reason returns the
+        message "rejection reason is required"; an absent body fails JSON
+        decoding first and returns the generic "invalid JSON body". Both are
+        400.
+      required: [reason]
+      properties:
+        reason:
+          type: string
+
+    RollbackInput:
+      type: object
+      properties:
+        revision:
+          type: integer
+          description: The revision number to restore to distribution.
+      required: [revision]
+
+    PublishStatus:
+      type: object
+      properties:
+        lastAttemptAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastSuccessAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastCommit:
+          type: string
+        lastError:
+          type: string
+      required: [lastAttemptAt, lastSuccessAt, lastCommit, lastError]
+
+    MarketplacePublishResponse:
+      type: object
+      properties:
+        status:
+          type: string
+      required: [status]
+
+    ArtifactEntitlement:
+      type: object
+      description: Grants a role access to a role-visibility artifact.
+      properties:
+        id:
+          type: string
+          format: uuid
+        roleId:
+          type: string
+          format: uuid
+        artifactId:
+          type: string
+          format: uuid
+      required: [id, roleId, artifactId]
+
+    ArtifactEntitlementInput:
+      type: object
+      properties:
+        roleId:
+          type: string
+          format: uuid
+        artifactId:
+          type: string
+          format: uuid
+      required: [roleId, artifactId]
+
+    ListArtifactEntitlementsResponse:
+      type: object
+      properties:
+        artifactEntitlements:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactEntitlement"
+        limit:
+          type: integer
+          description: The effective page size after clamping.
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [artifactEntitlements, limit, nextCursor]
+
+    SyncArtifact:
+      type: object
+      description: One entitled artifact for the Channel-2 sync client, rendered to final file content.
+      properties:
+        type:
+          type: string
+          enum: [skill, subagent, rule]
+        name:
+          type: string
+        content:
+          type: string
+        memoryScope:
+          type: string
+          description: Set only alongside memorySeed (target-path selection).
+        memorySeed:
+          type: string
+          description: Governed ORBEAT-SEED block body.
+      required: [type, name, content]
+
+    SyncArtifactsResponse:
+      type: object
+      properties:
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SyncArtifact"
+      required: [artifacts]
+
+    SyncConfigResponse:
+      type: object
+      properties:
+        gateway_url:
+          type: string
+      required: [gateway_url]
+
+    AuditEvent:
+      type: object
+      description: One audit event (an authorization or runtime decision).
+      properties:
+        id:
+          type: string
+          format: uuid
+        ts:
+          type: string
+          format: date-time
+        actor:
+          type: string
+        action:
+          type: string
+        target:
+          type: string
+        decision:
+          type: string
+          enum: [allow, deny, error]
+        metadata:
+          type: object
+          additionalProperties: true
+      required: [id, ts, actor, action, target, decision, metadata]
+
+    AuditPageResponse:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+        limit:
+          type: integer
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [events, limit, nextCursor]

@@ -1,0 +1,263 @@
+# Fixed project name so containers/networks are `orbeat-*` regardless of the
+# compose file's directory (which otherwise names the project "deploy").
+name: orbeat
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-orbeat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orbeat}
+      POSTGRES_DB: ${POSTGRES_DB:-orbeat}
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      # -h 127.0.0.1 forces a TCP probe. During initdb Postgres opens a
+      # temporary server on the UNIX SOCKET ONLY; a socket pg_isready answers UP
+      # in that window before the real server is listening on TCP (the compose
+      # equivalent of the "don't wait only on the port" testcontainers gotcha).
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orbeat} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7
+    restart: unless-stopped
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # Canonical public (browser-facing) URL — all tokens carry this as `iss`.
+      # The portal and host browser reach Keycloak at http://localhost:8088 and
+      # receive tokens with iss=http://localhost:8088/realms/orbeat.
+      KC_HOSTNAME: "http://localhost:8088"
+      # Allow requests from other hostnames (e.g. keycloak:8080 from containers)
+      # while still issuing the canonical public issuer URL above.
+      KC_HOSTNAME_STRICT: "false"
+      # Let Keycloak derive backchannel (container-to-container) endpoints from
+      # the incoming request URL instead of the public KC_HOSTNAME. This means
+      # the discovery doc's jwks_uri will resolve to keycloak:8080 when fetched
+      # from inside the Docker network — reachable by api/gateway containers.
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      # Enable the KC management health endpoint on port 9000 (KC 26+).
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      # Bind ONLY the dev realm file (not the whole deploy/keycloak/ directory) —
+      # `--import-realm` auto-imports every *.json it finds under the mount, and
+      # both this file and the committed orbeat-realm.prod.json declare
+      # "realm": "orbeat"; mounting the directory let Keycloak import whichever
+      # file it read first and silently skip the other (import order is
+      # filesystem-dependent, not alphabetical), which can leave the stack
+      # bootstrapped from the wrong realm (e.g. the prod template's zero users).
+      - ./keycloak/orbeat-realm.json:/opt/keycloak/data/import/orbeat-realm.json:ro
+    ports:
+      - "127.0.0.1:8088:8080"
+    healthcheck:
+      # KC 26 exposes a management API on port 9000. GET /health/ready returns
+      # {"status":"UP",...} when Keycloak is fully initialised (realm import done).
+      # The image has no curl/wget; we use /dev/tcp for a raw HTTP GET and pipe
+      # stdout directly into grep — no shell variable needed, avoiding YAML
+      # interpolation of $ signs in block scalars.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && printf 'GET /health/ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '\"status\": *\"UP\"' <&3"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    restart: unless-stopped
+    environment:
+      ORBEAT_HTTP_ADDR: ":8080"
+      ORBEAT_DB_URL: "postgres://${POSTGRES_USER:-orbeat}:${POSTGRES_PASSWORD:-orbeat}@postgres:5432/${POSTGRES_DB:-orbeat}?sslmode=disable"
+      # Tokens carry iss=localhost:8088 (browser-facing public issuer).
+      ORBEAT_OIDC_ISSUER: "http://localhost:8088/realms/orbeat"
+      ORBEAT_OIDC_AUDIENCE: "orbeat-api"
+      # Fetch OIDC discovery + JWKS from keycloak:8080 (container-reachable).
+      # With KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true the discovery doc served at
+      # keycloak:8080 returns jwks_uri pointing at keycloak:8080 — reachable here.
+      ORBEAT_OIDC_DISCOVERY_URL: "http://keycloak:8080/realms/orbeat"
+      ORBEAT_CORS_ORIGINS: "http://localhost:8081,http://localhost:5173"
+      # Marketplace git target: in-container ephemeral path writable by the
+      # nonroot (uid 65532) distroless image. /tmp is world-writable; no volume
+      # or bind-mount needed. On every artifact mutation the publisher commits
+      # the rendered tree here in local-commit mode (no remote credentials).
+      # Extract to host with:
+      #   docker compose -f deploy/docker-compose.yml cp api:/tmp/orbeat-marketplace ./orbeat-marketplace-published
+      ORBEAT_MARKETPLACE_GIT_URL: "/tmp/orbeat-marketplace"
+      ORBEAT_GATEWAY_RESOURCE_URL: "http://localhost:8090"
+      # Per-principal rate limiting (docs/specs/2026-08-12-orbeat-rate-limiting-design.md).
+      # The production default (rps=50, burst=200, cmd/api/main.go) is sized
+      # for one interactive admin and is deliberately NOT raised here — this
+      # override exists only because THIS stack also backs `make smoke` and
+      # the portal e2e suite, and three of its specs
+      # (pagination.spec.ts, concurrency.spec.ts, roles.spec.ts) all seed
+      # through the real API as the SAME (subject=boss, client=orbeat-cli)
+      # principal — one shared bucket (internal/ratelimit.KeyFor keys on
+      # subject+client, not per-test). Measured call counts against that one
+      # bucket for a full run: pagination.spec.ts alone issues ~531 (105
+      # server creates + 105 deletes, 105 artifact creates + 105 submits +
+      # 105 deletes, ~6 calls across its other two single-row tests);
+      # concurrency.spec.ts adds ~19; roles.spec.ts adds ~13. Total ~563.
+      # Raised to 1000 (not the plan's originally-proposed 400, which left
+      # only ~15% headroom over the window it modeled — see plan correction
+      # C4, docs/plans/orbeat-rate-limiting-2026-08-12.md): ~78% headroom
+      # over the measured 563, so the gate does not flake on timing, and
+      # slack for a future admin e2e spec to add its own calls to this SAME
+      # bucket without silently re-tripping this limit. If you add such a
+      # spec and it starts flaking here, re-derive the count above — do not
+      # "fix" it by lowering this value or slowing the tests.
+      ORBEAT_RATELIMIT_BURST: "1000"
+      # Unset (the default) resolves to "", which internal/config treats as
+      # "OTel disabled" — no-op providers, zero overhead, exactly as before.
+      # Set it to otel-collector:4317 alongside `--profile observability` to
+      # turn export on. Starting the collector alone does nothing: compose
+      # profiles gate SERVICES, not variables on other services.
+      ORBEAT_OTEL_ENDPOINT: ${ORBEAT_OTEL_ENDPOINT:-}
+      # Artifact revision pruning cap (docs/specs/2026-08-19-orbeat-revision-pruning-design.md).
+      # Unset (the default) resolves to "", which internal/config treats as
+      # "no pruning" (config.ArtifactRevisionKeepN). Do NOT hard-code a value
+      # here: this compose file also backs `make up` and the Playwright e2e
+      # job, and portal/e2e/approval.spec.ts approves an artifact twice then
+      # rolls back to revision 1 — a hard-coded cap of 2 would survive with
+      # zero margin (revision 1 pruned by the rollback's own insert), silently
+      # breaking that governance gate for a cause nobody would connect to this
+      # variable. scripts/smoke.sh exports its own value before bringing the
+      # stack up, exercising the cap without touching make up/e2e.
+      ORBEAT_ARTIFACT_REVISION_KEEP: ${ORBEAT_ARTIFACT_REVISION_KEEP:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    # Self-probe healthcheck: the distroless image has no shell/curl, so the
+    # binary probes its own /healthz (reads ORBEAT_HTTP_ADDR). This makes
+    # `depends_on: service_healthy` meaningful for the portal below.
+    healthcheck:
+      test: ["CMD", "/orbeat-api", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+
+  upstream:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.upstream
+    ports:
+      - "127.0.0.1:9000:9000"
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gateway
+    restart: unless-stopped
+    environment:
+      # NOTE: the gateway listens on :8090 (its own port, distinct from the api's
+      # :8080). The published port below maps host 8090 -> container 8090.
+      ORBEAT_HTTP_ADDR: ":8090"
+      ORBEAT_DB_URL: "postgres://${POSTGRES_USER:-orbeat}:${POSTGRES_PASSWORD:-orbeat}@postgres:5432/${POSTGRES_DB:-orbeat}?sslmode=disable"
+      # Tokens carry iss=localhost:8088 (browser-facing public issuer).
+      ORBEAT_OIDC_ISSUER: "http://localhost:8088/realms/orbeat"
+      # The gateway is a distinct OAuth 2.1 resource server (RFC 8707 audience).
+      ORBEAT_OIDC_AUDIENCE: "orbeat-gateway"
+      # Fetch OIDC discovery + JWKS from keycloak:8080 (container-reachable).
+      ORBEAT_OIDC_DISCOVERY_URL: "http://keycloak:8080/realms/orbeat"
+      ORBEAT_TENANT_NAME: "default"
+      ORBEAT_GATEWAY_RESOURCE_URL: "http://localhost:8090"
+      # Unset (the default) resolves to "", which internal/config treats as
+      # "OTel disabled" — no-op providers, zero overhead, exactly as before.
+      # Set it to otel-collector:4317 alongside `--profile observability` to
+      # turn export on. Starting the collector alone does nothing: compose
+      # profiles gate SERVICES, not variables on other services.
+      ORBEAT_OTEL_ENDPOINT: ${ORBEAT_OTEL_ENDPOINT:-}
+    ports:
+      - "127.0.0.1:8090:8090"
+    healthcheck:
+      test: ["CMD", "/orbeat-gateway", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      upstream:
+        condition: service_started
+      # Same reason as the prod stack: orbeat-api is the only service that runs
+      # migrations, and the gateway reads that schema directly. Without this edge
+      # the gateway can start against a not-yet-migrated database.
+      api:
+        condition: service_healthy
+
+  portal:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.portal
+    restart: unless-stopped
+    environment:
+      ORBEAT_HTTP_ADDR: ":8081"
+      # CSP connect-src origins the SPA is allowed to call from the browser:
+      # api (:8080), Keycloak (:8088), gateway (:8090). REQUIRED — without it
+      # the portal's CSP is 'self'-only and the browser blocks all API/OIDC
+      # calls. Must match the VITE_* origins baked into the portal image.
+      ORBEAT_PORTAL_CONNECT_SRC: "http://localhost:8080 http://localhost:8088 http://localhost:8090"
+      # Runtime config served at /config.json (fetched by the SPA at boot via
+      # loadConfig()) — the same origins baked into the VITE_* build-time
+      # fallback, so the containerized path exercises the runtime seam on
+      # every run instead of relying on values frozen at image build.
+      ORBEAT_PORTAL_API_BASE: "http://localhost:8080"
+      ORBEAT_PORTAL_GATEWAY_URL: "http://localhost:8090"
+      ORBEAT_PORTAL_OIDC_AUTHORITY: "http://localhost:8088/realms/orbeat"
+      ORBEAT_PORTAL_OIDC_CLIENT_ID: "orbeat-portal"
+      ORBEAT_PORTAL_MARKETPLACE_SOURCE: "./marketplace"
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "/orbeat-portal", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    # Wait for the api and Keycloak to be HEALTHY (not merely started) — both now
+    # have healthchecks, so the portal no longer races them at boot.
+    depends_on:
+      api:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+
+  # ── observability (opt-in) ───────────────────────────────────────────────
+  # Neither service starts unless `--profile observability` is named, so the
+  # default stack is the same six services it has always been. Turning them on
+  # is not enough by itself: api and gateway only export when
+  # ORBEAT_OTEL_ENDPOINT is set (see their environment blocks).
+  #
+  # Teardown needs the flag too — `docker compose down -v` WITHOUT it leaves
+  # these running and still exits 0. `make down` carries it.
+  otel-collector:
+    profiles: [observability]
+    image: otel/opentelemetry-collector:0.132.0
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
+    # Deliberately NO published port: api and gateway reach 4317 over the
+    # compose network by service name. Publishing it would add host exposure
+    # for nothing.
+    depends_on:
+      - jaeger
+
+  jaeger:
+    profiles: [observability]
+    image: jaegertracing/jaeger:2.11.0
+    ports:
+      # Loopback-bound, matching every other published port in this file
+      # (v1.17.0 moved them off 0.0.0.0 after the audit).
+      - "127.0.0.1:16686:16686"

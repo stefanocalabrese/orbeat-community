@@ -1,0 +1,8 @@
+{
+  "name": "orbeat-gateway",
+  "version": "0.1.0",
+  "description": "Connect to your entitled orbeat MCP gateway (SSO/OAuth).",
+  "author": {
+    "name": "orbeat"
+  }
+}

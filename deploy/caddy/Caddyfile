@@ -1,0 +1,23 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# Primary domain: portal (root) + api (/v1) — same origin, so browser->api needs
+# no CORS. The gateway and Keycloak each get their OWN subdomain because both
+# serve root-level paths that a path-prefix would break: Keycloak's admin/asset
+# relative paths, and the gateway's RFC 9728 metadata (it advertises
+# <resource>/.well-known/oauth-protected-resource and serves /mcp + the
+# well-known at its origin ROOT — under a /mcp path prefix the discovery URL
+# would 404 and MCP OAuth could not complete).
+{$ORBEAT_DOMAIN} {
+	reverse_proxy /v1/*  api:8080
+	reverse_proxy *      portal:8081
+}
+
+auth.{$ORBEAT_DOMAIN} {
+	reverse_proxy keycloak:8080
+}
+
+mcp.{$ORBEAT_DOMAIN} {
+	reverse_proxy gateway:8090
+}

@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+# Pin the Go minor line to match go.mod (1.26.x); see Dockerfile.api.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+COPY go.su[m] ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+# VERSION defaults to "dev" so a plain local `docker build` (no --build-arg)
+# still produces a working, honestly-labeled image; release.yml's images job
+# passes the real tag via --build-arg. -ldflags -X is the only thing that
+# makes internal/version.Version (advertised in the gateway's MCP
+# Implementation) anything other than "dev" (fable-audit §7 #15).
+ARG VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -ldflags "-X github.com/stefanocalabrese/orbeat/internal/version.Version=${VERSION}" -o /out/orbeat-gateway ./cmd/gateway
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/orbeat-gateway /orbeat-gateway
+# The gateway serves the MCP broker on :8090 (distinct from the api's :8080).
+EXPOSE 8090
+USER nonroot:nonroot
+# Container healthcheck via the binary's own self-probe (distroless has no shell
+# or curl). Compose wires HEALTHCHECK; kept here as the image-level default too.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=20 \
+  CMD ["/orbeat-gateway", "-healthcheck"]
+ENTRYPOINT ["/orbeat-gateway"]

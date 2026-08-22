@@ -1,0 +1,219 @@
+name: orbeat-prod
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: orbeat
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.prod}
+      POSTGRES_DB: orbeat
+    volumes:
+      # Mounted at /var/lib/postgresql, NOT the pre-18 /var/lib/postgresql/data.
+      # postgres 18 stores its cluster in a major-version subdirectory
+      # (PGDATA=/var/lib/postgresql/18/docker) and moved its declared VOLUME up
+      # one level to match, so the whole directory is what has to persist.
+      # Mounting the old path on 18 does not degrade, it refuses: the entrypoint
+      # exits 1 with "there appears to be PostgreSQL data in ...", and it does so
+      # even when the volume is EMPTY (reported as "unused mount/volume").
+      # See docs/upgrade-guide.md for the 16 -> 18 operator procedure, and
+      # internal/deploy.TestPostgres16To18DumpRestoreRoundTrip for the gate.
+      - orbeat-pgdata:/var/lib/postgresql
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbeat -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backup:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    entrypoint: ["/backup.sh"]
+    environment:
+      PGHOST: postgres
+      PGUSER: orbeat
+      PGDATABASE: orbeat
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set in .env.prod}
+      ORBEAT_BACKUP_INTERVAL: ${ORBEAT_BACKUP_INTERVAL:-86400}
+      ORBEAT_BACKUP_KEEP: ${ORBEAT_BACKUP_KEEP:-7}
+    volumes:
+      - ./postgres/backup.sh:/backup.sh:ro
+      - orbeat-backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7
+    restart: unless-stopped
+    # Production mode. Plain `start` (NOT --optimized) so Keycloak auto-runs the
+    # build step on boot and applies the runtime KC_DB setting; --optimized would
+    # error because `db` is a build-time option. --import-realm imports the
+    # mounted orbeat-realm.prod.json on first boot (idempotent — skipped once the
+    # realm exists in the persistent DB); without it the realm is never created
+    # and the api/gateway get a 404 on OIDC discovery.
+    command: ["start", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: "jdbc:postgresql://postgres:5432/keycloak"
+      KC_DB_USERNAME: orbeat
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.prod}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:?set in .env.prod}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?set in .env.prod}
+      KC_HOSTNAME: "https://auth.${ORBEAT_DOMAIN:?set in .env.prod}"
+      # Derive backchannel (container-to-container) endpoints from the incoming
+      # request URL instead of the public KC_HOSTNAME. Without this, the discovery
+      # doc served at keycloak:8080 returns jwks_uri = the PUBLIC https://auth.<domain>
+      # URL, which the api/gateway cannot resolve inside the compose network (only
+      # Caddy knows that host) — their eager JWKS fetch fails and they never become
+      # healthy. With it, jwks_uri resolves to http://keycloak:8080 (reachable),
+      # while the frontend issuer/authorization endpoints stay on the public host.
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: "xforwarded"
+      # KC_PROXY_TRUSTED_ADDRESSES is intentionally unset: Keycloak requires an
+      # IP/CIDR there (a Docker service name is rejected), and Keycloak boots
+      # before Caddy so a startup lookup has nothing to resolve. The default
+      # (trust the forwarding proxy) is safe here because Keycloak publishes NO
+      # host port — it is reachable only inside the compose network, via Caddy
+      # (front) and the first-party api/gateway (backchannel).
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./keycloak/orbeat-realm.prod.json:/opt/keycloak/data/import/orbeat-realm.json:ro
+    healthcheck:
+      # Probe the REALM's OIDC discovery endpoint (port 8080), not just
+      # /health/ready (port 9000). In production mode Keycloak's readiness can
+      # report UP while a BootstrapFilter still 503s every request (widened by
+      # KC 26.7's slower `start` bootstrap + the realm import) — so /health/ready
+      # lets the api start too early and its one-shot discovery fetch hits a 503.
+      # Gating on a 200 from the realm's discovery doc (the '"issuer"' key is
+      # present only once the realm is genuinely serving) makes `service_healthy`
+      # mean "ready to serve tokens", so dependents never race the bootstrap.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /realms/orbeat/.well-known/openid-configuration HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '\"issuer\"' <&3"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    image: ghcr.io/stefanocalabrese/orbeat-api:1.24.0
+    restart: unless-stopped
+    environment:
+      ORBEAT_HTTP_ADDR: ":8080"
+      ORBEAT_DB_URL: "postgres://orbeat:${POSTGRES_PASSWORD:?set in .env.prod}@postgres:5432/orbeat?sslmode=disable"
+      ORBEAT_OIDC_ISSUER: "https://auth.${ORBEAT_DOMAIN:?set in .env.prod}/realms/orbeat"
+      ORBEAT_OIDC_AUDIENCE: "orbeat-api"
+      ORBEAT_OIDC_DISCOVERY_URL: "http://keycloak:8080/realms/orbeat"
+      ORBEAT_CORS_ORIGINS: "https://${ORBEAT_DOMAIN:?set in .env.prod}"
+      ORBEAT_GATEWAY_RESOURCE_URL: "https://mcp.${ORBEAT_DOMAIN:?set in .env.prod}"
+      ORBEAT_MARKETPLACE_GIT_URL: "/data/marketplace"
+      # Rate limiting (docs/specs/2026-08-12-orbeat-rate-limiting-design.md).
+      # Deliberately UNSET here, not defaulted: the built-in binary default
+      # (rps=50, burst=200, cmd/api/main.go) is the "honest" production
+      # value, sized for one interactive admin. Set these in .env.prod only
+      # if you run a batch/administrative client (a CI job, an orbeat-sync
+      # cron) against this deployment that legitimately needs a higher
+      # budget than an interactive admin — see .env.example.
+      ORBEAT_RATELIMIT_RPS: "${ORBEAT_RATELIMIT_RPS:-}"
+      ORBEAT_RATELIMIT_BURST: "${ORBEAT_RATELIMIT_BURST:-}"
+    volumes:
+      - orbeat-marketplace:/data/marketplace
+    healthcheck:
+      test: ["CMD", "/orbeat-api", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+
+  gateway:
+    image: ghcr.io/stefanocalabrese/orbeat-gateway:1.24.0
+    restart: unless-stopped
+    environment:
+      ORBEAT_HTTP_ADDR: ":8090"
+      ORBEAT_DB_URL: "postgres://orbeat:${POSTGRES_PASSWORD:?set in .env.prod}@postgres:5432/orbeat?sslmode=disable"
+      ORBEAT_OIDC_ISSUER: "https://auth.${ORBEAT_DOMAIN:?set in .env.prod}/realms/orbeat"
+      ORBEAT_OIDC_AUDIENCE: "orbeat-gateway"
+      ORBEAT_OIDC_DISCOVERY_URL: "http://keycloak:8080/realms/orbeat"
+      ORBEAT_TENANT_NAME: "default"
+      ORBEAT_GATEWAY_RESOURCE_URL: "https://mcp.${ORBEAT_DOMAIN:?set in .env.prod}"
+      # Rate limiting — see the api service's comment above. Gateway
+      # built-in defaults: rps=20, burst=60, init-rps=1 (cmd/gateway/main.go).
+      ORBEAT_RATELIMIT_RPS: "${ORBEAT_RATELIMIT_RPS:-}"
+      ORBEAT_RATELIMIT_BURST: "${ORBEAT_RATELIMIT_BURST:-}"
+      ORBEAT_RATELIMIT_INIT_RPS: "${ORBEAT_RATELIMIT_INIT_RPS:-}"
+    healthcheck:
+      test: ["CMD", "/orbeat-gateway", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      # orbeat-api is the ONLY service that applies migrations (migrate.Up runs
+      # synchronously in its boot, before it opens the pool or serves a request),
+      # and the gateway reads the same schema directly via internal/store. Without
+      # this edge a plain `up -d` may start the gateway against a not-yet-migrated
+      # database. api's healthcheck can only answer once migrations are done, so
+      # service_healthy is the condition that actually means "schema is current".
+      api:
+        condition: service_healthy
+
+  portal:
+    image: ghcr.io/stefanocalabrese/orbeat-portal:1.24.0
+    restart: unless-stopped
+    environment:
+      ORBEAT_HTTP_ADDR: ":8081"
+      ORBEAT_PORTAL_API_BASE: "https://${ORBEAT_DOMAIN:?set in .env.prod}"
+      ORBEAT_PORTAL_GATEWAY_URL: "https://mcp.${ORBEAT_DOMAIN:?set in .env.prod}"
+      ORBEAT_PORTAL_OIDC_AUTHORITY: "https://auth.${ORBEAT_DOMAIN:?set in .env.prod}/realms/orbeat"
+      ORBEAT_PORTAL_OIDC_CLIENT_ID: "orbeat-portal"
+      ORBEAT_PORTAL_MARKETPLACE_SOURCE: "./marketplace"
+      ORBEAT_PORTAL_CONNECT_SRC: "https://${ORBEAT_DOMAIN:?set in .env.prod} https://auth.${ORBEAT_DOMAIN:?set in .env.prod} https://mcp.${ORBEAT_DOMAIN:?set in .env.prod}"
+    healthcheck:
+      test: ["CMD", "/orbeat-portal", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      api:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      ORBEAT_DOMAIN: ${ORBEAT_DOMAIN:?set in .env.prod}
+      ACME_EMAIL: ${ACME_EMAIL:?set in .env.prod}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      portal:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+
+volumes:
+  orbeat-pgdata:
+  orbeat-marketplace:
+  orbeat-backups:
+  caddy-data:
+  caddy-config:

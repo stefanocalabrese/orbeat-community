@@ -1,0 +1,15 @@
+orbeat.localhost {
+	tls internal
+	reverse_proxy /v1/*  api:8080
+	reverse_proxy *      portal:8081
+}
+
+auth.orbeat.localhost {
+	tls internal
+	reverse_proxy keycloak:8080
+}
+
+mcp.orbeat.localhost {
+	tls internal
+	reverse_proxy gateway:8090
+}

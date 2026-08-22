@@ -1,0 +1,31 @@
+# Binaries
+/bin/
+*.exe
+# stray binaries from `go build ./cmd/<x>` at repo root
+/api
+/gateway
+/marketplacegen
+
+# Go
+*.test
+*.out
+
+# Env / local
+.env
+*.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# brainstorming visual companion sessions
+.superpowers/
+.remember/
+
+# Portal SPA (portal/ has its own .gitignore, these are belt-and-suspenders)
+portal/node_modules/
+portal/dist/
+
+# Production secrets — only the .example ships.
+deploy/.env.prod
