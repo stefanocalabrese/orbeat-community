@@ -6,9 +6,9 @@ import (
 )
 
 func TestEnvProviderResolves(t *testing.T) {
-	t.Setenv("ORBEAT_TEST_SECRET", "s3cr3t")
+	t.Setenv("ORBEAT_UPSTREAM_TEST_SECRET", "s3cr3t")
 	p := EnvProvider{}
-	got, err := p.Resolve(context.Background(), "ORBEAT_TEST_SECRET")
+	got, err := p.Resolve(context.Background(), "ORBEAT_UPSTREAM_TEST_SECRET")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -19,7 +19,7 @@ func TestEnvProviderResolves(t *testing.T) {
 
 func TestEnvProviderUnsetFailsClosed(t *testing.T) {
 	p := EnvProvider{}
-	if _, err := p.Resolve(context.Background(), "ORBEAT_DEFINITELY_UNSET_VAR"); err == nil {
+	if _, err := p.Resolve(context.Background(), "ORBEAT_UPSTREAM_DEFINITELY_UNSET_VAR"); err == nil {
 		t.Fatal("want error for unset var, got nil")
 	}
 }

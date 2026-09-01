@@ -43,8 +43,23 @@ async function gotoAdmin(page: Page, section: string) {
 const API_BASE = "http://localhost:8080";
 const KC_TOKEN_URL = "http://localhost:8088/realms/orbeat/protocol/openid-connect/token";
 
+/**
+ * This spec's own Keycloak identity. Its four tests seed only a handful of
+ * rows each, so it is not what loads the bucket, but it moves anyway: the
+ * gate in internal/deploy derives its subject set from source (every spec
+ * defining adminToken), and carving out the cheap specs would mean a
+ * hand-maintained exemption list, which is the defect one level up.
+ *
+ * internal/ratelimit keys its token bucket on subject + azp, so every spec
+ * that stays on `boss` shares one bucket with all the others. One constant
+ * feeds both the browser login and the API token so the two can never drift
+ * apart, which would silently put half this spec's traffic back on the
+ * shared bucket.
+ */
+const E2E_USER = "e2e-concurrency";
+
 /** Verbatim from pagination.spec.ts — see that file's doc comment for why. */
-async function adminToken(request: APIRequestContext, user = "boss", pass = "boss"): Promise<string> {
+async function adminToken(request: APIRequestContext, user = E2E_USER, pass = E2E_USER): Promise<string> {
   const res = await request.post(KC_TOKEN_URL, {
     form: { grant_type: "password", client_id: "orbeat-cli", username: user, password: pass },
   });
@@ -170,7 +185,7 @@ test.describe("optimistic concurrency (real API + real browser)", () => {
     const created = await createServer(request, token, name, "active");
     seededServerIds.push(created.id);
 
-    await login(page, "boss", "boss");
+    await login(page, E2E_USER, E2E_USER);
     await gotoAdmin(page, "Servers");
 
     const row = page.locator("tr", { hasText: name });
@@ -221,7 +236,7 @@ test.describe("optimistic concurrency (real API + real browser)", () => {
     const created = await createServer(request, token, name, "active");
     seededServerIds.push(created.id);
 
-    await login(page, "boss", "boss");
+    await login(page, E2E_USER, E2E_USER);
     await gotoAdmin(page, "Servers");
 
     const row = page.locator("tr", { hasText: name });
@@ -302,7 +317,7 @@ test.describe("optimistic concurrency (real API + real browser)", () => {
     const created = await createArtifact(request, token, name, original);
     seededArtifactIds.push(created.id);
 
-    await login(page, "boss", "boss");
+    await login(page, E2E_USER, E2E_USER);
     await gotoAdmin(page, "Artifacts");
 
     await page.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
@@ -369,20 +384,20 @@ test.describe("optimistic concurrency (real API + real browser)", () => {
   // would be asserting the wrong thing — the assertion that matters is that
   // nothing was actually published, checked via the API.
   //
-  // Two distinct admins (boss authors/edits, boss2 reviews), matching
-  // approval.spec.ts's established pattern: approving your own submission
-  // is rejected server-side for an unrelated reason (separation of duties),
-  // and keeping the two concerns apart makes this test unambiguously about
-  // the version check.
+  // Two distinct admins (this spec's own identity authors/edits, boss2
+  // reviews), matching approval.spec.ts's established pattern: approving
+  // your own submission is rejected server-side for an unrelated reason
+  // (separation of duties), and keeping the two concerns apart makes this
+  // test unambiguously about the version check.
   test("a stale approve is rejected with a conflict notice, and nothing is published", async ({ page, request }) => {
-    const bossToken = await adminToken(request, "boss", "boss");
+    const authorToken = await adminToken(request, E2E_USER, E2E_USER);
     const name = `${RUN}-artifact-approve`;
     const v1 = `---\nname: ${name}\ndescription: e2e stale-approve seed\n---\nv1 content\n`;
-    const created = await createArtifact(request, bossToken, name, v1);
+    const created = await createArtifact(request, authorToken, name, v1);
     seededArtifactIds.push(created.id);
 
     const submitRes = await request.post(`${API_BASE}/v1/admin/artifacts/${created.id}/submit`, {
-      headers: { Authorization: `Bearer ${bossToken}` },
+      headers: { Authorization: `Bearer ${authorToken}` },
     });
     expect(submitRes.ok(), `submit: ${submitRes.status()} ${await submitRes.text()}`).toBeTruthy();
 
@@ -399,13 +414,13 @@ test.describe("optimistic concurrency (real API + real browser)", () => {
     // this resets it to draft (store.UpdateArtifact) — then resubmits so it
     // is pending again, at a NEWER row_version than the open card holds.
     const current = await request.get(`${API_BASE}/v1/admin/artifacts/${created.id}`, {
-      headers: { Authorization: `Bearer ${bossToken}` },
+      headers: { Authorization: `Bearer ${authorToken}` },
     });
     expect(current.ok()).toBeTruthy();
     const currentRowVersion = ((await current.json()) as { rowVersion: number }).rowVersion;
 
     const v2 = `---\nname: ${name}\ndescription: e2e stale-approve seed\n---\nv2 content, never reviewed\n`;
-    const editRes = await putArtifact(request, bossToken, created.id, currentRowVersion, {
+    const editRes = await putArtifact(request, authorToken, created.id, currentRowVersion, {
       type: "skill",
       name,
       description: "edited underneath the reviewer",
@@ -418,7 +433,7 @@ test.describe("optimistic concurrency (real API + real browser)", () => {
     expect(editRes.ok(), `underneath edit: ${editRes.status()} ${await editRes.text()}`).toBeTruthy();
 
     const resubmitRes = await request.post(`${API_BASE}/v1/admin/artifacts/${created.id}/submit`, {
-      headers: { Authorization: `Bearer ${bossToken}` },
+      headers: { Authorization: `Bearer ${authorToken}` },
     });
     expect(resubmitRes.ok(), `resubmit: ${resubmitRes.status()} ${await resubmitRes.text()}`).toBeTruthy();
 
@@ -429,7 +444,7 @@ test.describe("optimistic concurrency (real API + real browser)", () => {
     // Nothing was PUBLISHED: no approved snapshot, no revision. This is the
     // governance-critical check — not the UI message above.
     const afterStaleApprove = await request.get(`${API_BASE}/v1/admin/artifacts/${created.id}`, {
-      headers: { Authorization: `Bearer ${bossToken}` },
+      headers: { Authorization: `Bearer ${authorToken}` },
     });
     expect(afterStaleApprove.ok()).toBeTruthy();
     const afterBody = (await afterStaleApprove.json()) as { approved: boolean; approvedContent?: string };
@@ -437,7 +452,7 @@ test.describe("optimistic concurrency (real API + real browser)", () => {
     expect(afterBody.approvedContent, "a stale approve published content the reviewer never saw").toBeFalsy();
 
     const revisionsRes = await request.get(`${API_BASE}/v1/admin/artifacts/${created.id}/revisions`, {
-      headers: { Authorization: `Bearer ${bossToken}` },
+      headers: { Authorization: `Bearer ${authorToken}` },
     });
     expect(revisionsRes.ok()).toBeTruthy();
     const revisionsBody = (await revisionsRes.json()) as { revisions: unknown[] };

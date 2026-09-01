@@ -14,6 +14,10 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
+// certsPath is where authTestServer serves its JWKS, and what the default
+// jwks_uri in its discovery document points at.
+const certsPath = "/protocol/openid-connect/certs"
+
 // authTestServer mints RS256 tokens and serves OIDC discovery + JWKS, mimicking
 // Keycloak closely enough to exercise the full validation path without a container.
 type authTestServer struct {
@@ -21,6 +25,14 @@ type authTestServer struct {
 	signKey          jwk.Key // private, with kid + alg
 	issuer           string  // always equals srv.URL after construction
 	advertisedIssuer string  // the issuer emitted in the discovery document; defaults to issuer
+
+	// advertisedJWKSURI is the jwks_uri emitted in the discovery document. It
+	// defaults to this server's own certs endpoint and exists so a test can point
+	// it at a DIFFERENT origin. Until audit A2 the field did not exist and
+	// jwks_uri was hard-coded to srv.URL, which is why "the keys must come from
+	// the discovery origin" was not an expressible property here: every test in
+	// the package satisfied it by construction, so no test could fail for it.
+	advertisedJWKSURI string
 }
 
 func newAuthTestServer(t *testing.T) *authTestServer {
@@ -52,21 +64,27 @@ func newAuthTestServer(t *testing.T) *authTestServer {
 		if advertised == "" {
 			advertised = ats.issuer
 		}
+		jwks := ats.advertisedJWKSURI
+		if jwks == "" {
+			jwks = ats.srv.URL + certsPath
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"issuer": advertised,
-			// jwks_uri always points at the reachable server — the backend can always fetch it.
-			"jwks_uri": ats.srv.URL + "/protocol/openid-connect/certs",
+			// Default: this server's own certs endpoint, so jwks_uri shares an
+			// origin with the discovery URL, exactly as a real Keycloak's does.
+			"jwks_uri": jwks,
 		})
 	})
-	mux.HandleFunc("/protocol/openid-connect/certs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(certsPath, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		buf, _ := json.Marshal(set)
 		_, _ = w.Write(buf)
 	})
 	ats.srv = httptest.NewServer(mux)
 	ats.issuer = ats.srv.URL
-	ats.advertisedIssuer = ats.srv.URL // default: discovery doc issuer == server URL
+	ats.advertisedIssuer = ats.srv.URL              // default: discovery doc issuer == server URL
+	ats.advertisedJWKSURI = ats.srv.URL + certsPath // default: keys on the discovery origin
 	t.Cleanup(ats.srv.Close)
 	return ats
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,15 +45,23 @@ const (
 type cursorShape []cursorKind
 
 // encodeListCursor serializes a keyset position as
-// base64url(JSON ["<key1>",…,"<keyN>","<id>"]).
+// base64url(JSON ["<sort>","<key1>",…,"<keyN>","<id>"]).
 //
 // Deliberately NOT the audit endpoint's base64url("<a>:<b>"). That encoding is
 // ambiguous the moment a sort key can contain a colon, and these sort keys are
 // user-controlled strings: role names are validated only as non-empty, so a role
 // named "a:b" yields a cursor that decodes to the wrong position. A JSON array
 // is immune to whatever bytes the key contains.
+//
+// The leading "<sort>" element is store.ListCursor.Sort (see its doc comment
+// in internal/store/paging.go for why it exists). Prepending it, rather than
+// appending, means a cursor minted BEFORE this element existed decodes to a
+// JSON array one element SHORTER than any current shape expects, decodeListCursor's
+// existing length check rejects it outright rather than misreading its last
+// element as a sort identity or its first key as something else.
 func encodeListCursor(c store.ListCursor) string {
-	parts := make([]string, 0, len(c.Keys)+1)
+	parts := make([]string, 0, len(c.Keys)+2)
+	parts = append(parts, c.Sort)
 	parts = append(parts, c.Keys...)
 	parts = append(parts, c.ID)
 	// A []string always marshals; the error is structurally unreachable.
@@ -62,6 +71,13 @@ func encodeListCursor(c store.ListCursor) string {
 
 // decodeListCursor parses an opaque cursor, returning a validationError (→ 400)
 // for any malformed input.
+//
+// A cursor encoded before the sort-identity element existed is one element
+// shorter than len(shape)+2 and is rejected right here, by the length check
+// below, before its Sort ever reaches a comparison, it can never be
+// mistaken for a same-length cursor that just happens to carry an empty
+// Sort string (store.ErrCursorSortMismatch, checked downstream in
+// keysetTail, is what refuses THAT case instead).
 func decodeListCursor(s string, shape cursorShape) (*store.ListCursor, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
@@ -71,10 +87,11 @@ func decodeListCursor(s string, shape cursorShape) (*store.ListCursor, error) {
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return nil, validationError{"invalid cursor"}
 	}
-	if len(parts) != len(shape)+1 {
+	if len(parts) != len(shape)+2 {
 		return nil, validationError{"invalid cursor"}
 	}
-	keys := parts[:len(parts)-1]
+	sortID := parts[0]
+	keys := parts[1 : len(parts)-1]
 	id := parts[len(parts)-1]
 	if !uuidRe.MatchString(id) {
 		return nil, validationError{"invalid cursor"}
@@ -118,7 +135,100 @@ func decodeListCursor(s string, shape cursorShape) (*store.ListCursor, error) {
 			return nil, validationError{"invalid cursor"}
 		}
 	}
-	return &store.ListCursor{Keys: keys, ID: id}, nil
+	return &store.ListCursor{Keys: keys, ID: id, Sort: sortID}, nil
+}
+
+// The sort allowlist (docs/plans/orbeat-admin-search-sort-2026-08-27.md Task 2):
+// one query-string value per admin list, defined here in ONE place rather
+// than scattered per handler, so a future addition (or removal) has a single
+// site to change and nowhere else to forget.
+//
+// Every value below is chosen because it is ALREADY that list's production
+// default order (internal/store's roleKeys/mcpServerKeys/entitlementKeys/
+// artifactEntitlementKeys/artifactKeys/virtualKeyKeys) and is confirmed
+// index-backed (internal/store/explain_test.go's TestPaginatedListsUseTheirIndexes,
+// plus its virtual_key sibling this same task adds, see migration 00029).
+// This is deliberately NOT "the first of several planned columns": every
+// other column examined for these six tables (artifact by name alone,
+// mcp_server/role by status, entitlement/artifact_entitlement by a joined
+// server or artifact name) needs an index that does not exist today, and
+// Task 2's rule is "servable by an existing index, or refused", so adding
+// one is coupled to shipping that index first, in its own reviewed migration,
+// not a client-side request. What ?sort DOES add today, safely, is
+// ?order=desc: every list's comparison direction was previously hardcoded
+// ascending in the SQL and is now client-controlled.
+const (
+	roleSortName                = "name"
+	mcpServerSortName           = "name"
+	entitlementSortName         = "role_id"
+	artifactEntitlementSortName = "role_id"
+	artifactSortName            = "type"
+	virtualKeySortName          = "name"
+)
+
+// sortOrderParams parses ?sort and ?order for a list endpoint that offers
+// exactly one sort column today (want, see the allowlist above). An absent
+// ?sort defaults to want; any other value is a validationError (→ 400), never
+// a silent fallback: showing the user a table sorted one way while its column
+// header (or a ?sort the client just sent) claims another is worse than an
+// error. ?order accepts "asc" (default, absent) or "desc"; anything else is
+// also a validationError.
+//
+// This is intentionally a plain string-equality check, not a lookup into a
+// map of many options: with exactly one allowed value per list, a map would
+// have one entry and still forbid everything else, which equality already
+// does, and does more simply. It generalizes without restructuring the
+// moment a second value is added, see the allowlist comment above.
+func sortOrderParams(r *http.Request, want string) (desc bool, err error) {
+	if q := r.URL.Query().Get("sort"); q != "" && q != want {
+		return false, validationError{fmt.Sprintf("sort must be %q", want)}
+	}
+	switch o := r.URL.Query().Get("order"); o {
+	case "", "asc":
+		return false, nil
+	case "desc":
+		return true, nil
+	default:
+		return false, validationError{`order must be "asc" or "desc"`}
+	}
+}
+
+// searchParam returns the ?q= substring search term for a list endpoint that
+// supports search (docs/plans/orbeat-admin-search-sort-2026-08-27.md Task 4):
+// "" for both an absent and an explicitly-empty ?q=, which is deliberate:
+// they mean the same thing to a user (a cleared search box shows everything)
+// and to store.likeSearchArg (paging.go, internal/store), which treats ""
+// as "no filter" for exactly that reason. The raw, un-escaped term is
+// returned; wildcard escaping happens once, at the SQL-building boundary
+// (store.escapeLikeSpecials), not here: this function's only job is
+// reading the query string.
+func searchParam(r *http.Request) string {
+	return r.URL.Query().Get("q")
+}
+
+// refuseSearch rejects ?q= with 400 for a list with no natural text column to
+// search: entitlement and artifact_entitlement (Decision 1,
+// docs/plans/orbeat-admin-search-sort-2026-08-27.md Task 4) sort, and are
+// keyed, for cursor purposes, on role_id, a uuid, with no name or other free
+// text of their own a substring match could compare against. The alternative
+// was joining to role.name so search would have something to match, but that
+// drags a JOIN into a keyset query that today has none on either list (see
+// entitlementKeys' doc comment, internal/store/rbac.go, for the full
+// reasoning); refusing is louder and smaller.
+//
+// r.URL.Query().Has("q"), not Get("q") != "": Has reports the PARAMETER'S
+// PRESENCE regardless of its value, so a bare "?q=" (empty value) is refused
+// exactly like "?q=foo": a client that thinks it is filtering, even by an
+// empty string, must be told this list cannot, rather than silently getting
+// the unfiltered page back and concluding search "worked" and just happened
+// to return everything. That silent success is precisely the failure mode
+// the plan calls out: "a search box that appears to work and filters nothing
+// is worse than one that says it cannot."
+func refuseSearch(r *http.Request) error {
+	if r.URL.Query().Has("q") {
+		return validationError{"q is not supported on this list: role_id has no natural text column to search"}
+	}
+	return nil
 }
 
 // pageParams parses ?limit and ?cursor for a paginated list endpoint. An absent

@@ -70,7 +70,13 @@ func TestPaginatedListsUseTheirIndexes(t *testing.T) {
 	// community-repo-generation-design.md §4) — its subtest,
 	// testArtifactRevisionPlan, lives in explain_revisions.ee_test.go and
 	// runs as its own top-level test (TestArtifactRevisionPlanUsesItsIndex)
-	// rather than through this shared runner.
+	// rather than through this shared runner. virtual_key is Enterprise-only
+	// for the same reason, its subtest, testVirtualKeyPlan, lives in
+	// explain_virtual_key.ee_test.go and runs as its own top-level test
+	// (TestVirtualKeyPlanUsesItsIndex); that same file also carries
+	// TestVirtualKeyPlanIndexNameOnlyAssertionMissesTheTextCastDefect, a
+	// live reproduction, not merely a citation, of the index-name-only
+	// false pass this doc comment describes above.
 	t.Run("role", testRolePlan)
 	t.Run("mcp_server", testMCPServerPlan)
 }
@@ -213,12 +219,12 @@ func testEntitlementPlan(t *testing.T) {
 		t.Fatalf("analyze entitlement: %v", err)
 	}
 
-	first, err := s.ListEntitlementsPage(ctx, tn.ID, nil, 100)
+	first, err := s.ListEntitlementsPage(ctx, tn.ID, nil, 100, false)
 	if err != nil || len(first) != 100 {
 		t.Fatalf("seed page: %d rows, err=%v", len(first), err)
 	}
-	cursor := EntitlementCursor(first[len(first)-1])
-	sql, args, err := entitlementPageSQL(tn.ID, &cursor, 100)
+	cursor := EntitlementCursor(first[len(first)-1], false)
+	sql, args, err := entitlementPageSQL(tn.ID, &cursor, 100, false)
 	if err != nil {
 		t.Fatalf("entitlementPageSQL: %v", err)
 	}
@@ -264,12 +270,12 @@ func testArtifactEntitlementPlan(t *testing.T) {
 		t.Fatalf("analyze artifact_entitlement: %v", err)
 	}
 
-	first, err := s.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 100)
+	first, err := s.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 100, false)
 	if err != nil || len(first) != 100 {
 		t.Fatalf("seed page: %d rows, err=%v", len(first), err)
 	}
-	cursor := ArtifactEntitlementCursor(first[len(first)-1])
-	sql, args, err := artifactEntitlementPageSQL(tn.ID, &cursor, 100)
+	cursor := ArtifactEntitlementCursor(first[len(first)-1], false)
+	sql, args, err := artifactEntitlementPageSQL(tn.ID, &cursor, 100, false)
 	if err != nil {
 		t.Fatalf("artifactEntitlementPageSQL: %v", err)
 	}
@@ -307,7 +313,7 @@ func testArtifactUnfilteredPlan(t *testing.T) {
 	if err != nil || len(first) != 100 {
 		t.Fatalf("seed page: %d rows, err=%v", len(first), err)
 	}
-	cursor := ArtifactCursor(first[len(first)-1])
+	cursor := ArtifactCursor(first[len(first)-1], false)
 	opts.Cursor = &cursor
 	sql, args, err := artifactPageSQL(tn.ID, opts)
 	if err != nil {
@@ -353,7 +359,7 @@ func testArtifactStateFilteredPlan(t *testing.T) {
 	if err != nil || len(first) != 100 {
 		t.Fatalf("seed page: %d rows, err=%v", len(first), err)
 	}
-	cursor := ArtifactCursor(first[len(first)-1])
+	cursor := ArtifactCursor(first[len(first)-1], false)
 	opts.Cursor = &cursor
 	sql, args, err := artifactPageSQL(tn.ID, opts)
 	if err != nil {
@@ -397,12 +403,12 @@ func testRolePlan(t *testing.T) {
 		t.Fatalf("analyze role: %v", err)
 	}
 
-	first, err := s.ListRolesPage(ctx, tn.ID, nil, 100)
+	first, err := s.ListRolesPage(ctx, tn.ID, nil, 100, false, "")
 	if err != nil || len(first) != 100 {
 		t.Fatalf("seed page: %d rows, err=%v", len(first), err)
 	}
-	cursor := RoleCursor(first[len(first)-1])
-	sql, args, err := rolePageSQL(tn.ID, &cursor, 100)
+	cursor := RoleCursor(first[len(first)-1], false)
+	sql, args, err := rolePageSQL(tn.ID, &cursor, 100, false, "")
 	if err != nil {
 		t.Fatalf("rolePageSQL: %v", err)
 	}
@@ -433,12 +439,12 @@ func testMCPServerPlan(t *testing.T) {
 		t.Fatalf("analyze mcp_server: %v", err)
 	}
 
-	first, err := s.ListMCPServersPage(ctx, tn.ID, nil, 100)
+	first, err := s.ListMCPServersPage(ctx, tn.ID, nil, 100, false, "")
 	if err != nil || len(first) != 100 {
 		t.Fatalf("seed page: %d rows, err=%v", len(first), err)
 	}
-	cursor := MCPServerCursor(first[len(first)-1])
-	sql, args, err := mcpServerPageSQL(tn.ID, &cursor, 100)
+	cursor := MCPServerCursor(first[len(first)-1], false)
+	sql, args, err := mcpServerPageSQL(tn.ID, &cursor, 100, false, "")
 	if err != nil {
 		t.Fatalf("mcpServerPageSQL: %v", err)
 	}

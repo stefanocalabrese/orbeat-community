@@ -429,16 +429,11 @@ func TestAuthNilInterfaceWithoutCredential(t *testing.T) {
 	}
 }
 
-// TestRedactURLUserinfo pins audit G12: a git URL's embedded credentials
-// (https://user:token@host) must never survive into a persisted error
-// string — RecordResult writes this into publish_state.last_error and the
-// audit table's metadata, both readable from the portal UI.
-func TestRedactURLUserinfo(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
+// redactCases is the shared corpus for the redaction gates, so the exactness
+// test and the idempotence test can never drift apart on which inputs they
+// cover.
+func redactCases() []struct{ name, in, want string } {
+	return []struct{ name, in, want string }{
 		{
 			"basic userinfo with password",
 			"https://user:token@example.test/repo.git",
@@ -469,13 +464,112 @@ func TestRedactURLUserinfo(t *testing.T) {
 			"publish: init local repo: /var/lib/orbeat/marketplace: permission denied",
 			"publish: init local repo: /var/lib/orbeat/marketplace: permission denied",
 		},
+		// A slash in the credential. RFC 3986 ends the authority at the first
+		// "/", so a strict parse sees no userinfo at all here, yet base64
+		// material and GitLab/Gitea deploy tokens routinely carry one, and
+		// go-git echoes the URL verbatim. This is the input the old
+		// `[^/@\s]*@` class could not span, and it leaked the whole token.
+		{
+			"credential containing a slash",
+			"publish: clone: https://x-access-token:b64/token+val@github.com/org/repo.git: dial tcp: connection refused",
+			"publish: clone: https://***@github.com/org/repo.git: dial tcp: connection refused",
+		},
+		{
+			"credential containing a plus and base64 padding",
+			"publish: push: https://user:aGVsbG8+d29ybGQ=@example.test/repo.git: authentication failed",
+			"publish: push: https://***@example.test/repo.git: authentication failed",
+		},
+		// An "@" in the password. The old regex stopped at the FIRST "@" and
+		// emitted "https://***@ssw0rd@github.com/...", so the tail of the
+		// password survived in publish_state.last_error.
+		{
+			"password containing an at sign",
+			"publish: push: https://user:p@ssw0rd@github.com/org/repo.git: authentication failed",
+			"publish: push: https://***@github.com/org/repo.git: authentication failed",
+		},
+		{
+			"slash, plus and at together, host carrying a port",
+			"publish: fetch: https://x-access-token:YWxpY2U6cA==+b/c@d@gitea.internal:3000/org/repo.git: 403",
+			"publish: fetch: https://***@gitea.internal:3000/org/repo.git: 403",
+		},
+		{
+			"already-redacted message is unchanged",
+			"publish: clone: https://***@github.com/org/repo.git: dial tcp: connection refused",
+			"publish: clone: https://***@github.com/org/repo.git: dial tcp: connection refused",
+		},
+		// The token ends at the first whitespace, so an address in the prose
+		// after the URL is prose, not userinfo.
+		{
+			"user@host in the prose after the URL is untouched",
+			"publish: push: https://github.com/org/repo.git: remote rejected; contact ops@example.test",
+			"publish: push: https://github.com/org/repo.git: remote rejected; contact ops@example.test",
+		},
+		// STATED LIMIT, pinned so the boundary is recorded rather than
+		// discovered. Scanning past the first "/" is what catches a
+		// slash-bearing token, and the price is that an "@" in a PATH reads as
+		// the end of userinfo: this message never held a credential, and the
+		// host is masked anyway. Safe direction, legibility lost.
+		{
+			"LIMIT: an @ in the path over-redacts the host, no credential present",
+			"publish: fetch: https://github.com/org/repo@v1.git: reference not found",
+			"publish: fetch: https://***@v1.git: reference not found",
+		},
 	}
-	for _, c := range cases {
+}
+
+// TestRedactURLUserinfo pins audit G12: a git URL's embedded credentials
+// (https://user:token@host) must never survive into a persisted error
+// string. RecordResult writes this into publish_state.last_error and the
+// audit table's metadata, both readable from the portal UI, and cmd/api logs
+// the same error to stdout.
+func TestRedactURLUserinfo(t *testing.T) {
+	for _, c := range redactCases() {
 		t.Run(c.name, func(t *testing.T) {
 			if got := redactURLUserinfo(c.in); got != c.want {
 				t.Errorf("redactURLUserinfo(%q) =\n got:  %q\n want: %q", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// TestRedactURLUserinfoIsIdempotent pins the property the doc comment claims:
+// a second pass over an already-redacted message must be a no-op rather than
+// eating the host or stacking markers. RecordResult redacts, and the same
+// string can be re-formatted by a consumer that redacts again, so a
+// non-idempotent redactor would corrupt the message that reaches the portal.
+func TestRedactURLUserinfoIsIdempotent(t *testing.T) {
+	for _, c := range redactCases() {
+		t.Run(c.name, func(t *testing.T) {
+			once := redactURLUserinfo(c.in)
+			twice := redactURLUserinfo(once)
+			if twice != once {
+				t.Errorf("second pass changed the message:\n once:  %q\n twice: %q", once, twice)
+			}
+		})
+	}
+}
+
+// TestRedactedErrorRedactsSlashBearingToken drives the PRODUCTION wrapper, not
+// the helper, with the credential shape the old regex could not span: a token
+// containing "/". The corpus test above proves the function; this proves the
+// type every PublishOnce error is wrapped in actually applies it to that
+// shape, and that the assertion can fail (the unwrapped cause still carries
+// the token).
+func TestRedactedErrorRedactsSlashBearingToken(t *testing.T) {
+	const token = "b64/tok+en=SUPERSECRET"
+	inner := errors.New("publish: push: https://x-access-token:" + token + "@github.com/org/repo.git: authentication required")
+	wrapped := error(&redactedError{err: inner})
+
+	unwrapped := errors.Unwrap(wrapped)
+	if unwrapped == nil || !strings.Contains(unwrapped.Error(), token) {
+		t.Fatalf("test is vacuous: the unwrapped cause must still carry the token, got: %v", unwrapped)
+	}
+	got := wrapped.Error()
+	if strings.Contains(got, token) {
+		t.Fatalf("slash-bearing credential leaked through redactedError: %q", got)
+	}
+	if got != "publish: push: https://***@github.com/org/repo.git: authentication required" {
+		t.Fatalf("unexpected redaction result: %q", got)
 	}
 }
 

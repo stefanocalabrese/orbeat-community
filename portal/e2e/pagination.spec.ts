@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 
 // Portal unit tests mock `fetch` and were all green while the admin console
 // was truncated at 100 rows, the approver's diff panel was blank, and the
@@ -46,6 +46,21 @@ const API_BASE = "http://localhost:8080";
 const KC_TOKEN_URL = "http://localhost:8088/realms/orbeat/protocol/openid-connect/token";
 
 /**
+ * This spec's own Keycloak identity, and the one that matters most: its two
+ * 105-row walks put about 525 direct API calls on a single bucket (server
+ * create and delete, artifact create, submit and delete), the largest single
+ * contributor in deploy/docker-compose.yml's ORBEAT_RATELIMIT_BURST
+ * derivation.
+ *
+ * internal/ratelimit keys its token bucket on subject + azp, so every spec
+ * that stays on `boss` shares one bucket with all the others. One constant
+ * feeds both the browser login and the API token so the two can never drift
+ * apart, which would silently put half this spec's traffic back on the
+ * shared bucket.
+ */
+const E2E_USER = "e2e-pagination";
+
+/**
  * Direct-grant (password grant) admin token for API seeding, bypassing the
  * browser entirely. This is NOT a reimplementation of the portal's
  * PKCE/redirect SSO flow that login() drives above — it's the same mechanism
@@ -56,7 +71,7 @@ const KC_TOKEN_URL = "http://localhost:8088/realms/orbeat/protocol/openid-connec
  * through the browser form would make this spec unusably slow; every other
  * spec in this suite seeds only a handful of rows and never needed this.
  */
-async function adminToken(request: APIRequestContext, user = "boss", pass = "boss"): Promise<string> {
+async function adminToken(request: APIRequestContext, user = E2E_USER, pass = E2E_USER): Promise<string> {
   const res = await request.post(KC_TOKEN_URL, {
     form: { grant_type: "password", client_id: "orbeat-cli", username: user, password: pass },
   });
@@ -105,6 +120,63 @@ async function deleteAll(request: APIRequestContext, token: string, base: string
     const res = await request.delete(`${API_BASE}${base}/${id}`, { headers: { Authorization: `Bearer ${token}` } });
     expect(res.ok(), `delete ${base}/${id}: ${res.status()} ${await res.text()}`).toBeTruthy();
   });
+}
+
+/**
+ * Walks GET {base} by cursor, calling `onPage` with each page's raw response
+ * text, until `onPage` reports the target found or the list is exhausted
+ * (empty `nextCursor`). Bounded by the list's own exhaustion, not a clock.
+ *
+ * GET /v1/admin/artifacts has no filter narrow enough to scope an existence
+ * check to one seeded row (only `?state`, and freshly-seeded rows across
+ * this whole suite are almost all "draft"), so unlike audit-filters.spec.ts's
+ * `?action=` fix this cannot narrow the competing volume, it can only stop
+ * assuming the row landed on page 1. Reproduced live: seeding 105 rows of the
+ * same artifact `type` ahead of this test's row in (type, name) sort order
+ * pushed it off an unfiltered page-1 response entirely.
+ */
+async function walkArtifactPages(
+  request: APIRequestContext,
+  token: string,
+  onPage: (pageText: string) => boolean,
+): Promise<boolean> {
+  let cursor = "";
+  for (let i = 0; i < 50; i++) {
+    const url = cursor
+      ? `${API_BASE}/v1/admin/artifacts?cursor=${encodeURIComponent(cursor)}`
+      : `${API_BASE}/v1/admin/artifacts`;
+    const res = await request.get(url, { headers: { Authorization: `Bearer ${token}` } });
+    expect(res.ok(), `list artifacts: ${res.status()} ${await res.text()}`).toBeTruthy();
+    const text = await res.text();
+    if (onPage(text)) return true;
+    const parsed = JSON.parse(text) as { nextCursor?: string };
+    if (!parsed.nextCursor) return false;
+    cursor = parsed.nextCursor;
+  }
+  return false;
+}
+
+/**
+ * Clicks "Load more" on the currently open admin list, bounded by the
+ * control's own exhaustion (it only renders while `hasNextPage` is true --
+ * ArtifactsPage.tsx), until `target` is visible or the list runs out. The
+ * post-click wait is the same "poll a real row-count growth" technique this
+ * file's first test ("Load more appends pages of servers") already uses for
+ * the identical class of problem, not a fixed sleep.
+ */
+async function revealRow(page: Page, target: Locator): Promise<void> {
+  const loadMore = page.getByRole("button", { name: "Load more", exact: true });
+  const appearedSoFar = () =>
+    target
+      .waitFor({ state: "visible", timeout: 2_000 })
+      .then(() => true)
+      .catch(() => false);
+  for (let i = 0; i < 50 && !(await appearedSoFar()); i++) {
+    if (!(await loadMore.isVisible().catch(() => false))) break;
+    const before = await page.locator("tbody tr").count();
+    await loadMore.click();
+    await expect.poll(() => page.locator("tbody tr").count(), { timeout: 15_000 }).toBeGreaterThan(before);
+  }
 }
 
 // Per-run unique, all-lowercase/digits/dashes after the prefix so every
@@ -175,7 +247,7 @@ test.describe("admin list pagination (real API + real browser)", () => {
     seededServerIds.push(...ids);
     console.log(`[pagination.spec] seeded ${N} servers in ${Date.now() - t0}ms`);
 
-    await login(page, "boss", "boss");
+    await login(page, E2E_USER, E2E_USER);
     await gotoAdmin(page, "Servers");
 
     const loadMore = page.getByRole("button", { name: "Load more", exact: true });
@@ -246,24 +318,27 @@ test.describe("admin list pagination (real API + real browser)", () => {
 
     // The list response must actually CONTAIN this row before its absence of
     // `body` means anything. Without this, a row pushed off-page by unrelated
-    // volume (proven live with ?limit=1) would make the next assertion pass
-    // for entirely the wrong reason — the exact "a check whose negative
-    // result isn't evidence of the thing it claims" shape.
-    const list = await request.get(`${API_BASE}/v1/admin/artifacts`, {
-      headers: { Authorization: `Bearer ${token}` },
+    // volume (proven live, see walkArtifactPages's doc comment) would make
+    // the next assertion pass for entirely the wrong reason, the exact "a
+    // check whose negative result isn't evidence of the thing it claims"
+    // shape. Walking every page (instead of assuming page 1) also makes the
+    // slimness check itself STRONGER: every page it visits along the way is
+    // asserted slim too, not only the one this row happens to land on.
+    let sawBody = false;
+    const found = await walkArtifactPages(request, token, (pageText) => {
+      if (pageText.includes(body)) sawBody = true;
+      return pageText.includes(name);
     });
-    expect(list.ok()).toBeTruthy();
-    const listText = await list.text();
-    expect(listText, "seeded row is not even in the list response — page/volume issue, not a slimness proof").toContain(
-      name,
-    );
-    expect(listText).not.toContain(body);
+    expect(found, "seeded row is not even in the list response, page/volume issue, not a slimness proof").toBeTruthy();
+    expect(sawBody, "artifact content appeared in a slim list page").toBeFalsy();
 
     // ...but opening the edit form fetches GET /{id} (always the full
     // payload — see useAdminArtifact's doc comment) and shows it.
-    await login(page, "boss", "boss");
+    await login(page, E2E_USER, E2E_USER);
     await gotoAdmin(page, "Artifacts");
-    await page.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
+    const editButton = page.getByRole("button", { name: `Edit ${name}`, exact: true });
+    await revealRow(page, editButton);
+    await editButton.click();
     // Scope the field lookup to the open <form>: row-action buttons carry
     // aria-labels like "Edit <name>"/"Delete <name>", and getByLabel is a
     // case-insensitive SUBSTRING match, so once a row exists an unscoped
@@ -298,9 +373,11 @@ test.describe("admin list pagination (real API + real browser)", () => {
     const created = (await createRes.json()) as { id: string };
     seededArtifactIds.push(created.id);
 
-    await login(page, "boss", "boss");
+    await login(page, E2E_USER, E2E_USER);
     await gotoAdmin(page, "Artifacts");
-    await page.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
+    const editButton = page.getByRole("button", { name: `Edit ${name}`, exact: true });
+    await revealRow(page, editButton);
+    await editButton.click();
     const form = page.locator("form");
     // The form must have loaded the FULL artifact (not a slim list row, whose
     // content/memorySeed are both "") before we touch anything — otherwise
@@ -375,7 +452,7 @@ test.describe("admin list pagination (real API + real browser)", () => {
       `[pagination.spec] seeded+submitted ${N} pending artifacts: create=${createMs}ms submit=${submitMs}ms`,
     );
 
-    await login(page, "boss", "boss");
+    await login(page, E2E_USER, E2E_USER);
     await gotoAdmin(page, "Review queue");
 
     // Content renders end to end (Task 11 review gap: the unit test only

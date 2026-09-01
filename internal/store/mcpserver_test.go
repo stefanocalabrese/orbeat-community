@@ -55,7 +55,7 @@ func TestMCPServerUpdateDelete(t *testing.T) {
 
 	srv.Description = "GitHub MCP"
 	srv.Status = "disabled"
-	upd, err := s.UpdateMCPServer(ctx, srv)
+	upd, err := s.UpdateMCPServer(ctx, srv, nil, nil)
 	if err != nil {
 		t.Fatalf("UpdateMCPServer: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestMCPServerMalformedIDIsNotFound(t *testing.T) {
 	if _, err := s.UpdateMCPServer(ctx, MCPServer{
 		ID: badID, TenantID: tn.ID, Name: "x", Transport: "http",
 		EndpointOrCommand: "https://x", Status: "active",
-	}); !errors.Is(err, ErrNotFound) {
+	}, nil, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("UpdateMCPServer(bad id): want ErrNotFound, got %v", err)
 	}
 
@@ -214,7 +214,9 @@ func TestMCPServerTLSCARefRoundTrip(t *testing.T) {
 
 // TestMCPServerTLSCARefUpdateSetAndClear proves UpdateMCPServer can both set
 // the ref on a server that started without one, and clear it back to NULL —
-// exercising the write-side NULLIF normalization in both directions.
+// exercising the write-side NULLIF normalization in both directions, driven
+// through the tri-state secretRef/tlsCARef parameters (nil=unchanged,
+// &""=clear, &value=replace — see UpdateMCPServer's own doc comment).
 func TestMCPServerTLSCARefUpdateSetAndClear(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
@@ -231,8 +233,8 @@ func TestMCPServerTLSCARefUpdateSetAndClear(t *testing.T) {
 		t.Fatalf("newly created server has TLSCARef %q, want empty", srv.TLSCARef)
 	}
 
-	srv.TLSCARef = "env:OTHER_CA"
-	updated, err := s.UpdateMCPServer(ctx, srv)
+	newRef := "env:OTHER_CA"
+	updated, err := s.UpdateMCPServer(ctx, srv, nil, &newRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,8 +242,8 @@ func TestMCPServerTLSCARefUpdateSetAndClear(t *testing.T) {
 		t.Fatalf("update set returned %q, want env:OTHER_CA", updated.TLSCARef)
 	}
 
-	updated.TLSCARef = ""
-	cleared, err := s.UpdateMCPServer(ctx, updated)
+	empty := ""
+	cleared, err := s.UpdateMCPServer(ctx, updated, nil, &empty)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,6 +266,57 @@ func TestMCPServerTLSCARefUpdateSetAndClear(t *testing.T) {
 	}
 	if !isNull {
 		t.Fatal("cleared tls_ca_ref stored as '' rather than NULL — NULLIF is missing from the UPDATE")
+	}
+}
+
+// TestMCPServerUpdateNilRefsPreserveExistingValues is the store-level proof
+// for the 2026-09-01 fix (defect 1, "cannot express leave this unchanged"):
+// passing nil for secretRef/tlsCARef while updating an unrelated field
+// (Description) must leave BOTH ref columns exactly as they were, not wipe
+// them the way the pre-fix single-string contract silently did on any
+// caller that didn't already know (and resend) the current value — which,
+// since GetMCPServer/toAdminServerDTO never echo either ref back, no caller
+// ever could.
+func TestMCPServerUpdateNilRefsPreserveExistingValues(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tn := mustTenant(t, s)
+
+	srv, err := s.CreateMCPServer(ctx, MCPServer{
+		TenantID: tn.ID, Name: "preserve-me", Transport: "http",
+		EndpointOrCommand: "https://x.example.com/mcp",
+		SecretRef:         "vault:kv/x#token", TLSCARef: "env:ORBEAT_UPSTREAM_CA",
+		Status: "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv.Description = "now with a description"
+	updated, err := s.UpdateMCPServer(ctx, srv, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Description != "now with a description" {
+		t.Fatalf("Description = %q, want the new value (the update itself must still apply)", updated.Description)
+	}
+	if updated.SecretRef != "vault:kv/x#token" {
+		t.Fatalf("SecretRef = %q, want it preserved unchanged (nil must not clear it)", updated.SecretRef)
+	}
+	if updated.TLSCARef != "env:ORBEAT_UPSTREAM_CA" {
+		t.Fatalf("TLSCARef = %q, want it preserved unchanged (nil must not clear it)", updated.TLSCARef)
+	}
+
+	// Re-read from a fresh query too, not just the RETURNING-derived struct
+	// above: proves the preservation is really in the stored row, not an
+	// artifact of GetMCPServer's own reread inside UpdateMCPServer echoing
+	// back whatever was passed in.
+	reread, err := s.GetMCPServer(ctx, tn.ID, srv.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reread.SecretRef != "vault:kv/x#token" || reread.TLSCARef != "env:ORBEAT_UPSTREAM_CA" {
+		t.Fatalf("reread mismatch: %+v", reread)
 	}
 }
 

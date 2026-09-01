@@ -24,16 +24,30 @@ var ErrVersionMismatch = errors.New("version mismatch")
 // whose only USER-SUPPLIED cast is the uuid id parameter (an internal,
 // trusted value like tenantID may also be uuid-cast in the same query — that
 // doesn't matter, since it can never fail): either no row matched
-// (pgx.ErrNoRows) or the id itself failed the uuid cast (Postgres 22P02,
-// invalid_text_representation — a malformed id can never match an existing
-// row, so "not found" is the correct outcome either way). Do not reuse this
-// helper for a query with any OTHER user-supplied cast: it would then mask an
-// unrelated invalid-input error as a plain not-found. Verify this holds for
-// each call site individually before applying it.
+// (pgx.ErrNoRows) or the id itself failed the uuid cast (idCastMalformed,
+// Postgres 22P02 invalid_text_representation — a malformed id can never
+// match an existing row, so "not found" is the correct outcome either way).
+// Do not reuse this helper for a query with any OTHER user-supplied cast: it
+// would then mask an unrelated invalid-input error as a plain not-found.
+// Verify this holds for each call site individually before applying it.
 func idCastNotFound(err error) bool {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return true
-	}
+	return errors.Is(err, pgx.ErrNoRows) || idCastMalformed(err)
+}
+
+// idCastMalformed reports whether err is SPECIFICALLY a malformed-uuid cast
+// failure (Postgres 22P02, invalid_text_representation), distinct from
+// idCastNotFound's broader "this-or-plain-no-rows" test. Split out (audit
+// B37) because some call sites must react differently to the two outcomes a
+// single UPDATE/DELETE...RETURNING can produce when it returns zero rows:
+// UpdateRoleQuota (usage.ee.go) needs "the id was never a real uuid" (404,
+// via this function) to stay distinguishable from "the id is real but the
+// row_version is stale" (412, via a plain errors.Is(err, pgx.ErrNoRows) check
+// beside it) — folding both into idCastNotFound's single bool, as the
+// original code did, mapped a malformed role id to 412 instead of 404. Most
+// call sites in this package do NOT need that distinction (a plain "doesn't
+// exist" outcome, mapped to ErrNotFound, is correct for both sub-cases), which
+// is exactly why idCastNotFound stays the default and this is the exception.
+func idCastMalformed(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
 }

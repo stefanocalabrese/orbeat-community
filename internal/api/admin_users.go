@@ -8,8 +8,9 @@ import (
 
 // userDeleteResponse is handleDeleteUser's 200 body: the identity DeleteUser
 // destroyed. Unlike roleDeleteResponse, this carries no cascade counts -- a
-// user row has nothing downstream to revoke (see store.DeletedUser's doc
-// comment for why).
+// user row has nothing downstream to REVOKE, which is a narrower claim than
+// "nothing downstream" since migration 00017 (see store.DeletedUser's doc
+// comment for what the delete does now destroy).
 type userDeleteResponse struct {
 	Subject     string `json:"subject"`
 	Email       string `json:"email"`
@@ -25,14 +26,24 @@ type userDeleteResponse struct {
 // Returns 200 with the deleted identity rather than 204 like its sibling
 // deletes for servers/entitlements: mirrors handleDeleteRole's choice
 // (v1.24.0) of reporting what was destroyed rather than leaving the caller to
-// infer it, but the CONTENT differs, because a user row owns nothing that
-// cascades -- no table in the schema holds a foreign key to users.id (roles
-// are reconciled from token claims per request, not a stored user-role
-// table). So this reports the identity itself (subject/email/displayName),
-// not a revoked-grants count like RoleDeleteResponse -- see
-// store.DeletedUser's doc comment for the full reasoning, including why no
-// SELECT ... FOR UPDATE analogous to DeleteRole's is needed here: there is no
-// second table's data being read before the delete for a lock to protect.
+// infer it, but the CONTENT differs, because a user row owns no ACCESS that
+// cascades: roles are reconciled from token claims per request, not from a
+// stored user-role table, so deleting a user revokes nothing. So this reports
+// the identity itself (subject/email/displayName), not a revoked-grants count
+// like RoleDeleteResponse -- see store.DeletedUser's doc comment for the full
+// reasoning, including why no SELECT ... FOR UPDATE analogous to DeleteRole's
+// is needed here: there is no second table's data being read before the
+// delete for a lock to protect.
+//
+// It does now cascade DATA, and only since migration 00017:
+// artifact_deployment.user_id references users.id ON DELETE CASCADE, so this
+// route is the erasure path for the deployment registry's records about one
+// person. That is not the whole set, which this comment implied until audit
+// finding C7: virtual_key.created_by (00020) also points at users.id, ON
+// DELETE SET NULL, and since audit B33 this handler additionally REVOKES
+// every virtual key the deleted user created, reporting their ids so the
+// audit row can name them. The response deliberately does not count them; store.DeletedUser's
+// doc comment records that as an open question rather than a closed one.
 //
 // Deletion is not a ban (spec docs/specs/2026-08-19-orbeat-community-caps-
 // design.md sec 3.3): a deleted subject who authenticates again is upserted

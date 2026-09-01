@@ -14,6 +14,7 @@ import (
 
 	"github.com/stefanocalabrese/orbeat-community/internal/auth"
 	"github.com/stefanocalabrese/orbeat-community/internal/authz"
+	"github.com/stefanocalabrese/orbeat-community/internal/govern"
 	"github.com/stefanocalabrese/orbeat-community/internal/store"
 )
 
@@ -598,6 +599,44 @@ func TestArtifactCreateOversizedSeedIs400(t *testing.T) {
 	srv.handleCreateArtifact(rec, adminReq(ctx, http.MethodPost, "/v1/admin/artifacts", in, tn))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("oversized seed = %d, want 400, body = %s", rec.Code, rec.Body)
+	}
+}
+
+// TestValidateArtifactAllowsContentThatScannerWarnsAbout proves the size warn
+// rule (internal/govern/scanner.go) is actually reachable through
+// validateArtifact: content between the warn threshold and the hard cap
+// passes validation, and the SAME content still makes the scanner emit a
+// size warn. Without this test, WarnContentBytes could be raised back up to
+// equal MaxContentBytes, rebuilding the exact dead branch this change exists
+// to fix, and nothing else here would notice, since scanner_test.go alone
+// cannot see what validateArtifact accepts.
+func TestValidateArtifactAllowsContentThatScannerWarnsAbout(t *testing.T) {
+	prefix := "---\nname: fmt-skill\ndescription: formats code\n---\n"
+	content := prefix + strings.Repeat("a", govern.MaxContentBytes-len(prefix)-100)
+
+	if len(content) <= govern.WarnContentBytes || len(content) >= govern.MaxContentBytes {
+		t.Fatalf("test content sized wrong: len=%d warn=%d max=%d", len(content), govern.WarnContentBytes, govern.MaxContentBytes)
+	}
+
+	in := artifactInput{Type: "skill", Name: "fmt-skill", Content: content}
+	if err := validateArtifact(in); err != nil {
+		t.Fatalf("content above the warn threshold but below the hard cap must still validate, got %v", err)
+	}
+
+	findings, err := govern.NewDefaultScanner().Scan(context.Background(), govern.ArtifactPayload{
+		Type: "skill", Name: "fmt-skill", Content: content,
+	})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	warned := false
+	for _, f := range findings {
+		if f.Rule == "size" && f.Severity == "warn" {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("content above the warn threshold and below the hard cap must produce a size warn, got %+v", findings)
 	}
 }
 

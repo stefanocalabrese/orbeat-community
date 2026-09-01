@@ -47,6 +47,34 @@ type Config struct {
 	// deployments are unchanged. Parsed by ArtifactRevisionKeepN.
 	ArtifactRevisionKeep string
 
+	// DeploymentRegistry switches on POST /v1/sync/deployments, the artifact
+	// deployment registry (docs/specs/2026-08-22-orbeat-artifact-deployment-
+	// registry-design.md sec 8.6). Empty (default) = OFF, and the default is
+	// the point: enabling it starts recording, per named developer and per
+	// machine, which artifacts that machine holds and when it last checked
+	// in. Parsed by DeploymentRegistryEnabled. Enterprise only, so setting it
+	// in a Community build changes nothing (internal/api's
+	// SetDeploymentRegistry, which is where the two terms meet).
+	DeploymentRegistry string
+
+	// DeploymentRetentionDays is how many days an artifact_deployment row
+	// survives without a fresh report before the retention loop deletes it.
+	// Empty (unset) means the 90-day default, which INVERTS
+	// AuditRetentionDays' off-by-default (spec sec 7.2): an audit row is a
+	// compliance record whose deletion is a loss, a deployment row is a claim
+	// about a person's machine that decays, and a silent install is not
+	// evidence of a deployment. "0" = keep forever, accepted but warned at
+	// startup by cmd/api. Parsed by DeploymentRetentionDaysN. Read only by
+	// cmd/api, and only in an Enterprise build.
+	//
+	// Loaded with os.Getenv rather than getenv(..., "90") on purpose. The
+	// sibling AuditExportMaxRows writes its default in BOTH places, and a
+	// number in two places is one nobody can mutate a test against: with
+	// Load() supplying "90", the accessor's empty branch is unreachable
+	// through Load and a mutant that breaks it stays green. The accessor
+	// below is the single owner of the number.
+	DeploymentRetentionDays string
+
 	// RateLimitRPS is the configured per-key steady rate (requests/sec).
 	// Empty means unset — the per-binary default passed to RateLimitRPSN
 	// wins. An explicit "0" disables limiting, matching the
@@ -64,6 +92,20 @@ type Config struct {
 	// per second rather than how many are in flight at once (fable-audit §7
 	// #14). Empty means unset. Parsed by GatewayMaxInflightN.
 	GatewayMaxInflight string
+
+	// Intercept switches on runtime call interception (docs/specs/2026-08-25-
+	// orbeat-runtime-interception-design.md): the gateway scans tool call
+	// arguments and results through govern.Scanner, denying an argument or
+	// replacing a result on a blocking finding. ORBEAT_INTERCEPT, "" =
+	// disabled (default) -- mirrors how OTelEndpoint and ScanLLMEndpoint
+	// express optionality above. Unset means the hook is never INSTALLED at
+	// all -- no scan, no latency, no behaviour change -- not merely
+	// installed with nothing to find; cmd/gateway's wiring (interceptorFor,
+	// main.go) is what turns that guarantee from a doc claim into code. Read
+	// only by cmd/gateway: internal/gateway/intercept.go is deliberately
+	// shared rather than Enterprise-gated (its own doc comment explains why),
+	// so this knob has the same behaviour in both editions.
+	Intercept string
 
 	// CORSOrigins is the exact-match allow-list for browser cross-origin calls
 	// (ORBEAT_CORS_ORIGINS, comma-separated). Unset → nil → fail closed.
@@ -99,6 +141,55 @@ type Config struct {
 	// not import internal/authz for one. cmd/gateway also calls Load() and
 	// never reads this field.
 	ContactEmail string
+
+	// DCRClientID is the Keycloak service-account client id orbeat-api
+	// authenticates as when registering/deleting virtual-key robot
+	// credentials via Dynamic Client Registration (docs/specs/2026-08-25-
+	// orbeat-virtual-keys-design.md sec 4; deploy/keycloak/orbeat-realm.json's
+	// "orbeat-dcr" client, whose service account holds only realm-management's
+	// create-client and view-realm roles; view-realm is not optional, see
+	// internal/keycloak/dcr.ee.go). ORBEAT_DCR_CLIENT_ID. Empty (default) disables
+	// virtual-key registration entirely -- no deployment that doesn't grant
+	// orbeat this Keycloak privilege needs to set either of these two
+	// fields, and POST /v1/admin/virtual-keys keeps refusing through
+	// admin_virtual_keys.ee.go's existing nil-registrar branch. Read only by
+	// cmd/api (Enterprise only; cmd/gateway calls Load() too and never reads
+	// this field, matching ContactEmail's own note above).
+	DCRClientID string
+	// DCRClientSecretRef is a secrets ref (env:/vault:/awssm:) for
+	// DCRClientID's own client secret -- the credential orbeat uses to
+	// authenticate ITSELF to Keycloak's token endpoint, resolved via
+	// internal/secrets the same way ScanLLMKeyRef is. This is never the
+	// robot's credential (internal/keycloak.DCRClient's own doc comment on
+	// ServiceAccountClientSecret draws that line). ORBEAT_DCR_CLIENT_SECRET_REF.
+	DCRClientSecretRef string
+
+	// UsageFlushInterval is how often cmd/gateway's usage counter flushes to
+	// Postgres and the quota cache refreshes (docs/specs/2026-08-25-orbeat-
+	// usage-metering-design.md section 3) -- ORBEAT_USAGE_FLUSH_INTERVAL, a
+	// Go duration, default "60s". This is the "up to one interval" in the
+	// design's stated overshoot ("a quota can be overshot by up to one flush
+	// interval's worth of calls"): shortening it tightens how quickly a
+	// newly-created quota takes effect and how quickly a stopped gateway's
+	// in-memory counts would have been lost without the shutdown flush;
+	// lengthening it trades that responsiveness for fewer round trips against
+	// Postgres. Unlike ORBEAT_INTERCEPT's off-by-default sentinel, there is
+	// no off value here: counting itself is unconditional (see
+	// UsageFlushIntervalDuration's doc comment for why), so this only tunes
+	// its cadence. Read only by cmd/gateway.
+	UsageFlushInterval string
+
+	// UsageRetentionDays is how many days a usage_daily row survives before
+	// cmd/api's retention loop deletes it. Empty (unset) means the 90-day
+	// default; ORBEAT_USAGE_RETENTION_DAYS=0 keeps rows forever. Mirrors
+	// DeploymentRetentionDays' shape and its on-by-default direction exactly
+	// (spec sec 4: "usage rows accumulate forever otherwise") -- a
+	// usage_daily row is a per-day, per-tool count, not a compliance record
+	// the way an audit_event row is, so ORBEAT_AUDIT_RETENTION_DAYS' off-by-
+	// default direction is the wrong precedent here; the deployment
+	// registry's is the right one. Read only by cmd/api, and only in an
+	// Enterprise build (usage_daily itself is Enterprise-only).
+	UsageRetentionDays string
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -126,10 +217,14 @@ func Load() (Config, error) {
 
 		ArtifactRevisionKeep: getenv("ORBEAT_ARTIFACT_REVISION_KEEP", "0"),
 
+		DeploymentRegistry:      os.Getenv("ORBEAT_DEPLOYMENT_REGISTRY"),
+		DeploymentRetentionDays: os.Getenv("ORBEAT_DEPLOYMENT_RETENTION_DAYS"),
+
 		RateLimitRPS:       os.Getenv("ORBEAT_RATELIMIT_RPS"),
 		RateLimitBurst:     os.Getenv("ORBEAT_RATELIMIT_BURST"),
 		RateLimitInitRPS:   os.Getenv("ORBEAT_RATELIMIT_INIT_RPS"),
 		GatewayMaxInflight: os.Getenv("ORBEAT_GATEWAY_MAX_INFLIGHT"),
+		Intercept:          os.Getenv("ORBEAT_INTERCEPT"),
 
 		LogFormat: getenv("ORBEAT_LOG_FORMAT", "json"),
 		LogLevel:  getenv("ORBEAT_LOG_LEVEL", "info"),
@@ -146,6 +241,12 @@ func Load() (Config, error) {
 		ScanLLMTimeout:  getenv("ORBEAT_SCAN_LLM_TIMEOUT", "15s"),
 
 		ContactEmail: strings.TrimSpace(os.Getenv("ORBEAT_CONTACT_EMAIL")),
+
+		DCRClientID:        os.Getenv("ORBEAT_DCR_CLIENT_ID"),
+		DCRClientSecretRef: os.Getenv("ORBEAT_DCR_CLIENT_SECRET_REF"),
+
+		UsageFlushInterval: getenv("ORBEAT_USAGE_FLUSH_INTERVAL", "60s"),
+		UsageRetentionDays: os.Getenv("ORBEAT_USAGE_RETENTION_DAYS"),
 	}
 	if c.DBURL == "" {
 		return Config{}, errors.New("ORBEAT_DB_URL is required")
@@ -163,15 +264,41 @@ func Load() (Config, error) {
 // ORBEAT_MARKETPLACE_GIT_CREDENTIAL_REF (a SecretsProvider ref), never the
 // URL. Local filesystem paths and SCP-like "git@host:path" syntax (no
 // "://", conventional SSH login, key-based auth) are left alone.
+//
+// The credential test is a STRING scan for "@" after the scheme, run before any
+// parse, and it replaces the u.User != nil test this guard used to make. That
+// is not a stylistic swap. url.Parse FAILS on the exact URLs this guard exists
+// to reject: a token containing "/" makes the authority unparseable, so
+// url.Parse("https://x-access-token:b64/token+val@github.com/o/r") returns
+// `invalid port ":b64" after host`, and the old `if err != nil ... return nil`
+// treated that as acceptable. A parse error meant ACCEPTED. It is the same
+// fail-open shape audit A6 fixed one layer down in internal/publish, and the
+// scan here is that fix's rule applied at the same width: within a
+// "scheme://..." string, everything up to the last "@" is userinfo.
+//
+// Cost of the over-approximation, stated because it is real: a URL whose PATH
+// contains "@" and carries no credential is refused, so
+// "https://github.com/org/repo@v1.git" does not start. internal/publish already
+// accepted the same cost (it over-redacts that URL), and the two layers now
+// agree on one rule rather than each guessing. Refusing at startup with a named
+// variable is also the recoverable end of the trade: the operator sees the
+// message immediately, where a leaked push token is not recoverable at all.
+// Note that "ssh://git@host/repo.git" was already refused by the u.User test
+// this replaces; only the path-"@" case is newly refused.
+//
+// Neither message echoes raw, and the parse failure is NOT wrapped: url.Error's
+// own text quotes the whole URL, which on the motivating input is the token.
 func checkMarketplaceGitURL(raw string) error {
 	if raw == "" || !strings.Contains(raw, "://") {
 		return nil
 	}
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return nil
+	if _, afterScheme, _ := strings.Cut(raw, "://"); strings.Contains(afterScheme, "@") {
+		return fmt.Errorf("ORBEAT_MARKETPLACE_GIT_URL must not embed credentials (user:token@); set ORBEAT_MARKETPLACE_GIT_CREDENTIAL_REF instead")
 	}
-	return fmt.Errorf("ORBEAT_MARKETPLACE_GIT_URL must not embed credentials (user:token@); set ORBEAT_MARKETPLACE_GIT_CREDENTIAL_REF instead")
+	if _, err := url.Parse(raw); err != nil {
+		return errors.New("ORBEAT_MARKETPLACE_GIT_URL is not a parseable URL (the value is not echoed: it may carry a credential)")
+	}
+	return nil
 }
 
 // MarketplaceGitTimeoutDuration parses the configured publish timeout. It falls
@@ -227,6 +354,56 @@ func (c Config) ArtifactRevisionKeepN() int {
 	n, err := strconv.Atoi(strings.TrimSpace(c.ArtifactRevisionKeep))
 	if err != nil || n < 0 {
 		return 0
+	}
+	return n
+}
+
+// DeploymentRegistryEnabled reports whether the operator asked for the
+// artifact deployment registry. Only an explicit, unambiguous affirmative
+// counts: "1", "t", "true", "T", "TRUE" and the rest of strconv.ParseBool's
+// accepted set, case-insensitively. Anything else, including unset, empty,
+// "yes", "on" and a typo, is OFF.
+//
+// Unparseable means off rather than an error, mirroring every other accessor
+// in this file: Load() also runs in cmd/gateway, which never reads this knob,
+// so a strict failure would stop the gateway starting over a value it does not
+// use. The direction the leniency falls matters here more than elsewhere,
+// because this knob turns on per-developer collection: a value nobody can read
+// as a clear yes must never be read as one.
+func (c Config) DeploymentRegistryEnabled() bool {
+	on, err := strconv.ParseBool(strings.TrimSpace(c.DeploymentRegistry))
+	return err == nil && on
+}
+
+// DeploymentRetentionDaysN is the deployment-registry retention window in
+// days; 0 = off (keep forever). It defaults to 90, which is the one retention
+// default in this file that is ON, and the asymmetry with AuditRetentionDaysN
+// is deliberate rather than an oversight (spec sec 7.2): an audit row is a
+// compliance record and deleting it is a loss, a deployment row is a claim
+// about a named person's machine that stops being true the moment that
+// machine goes quiet.
+//
+// THE DIRECTION THE LENIENCY FALLS IS THE OPPOSITE OF AuditRetentionDaysN's,
+// and that follows from the same principle rather than contradicting it.
+// There, an unreadable value collapses to 0 so a typo can never silently
+// start deleting compliance records. Here, 0 is the dangerous answer, so an
+// unset, blank, negative or unparseable value collapses to the 90-day default
+// and only an explicit, readable "0" keeps rows forever. That mirrors
+// AuditExportMaxRowsN's shape, which is the existing precedent in this file
+// for a knob whose default is a real number rather than a sentinel.
+//
+// Unparseable means "the default" rather than an error for the reason
+// ArtifactRevisionKeepN states: Load() also runs in cmd/gateway, which never
+// reads this knob, so a strict failure would stop the gateway starting over a
+// value it does not use.
+func (c Config) DeploymentRetentionDaysN() int {
+	s := strings.TrimSpace(c.DeploymentRetentionDays)
+	if s == "" {
+		return 90
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 90
 	}
 	return n
 }
@@ -296,6 +473,60 @@ func (c Config) GatewayMaxInflightN(def int) int {
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 0 {
 		return def
+	}
+	return n
+}
+
+// UsageFlushIntervalDuration is how often cmd/gateway flushes usage counts
+// and refreshes the quota cache (default 60s; an unparseable or non-positive
+// value falls back to it, mirroring AuditRetentionIntervalDuration's own
+// fallback shape exactly).
+//
+// THERE IS NO OFF SWITCH FOR COUNTING ITSELF, and that is capo's explicit
+// call (docs/plans/orbeat-usage-metering-2026-08-25.md Task 5), not an
+// oversight: counting is cheap (an in-memory map increment, off the
+// tool-call hot path by construction -- usage.ee.go's UsageCounter.Count
+// never touches the database) and it IS the subsystem's entire value --
+// quota enforcement reads nothing but what counting wrote, so an off-by-
+// default counter would leave every role_quota row an admin ever sets
+// permanently inert, the exact "nine tasks of tested code connected to
+// nothing" failure mode this task's own wiring gate exists to catch, just
+// moved one layer up from "not installed" to "installed but never counts
+// anything". Quota ENFORCEMENT needs no separate toggle either, for the
+// opposite reason: it is already off in every practical sense until an
+// admin creates a role_quota row (QuotaEnforcer.Check's documented "no
+// cache entry is unlimited" contract, quota.ee.go) -- gating it a second
+// time at the config layer would just be two off-switches for one behavior.
+func (c Config) UsageFlushIntervalDuration() time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(c.UsageFlushInterval))
+	if err != nil || d <= 0 {
+		return 60 * time.Second
+	}
+	return d
+}
+
+// UsageRetentionDaysN is the usage_daily retention window in days; 0 = off
+// (keep forever). Defaults to 90 -- ON, mirroring DeploymentRetentionDaysN's
+// shape exactly, including which direction leniency falls (empty, negative
+// or unparseable all collapse to the 90-day default; only an explicit,
+// readable "0" keeps rows forever) and why: capo's stated call is that usage
+// rows accumulate forever otherwise, and a usage_daily row is closer in kind
+// to a deployment row (a claim that decays -- here, "how much a role called
+// last spring" is of steadily shrinking operational relevance once that
+// month's quota window has long closed) than to an audit_event row (a
+// compliance record whose deletion is a loss). Unparseable means "the
+// default" rather than an error for the reason DeploymentRetentionDaysN and
+// ArtifactRevisionKeepN both give: Load() also runs in cmd/gateway, which
+// never reads this knob, so a strict failure would stop the gateway starting
+// over a value it does not use.
+func (c Config) UsageRetentionDaysN() int {
+	s := strings.TrimSpace(c.UsageRetentionDays)
+	if s == "" {
+		return 90
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 90
 	}
 	return n
 }

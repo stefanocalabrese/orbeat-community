@@ -56,7 +56,7 @@ func TestAdminCreateServerOmitsSecretRef(t *testing.T) {
 		// (the create response never leaks secretRef), and env: is the one
 		// scheme registered in every tier (docs/specs/2026-08-19-orbeat-
 		// community-repo-generation-design.md §4).
-		"secretRef": "env:GITHUB_TOKEN", "status": "active",
+		"secretRef": "env:ORBEAT_UPSTREAM_GITHUB_TOKEN", "status": "active",
 	}
 	rec := httptest.NewRecorder()
 	srv.handleCreateServer(rec, adminReq(ctx, http.MethodPost, "/v1/admin/servers", in, tn))
@@ -82,7 +82,7 @@ func TestAdminCreateServerOmitsSecretRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if m.SecretRef != "env:GITHUB_TOKEN" || m.TenantID != tn.ID {
+	if m.SecretRef != "env:ORBEAT_UPSTREAM_GITHUB_TOKEN" || m.TenantID != tn.ID {
 		t.Fatalf("bad persisted server: %+v", m)
 	}
 	evs, _ := st.ListAuditEventsByTenant(ctx, tn.ID, 10)
@@ -91,6 +91,13 @@ func TestAdminCreateServerOmitsSecretRef(t *testing.T) {
 	}
 }
 
+// TestAdminUpdateServerReplacesAndAudits proves a full-replace update applies
+// every field, bumps row_version, and audits — using an EXPLICIT "" for
+// secretRef so the clear is a deliberate part of the request (defect 1,
+// 2026-09-01: an update body's tri-state secretRef/tlsCaRef distinguishes
+// "not mentioned" from "explicit empty string" — see
+// TestAdminUpdateServerOmittedRefsPreserveExisting below for the omitted-key
+// case this test used to conflate with a clear).
 func TestAdminUpdateServerReplacesAndAudits(t *testing.T) {
 	ctx := context.Background()
 	srv, st, tn := newAdminServer(t)
@@ -99,11 +106,12 @@ func TestAdminUpdateServerReplacesAndAudits(t *testing.T) {
 		EndpointOrCommand: "https://old", SecretRef: "vault:kv/old#token", Status: "active",
 	})
 
-	// Full-replace update that clears the secret (no secretRef in the body).
-	// "disabled" is one of the two valid lifecycle states (active|disabled).
+	// Full-replace update that EXPLICITLY clears the secret ("secretRef":"" is
+	// present in the body). "disabled" is one of the two valid lifecycle
+	// states (active|disabled).
 	in := map[string]any{
 		"name": "upd", "transport": "http",
-		"endpointOrCommand": "https://new", "status": "disabled",
+		"endpointOrCommand": "https://new", "secretRef": "", "status": "disabled",
 	}
 	rec := httptest.NewRecorder()
 	req := adminReq(ctx, http.MethodPut, "/v1/admin/servers/"+orig.ID, in, tn)
@@ -128,7 +136,7 @@ func TestAdminUpdateServerReplacesAndAudits(t *testing.T) {
 		t.Fatalf("rowVersion = %v, want 2", got["rowVersion"])
 	}
 	if got["hasSecret"] != false {
-		t.Fatalf("hasSecret should be false after clearing secret: %+v", got)
+		t.Fatalf("hasSecret should be false after the explicit clear: %+v", got)
 	}
 	if _, leaked := got["secretRef"]; leaked {
 		t.Fatal("update leaked secretRef")
@@ -141,6 +149,154 @@ func TestAdminUpdateServerReplacesAndAudits(t *testing.T) {
 	evs, _ := st.ListAuditEventsByTenant(ctx, tn.ID, 10)
 	if len(evs) != 1 || evs[0].Action != "server.update" || evs[0].Decision != "allow" {
 		t.Fatalf("expected one server.update audit, got %+v", evs)
+	}
+}
+
+// TestAdminUpdateServerOmittedRefsPreserveExisting is the HTTP-layer proof
+// for defect 1 (2026-09-01, BREAKING): a PUT body that OMITS secretRef and
+// tlsCaRef entirely must leave both exactly as they were, not wipe them —
+// which is what the pre-fix contract did, silently, because
+// GetMCPServer/toAdminServerDTO never echo either ref back (hasSecret/
+// hasTlsCa booleans only), so no read-modify-write client could ever have
+// resent the value it was never shown.
+func TestAdminUpdateServerOmittedRefsPreserveExisting(t *testing.T) {
+	ctx := context.Background()
+	srv, st, tn := newAdminServer(t)
+	orig, _ := st.CreateMCPServer(ctx, store.MCPServer{
+		TenantID: tn.ID, Name: "preserve-http", Transport: "http",
+		EndpointOrCommand: "https://old",
+		SecretRef:         "vault:kv/old#token", TLSCARef: "env:ORBEAT_UPSTREAM_CA",
+		Status: "active",
+	})
+
+	// Neither secretRef nor tlsCaRef appears in this body at all — a caller
+	// updating only the endpoint, exactly the read-modify-write script defect
+	// 1 describes.
+	in := map[string]any{
+		"name": "preserve-http", "transport": "http",
+		"endpointOrCommand": "https://new", "status": "active",
+	}
+	rec := httptest.NewRecorder()
+	req := adminReq(ctx, http.MethodPut, "/v1/admin/servers/"+orig.ID, in, tn)
+	req.SetPathValue("id", orig.ID)
+	req.Header.Set("If-Match", etag(orig.RowVersion))
+	srv.handleUpdateServer(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update = %d, body %s", rec.Code, rec.Body)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["endpointOrCommand"] != "https://new" {
+		t.Fatalf("the mentioned field must still apply: %+v", got)
+	}
+	if got["hasSecret"] != true || got["hasTlsCa"] != true {
+		t.Fatalf("omitting secretRef/tlsCaRef must preserve both, got hasSecret=%v hasTlsCa=%v",
+			got["hasSecret"], got["hasTlsCa"])
+	}
+	m, err := st.GetMCPServer(ctx, tn.ID, orig.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if m.SecretRef != "vault:kv/old#token" {
+		t.Fatalf("SecretRef = %q, want it preserved unchanged", m.SecretRef)
+	}
+	if m.TLSCARef != "env:ORBEAT_UPSTREAM_CA" {
+		t.Fatalf("TLSCARef = %q, want it preserved unchanged", m.TLSCARef)
+	}
+}
+
+// TestAdminUpdateServerExplicitEmptyRefsClear is
+// TestAdminUpdateServerOmittedRefsPreserveExisting's counterpart: sending an
+// EXPLICIT "" for both refs must still clear them, proving the fix adds a
+// third state rather than removing the ability to clear at all.
+func TestAdminUpdateServerExplicitEmptyRefsClear(t *testing.T) {
+	ctx := context.Background()
+	srv, st, tn := newAdminServer(t)
+	orig, _ := st.CreateMCPServer(ctx, store.MCPServer{
+		TenantID: tn.ID, Name: "clear-http", Transport: "http",
+		EndpointOrCommand: "https://old",
+		SecretRef:         "vault:kv/old#token", TLSCARef: "env:ORBEAT_UPSTREAM_CA",
+		Status: "active",
+	})
+
+	in := map[string]any{
+		"name": "clear-http", "transport": "http",
+		"endpointOrCommand": "https://old", "secretRef": "", "tlsCaRef": "", "status": "active",
+	}
+	rec := httptest.NewRecorder()
+	req := adminReq(ctx, http.MethodPut, "/v1/admin/servers/"+orig.ID, in, tn)
+	req.SetPathValue("id", orig.ID)
+	req.Header.Set("If-Match", etag(orig.RowVersion))
+	srv.handleUpdateServer(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update = %d, body %s", rec.Code, rec.Body)
+	}
+	m, err := st.GetMCPServer(ctx, tn.ID, orig.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if m.SecretRef != "" {
+		t.Fatalf("SecretRef = %q, want cleared", m.SecretRef)
+	}
+	if m.TLSCARef != "" {
+		t.Fatalf("TLSCARef = %q, want cleared", m.TLSCARef)
+	}
+}
+
+// TestAdminUpdateServerReplaceThenOmitPreservesTheReplacedValue chains a
+// replace and a later omit: the second PUT must preserve whatever the FIRST
+// PUT actually wrote, not some earlier value — proving the tri-state reads
+// the live row rather than assuming a caller-supplied "previous" value.
+func TestAdminUpdateServerReplaceThenOmitPreservesTheReplacedValue(t *testing.T) {
+	ctx := context.Background()
+	srv, st, tn := newAdminServer(t)
+	orig, _ := st.CreateMCPServer(ctx, store.MCPServer{
+		TenantID: tn.ID, Name: "chain", Transport: "http",
+		EndpointOrCommand: "https://old", SecretRef: "env:ORBEAT_UPSTREAM_OLD_TOKEN", Status: "active",
+	})
+
+	replace := map[string]any{
+		"name": "chain", "transport": "http",
+		"endpointOrCommand": "https://old", "secretRef": "env:ORBEAT_UPSTREAM_NEW_TOKEN", "status": "active",
+	}
+	rec := httptest.NewRecorder()
+	req := adminReq(ctx, http.MethodPut, "/v1/admin/servers/"+orig.ID, replace, tn)
+	req.SetPathValue("id", orig.ID)
+	req.Header.Set("If-Match", etag(orig.RowVersion))
+	srv.handleUpdateServer(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replace = %d, body %s", rec.Code, rec.Body)
+	}
+	var replaced struct {
+		RowVersion int64 `json:"rowVersion"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &replaced); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	omit := map[string]any{
+		"name": "chain", "transport": "http",
+		"endpointOrCommand": "https://newer", "status": "active",
+	}
+	rec2 := httptest.NewRecorder()
+	req2 := adminReq(ctx, http.MethodPut, "/v1/admin/servers/"+orig.ID, omit, tn)
+	req2.SetPathValue("id", orig.ID)
+	req2.Header.Set("If-Match", etag(replaced.RowVersion))
+	srv.handleUpdateServer(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("omit = %d, body %s", rec2.Code, rec2.Body)
+	}
+
+	m, err := st.GetMCPServer(ctx, tn.ID, orig.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if m.SecretRef != "env:ORBEAT_UPSTREAM_NEW_TOKEN" {
+		t.Fatalf("SecretRef = %q, want the FIRST update's value preserved, not the original", m.SecretRef)
 	}
 }
 
@@ -595,6 +751,155 @@ func TestAdminCreateRoleAndList(t *testing.T) {
 	}
 }
 
+// TestCreateRoleRefusesKeycloakBuiltinNames is audit B8's create-half
+// red-proof: a role named after either Keycloak built-in must be refused
+// with 400, and refused BEFORE anything is persisted (no row, no audit
+// event) — never merely "created but harmless somehow".
+// TestRefuseKeycloakBuiltinRoleName is the pure, direct unit proof for
+// refuseKeycloakBuiltinRoleName (admin_roles.go) — table-driven so the
+// prefix rule's exact boundary is pinned independently of any HTTP handler:
+// a "default-roles-" prefix match (any realm), the bare prefix by itself,
+// the two exact-match sentinels, AND the cases that must NOT match (a
+// near-miss missing the hyphen, a differently-cased prefix, and an ordinary
+// role name) — a test that only asserted the positive cases could pass on a
+// mutant that refuses everything.
+func TestRefuseKeycloakBuiltinRoleName(t *testing.T) {
+	cases := []struct {
+		name    string
+		refused bool
+	}{
+		{"offline_access", true},
+		{"uma_authorization", true},
+		{"default-roles-orbeat", true},
+		{"default-roles-prod", true},
+		{"default-roles-some-other-realm-name", true},
+		{"default-roles-", true},        // the bare prefix, no realm suffix at all
+		{"default-rolesabc", false},     // missing hyphen: not Keycloak's literal
+		{"Default-Roles-orbeat", false}, // different case: not Keycloak's literal
+		{"orbeat-admin", false},
+		{"ci-runner", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := refuseKeycloakBuiltinRoleName(tc.name); got != tc.refused {
+				t.Fatalf("refuseKeycloakBuiltinRoleName(%q) = %v, want %v", tc.name, got, tc.refused)
+			}
+		})
+	}
+}
+
+func TestCreateRoleRefusesKeycloakBuiltinNames(t *testing.T) {
+	ctx := context.Background()
+	srv, st, tn := newAdminServer(t)
+
+	for _, name := range []string{"offline_access", "uma_authorization", "default-roles-orbeat"} {
+		t.Run(name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			srv.handleCreateRole(rec, adminReq(ctx, http.MethodPost, "/v1/admin/roles", map[string]any{"name": name}, tn))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("create role %q = %d, want 400, body %s", name, rec.Code, rec.Body)
+			}
+			roles, err := st.ListRolesPage(ctx, tn.ID, nil, 0, false, "")
+			if err != nil {
+				t.Fatalf("list roles: %v", err)
+			}
+			for _, r := range roles {
+				if r.Name == name {
+					t.Fatalf("a role named %q was persisted despite the 400", name)
+				}
+			}
+			evs, err := st.ListAuditEventsByTenant(ctx, tn.ID, 50)
+			if err != nil {
+				t.Fatalf("list audit: %v", err)
+			}
+			for _, ev := range evs {
+				if ev.Action == "role.create" && ev.Metadata["name"] == name {
+					t.Fatalf("a role.create audit event was recorded for the refused name %q", name)
+				}
+			}
+		})
+	}
+
+	// A legitimate role sharing no name with either built-in must still be
+	// admitted — otherwise this could be a mutant that refuses everything.
+	rec := httptest.NewRecorder()
+	srv.handleCreateRole(rec, adminReq(ctx, http.MethodPost, "/v1/admin/roles", map[string]any{"name": "ci-runner"}, tn))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create role %q = %d, want 201, body %s", "ci-runner", rec.Code, rec.Body)
+	}
+}
+
+// TestUpdateRoleRefusesKeycloakBuiltinNames is TestCreateRoleRefusesKeycloak-
+// BuiltinNames' rename-path counterpart — B8's own scope names BOTH create
+// and rename, and until this test neither the two exact-match sentinels nor
+// the new default-roles- prefix (defect 2, 2026-09-01) had a rename-path
+// proof: refuseKeycloakBuiltinRoleName is shared code, but a shared function
+// wired into two call sites needs a test AT each call site, since a future
+// edit could remove the check from one handler while leaving the other, and
+// a create-only test would never notice a rename regression.
+//
+// s.roleExists is left nil (no realm-role lookup configured) on purpose: the
+// refusal in handleUpdateRole runs BEFORE verifyIdpRename is ever called
+// (admin_roles.go's own comment on that ordering), so this test exercises
+// the refusal in isolation from the IdP-verification path entirely — a
+// rename to a refused name must 400 regardless of whether a lookup is
+// configured.
+func TestUpdateRoleRefusesKeycloakBuiltinNames(t *testing.T) {
+	ctx := context.Background()
+	srv, st, tn := newAdminServer(t)
+
+	for _, name := range []string{"offline_access", "uma_authorization", "default-roles-orbeat"} {
+		t.Run(name, func(t *testing.T) {
+			orig, err := st.CreateRole(ctx, tn.ID, "rename-target-"+name)
+			if err != nil {
+				t.Fatalf("seed role: %v", err)
+			}
+			rec := httptest.NewRecorder()
+			req := adminReq(ctx, http.MethodPut, "/v1/admin/roles/"+orig.ID,
+				map[string]any{"name": name}, tn)
+			req.SetPathValue("id", orig.ID)
+			req.Header.Set("If-Match", etag(orig.RowVersion))
+			srv.handleUpdateRole(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("rename role to %q = %d, want 400, body %s", name, rec.Code, rec.Body)
+			}
+			m, err := st.GetRole(ctx, tn.ID, orig.ID)
+			if err != nil {
+				t.Fatalf("get role: %v", err)
+			}
+			if m.Name == name {
+				t.Fatalf("role was renamed to %q despite the 400", name)
+			}
+			evs, err := st.ListAuditEventsByTenant(ctx, tn.ID, 50)
+			if err != nil {
+				t.Fatalf("list audit: %v", err)
+			}
+			for _, ev := range evs {
+				if ev.Action == "role.rename" && ev.Metadata["to"] == name {
+					t.Fatalf("a role.rename audit event was recorded for the refused name %q", name)
+				}
+			}
+		})
+	}
+
+	// A legitimate rename target sharing no name with any built-in must
+	// still be admitted.
+	orig, err := st.CreateRole(ctx, tn.ID, "rename-target-ok")
+	if err != nil {
+		t.Fatalf("seed role: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := adminReq(ctx, http.MethodPut, "/v1/admin/roles/"+orig.ID,
+		map[string]any{"name": "ci-runner-2", "idpRenamed": true}, tn)
+	req.SetPathValue("id", orig.ID)
+	req.Header.Set("If-Match", etag(orig.RowVersion))
+	srv.handleUpdateRole(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legitimate rename = %d, want 200, body %s", rec.Code, rec.Body)
+	}
+}
+
 func TestAdminCreateEntitlementValidatesTenant(t *testing.T) {
 	ctx := context.Background()
 	srv, st, tn := newAdminServer(t)
@@ -643,7 +948,7 @@ func TestAdminCreateEntitlementForeignRoleIs400(t *testing.T) {
 		t.Fatalf("foreign-role entitlement = %d, want 400", rec.Code)
 	}
 	// Nothing should have been created, and no audit row written (validation precedes auditedTx).
-	ents, _ := st.ListEntitlementsPage(ctx, tn.ID, nil, 0)
+	ents, _ := st.ListEntitlementsPage(ctx, tn.ID, nil, 0, false)
 	if len(ents) != 0 {
 		t.Fatalf("foreign-role entitlement must not be created: %+v", ents)
 	}
@@ -668,7 +973,7 @@ func TestAdminDeleteEntitlementIsAuditedAnd204(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete entitlement = %d, want 204", rec.Code)
 	}
-	ents, _ := st.ListEntitlementsPage(ctx, tn.ID, nil, 0)
+	ents, _ := st.ListEntitlementsPage(ctx, tn.ID, nil, 0, false)
 	if len(ents) != 0 {
 		t.Fatalf("entitlement not deleted: %+v", ents)
 	}
@@ -917,7 +1222,7 @@ func TestAdminDeleteRoleCascadesAndAudits(t *testing.T) {
 	}
 
 	// Both grants are actually gone.
-	ents, err := st.ListEntitlementsPage(ctx, tn.ID, nil, 0)
+	ents, err := st.ListEntitlementsPage(ctx, tn.ID, nil, 0, false)
 	if err != nil {
 		t.Fatalf("list entitlements: %v", err)
 	}
@@ -926,7 +1231,7 @@ func TestAdminDeleteRoleCascadesAndAudits(t *testing.T) {
 			t.Errorf("entitlement %s survived the role deletion", e.ID)
 		}
 	}
-	aents, err := st.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0)
+	aents, err := st.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0, false)
 	if err != nil {
 		t.Fatalf("list artifact entitlements: %v", err)
 	}
@@ -969,7 +1274,7 @@ func TestAdminDeleteRoleCascadesAndAudits(t *testing.T) {
 		t.Errorf("metadata[artifacts] = %v, want [del-art]", ev.Metadata["artifacts"])
 	}
 	// truncated must be present and false: only one server/artifact grant
-	// existed, well under maxGrantNames, so the name lists were not capped.
+	// existed, well under store.MaxGrantNames, so the name lists were not capped.
 	// Red-proven: dropping the handler's "truncated" key from the Metadata
 	// map (admin_roles.go) leaves every assertion above green — only this
 	// one catches it.
@@ -1033,7 +1338,7 @@ func TestAdminDeleteRoleNotFound(t *testing.T) {
 	}
 
 	// The foreign role, targeted from the wrong tenant above, must still exist.
-	roles, err := st.ListRolesPage(ctx, other.ID, nil, 0)
+	roles, err := st.ListRolesPage(ctx, other.ID, nil, 0, false, "")
 	if err != nil {
 		t.Fatalf("list foreign-tenant roles: %v", err)
 	}

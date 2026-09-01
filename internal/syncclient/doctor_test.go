@@ -10,7 +10,7 @@ import (
 
 func TestDiagnoseReportsAnAbsentSyncRoot(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "never-synced")
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	// 2, not 1: Diagnose always appends a CheckAuth note last (see
 	// TestDiagnoseOnAHealthyTreeHasOnlyTheAuthNote below), so Findings[0] is
@@ -43,7 +43,7 @@ func TestDiagnoseReportsAnAbsentSyncRoot(t *testing.T) {
 // that reads as broken.
 func TestDiagnoseOnAHealthyTreeHasOnlyTheAuthNote(t *testing.T) {
 	home := t.TempDir()
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	if rep.Problems() != 0 {
 		t.Fatalf("a healthy tree must report zero problems, got %d: %+v", rep.Problems(), rep.Findings)
@@ -95,7 +95,7 @@ func TestDiagnoseOnAnUnreadableSyncRootBlamesTheRootNotTheManifest(t *testing.T)
 		t.Skip("mode 000 did not block os.ReadDir here — permissions not enforced, skipping")
 	}
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	// 2, not 1: the always-present auth note (see
 	// TestDiagnoseOnAHealthyTreeHasOnlyTheAuthNote) is always Findings' last
@@ -120,7 +120,7 @@ func TestDiagnoseOnASyncRootThatIsARegularFileBlamesTheRootNotTheManifest(t *tes
 		t.Fatal(err)
 	}
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	// 2, not 1: same always-present auth note as above, always last.
 	if len(rep.Findings) != 2 {
@@ -135,7 +135,7 @@ func TestDiagnoseReportsAnUnreachableProject(t *testing.T) {
 	home := t.TempDir()
 	gone := filepath.Join(t.TempDir(), "unmounted")
 
-	rep := Diagnose(home, []string{gone})
+	rep := Diagnose(home, []string{gone}, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -163,7 +163,7 @@ func TestDiagnoseDedupesDuplicateProjectEntries(t *testing.T) {
 	home := t.TempDir()
 	gone := filepath.Join(t.TempDir(), "unmounted")
 
-	rep := Diagnose(home, []string{gone, gone})
+	rep := Diagnose(home, []string{gone, gone}, "", "", "")
 
 	var n int
 	for _, f := range rep.Findings {
@@ -191,7 +191,7 @@ func TestDiagnoseReportsPreservedEntriesAsNotesNotProblems(t *testing.T) {
 	// all) for a reason that has nothing to do with what this test pins. A
 	// ledger entry for a project that was simply never (or no longer)
 	// registered must still surface as a note on its own.
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	for _, f := range rep.Findings {
 		if f.Check == CheckPreservedEntry {
@@ -219,7 +219,7 @@ func TestDiagnoseSuppressesPreservedEntryNoteWhenProjectAlreadyReportedUnreachab
 	gone := filepath.Join(t.TempDir(), "unmounted")
 	must(t, saveManifest(home, manifest{Rules: []string{gone}}, nil))
 
-	rep := Diagnose(home, []string{gone})
+	rep := Diagnose(home, []string{gone}, "", "", "")
 
 	var problem *Finding
 	for i := range rep.Findings {
@@ -266,13 +266,19 @@ func TestCheckLedgerDriftUsesThePassedManifestNotADiskRead(t *testing.T) {
 	// On disk: no Files entry at all — a fresh read would find no drift.
 	must(t, saveManifest(home, manifest{}, nil))
 
-	// Passed in: a Files entry naming a file that does not exist on disk.
-	passed := manifest{Files: []string{"ghost.md"}}
+	// Passed in: a Files entry naming a file that does not exist on disk. The
+	// path has to be one orbeat-sync could actually have written
+	// (validManagedFilePath), or the drift check never runs: a shape-invalid
+	// entry gets its own note and is skipped, since sync drops it rather than
+	// recreating it.
+	passed := manifest{Files: []string{"agents/ghost.md"}}
 
 	var r Report
-	r.checkLedgerDrift(home, passed, nil)
+	// nil projects: this test is about the Files ledger, which does not consult
+	// the trusted-root set at all.
+	r.checkLedgerDrift(home, nil, passed, nil)
 
-	want := filepath.Join(home, "ghost.md")
+	want := filepath.Join(home, "agents", "ghost.md")
 	var found bool
 	for _, f := range r.Findings {
 		if f.Check == CheckLedgerDrift && f.Path == want {
@@ -292,7 +298,7 @@ func TestDiagnoseReportsLedgerDrift(t *testing.T) {
 	// but the operator cannot see that coming without doctor telling them.
 	must(t, saveManifest(home, manifest{Files: []string{"agents/ghost.md"}}, nil))
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -325,7 +331,7 @@ func TestDiagnoseIsSilentOnAnIntactLedger(t *testing.T) {
 	}
 	must(t, saveManifest(home, manifest{Files: []string{"agents/a.md"}}, nil))
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	for _, f := range rep.Findings {
 		if f.Check == CheckLedgerDrift {
@@ -355,7 +361,7 @@ func TestDiagnoseReportsAVanishedSeedFileAsANote(t *testing.T) {
 	path := filepath.Join(proj, ".claude", "agent-memory", "gone-agent", "MEMORY.md")
 	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"gone-agent": {path}}}, nil))
 
-	rep := Diagnose(home, []string{proj})
+	rep := Diagnose(home, []string{proj}, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -389,7 +395,7 @@ func TestDiagnoseReportsAMalformedRulesMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep := Diagnose(home, []string{proj})
+	rep := Diagnose(home, []string{proj}, "", "", "")
 
 	var found *Finding
 	agentsPath := filepath.Join(proj, "AGENTS.md")
@@ -416,7 +422,7 @@ func TestDiagnoseIsSilentOnHealthyMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep := Diagnose(home, []string{proj})
+	rep := Diagnose(home, []string{proj}, "", "", "")
 
 	for _, f := range rep.Findings {
 		if f.Check == CheckMarkers {
@@ -451,7 +457,7 @@ func TestDiagnoseDoesNotCallDocumentationOfTheMarkerAnOrphan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep := Diagnose(home, []string{proj})
+	rep := Diagnose(home, []string{proj}, "", "", "")
 
 	var sawMarkers bool
 	for _, f := range rep.Findings {
@@ -503,7 +509,7 @@ func TestDiagnoseDoesNotReadAnOversizedFileWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep := Diagnose(home, []string{proj})
+	rep := Diagnose(home, []string{proj}, "", "", "")
 
 	var sawTooLarge, sawMalformed bool
 	for _, f := range rep.Findings {
@@ -566,7 +572,7 @@ func TestDiagnoseReportsAnUnparseableManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -592,7 +598,7 @@ func TestDiagnoseReportsAnUnparseableManifest(t *testing.T) {
 func TestDiagnoseIsSilentOnAMissingManifest(t *testing.T) {
 	home := t.TempDir() // sync root exists; no manifest file inside it
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	for _, f := range rep.Findings {
 		if f.Check == CheckManifest {
@@ -612,7 +618,7 @@ func TestDiagnoseReportsATraversingFilesEntryAsAManifestProblem(t *testing.T) {
 	home := t.TempDir()
 	must(t, saveManifest(home, manifest{Files: []string{"../../../../etc/hosts"}}, nil))
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -646,7 +652,7 @@ func TestDiagnoseReportsAShapeInvalidRulesEntryAsANote(t *testing.T) {
 	home := t.TempDir()
 	must(t, saveManifest(home, manifest{Rules: []string{"not-an-absolute-path"}}, nil))
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -667,14 +673,14 @@ func TestDiagnoseReportsAShapeInvalidRulesEntryAsANote(t *testing.T) {
 
 // TestDiagnoseReportsAShapeInvalidSeedEntryAsANoteInPreservedEntries covers
 // the first of the two validSeedPath sites: checkPreservedEntries' Seeds
-// loop, which normally derives a project boundary via seedBoundary to check
+// loop, which normally guesses a project root via seedProjectGuess to check
 // reachability — a shape-invalid path can't safely go through that
 // derivation, so this site reports what it could not verify.
 func TestDiagnoseReportsAShapeInvalidSeedEntryAsANoteInPreservedEntries(t *testing.T) {
 	home := t.TempDir()
 	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"agent-x": {"relative/MEMORY.md"}}}, nil))
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -702,7 +708,7 @@ func TestDiagnoseReportsAShapeInvalidSeedEntryAsANoteInMarkers(t *testing.T) {
 	home := t.TempDir()
 	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"agent-x": {"relative/MEMORY.md"}}}, nil))
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -736,14 +742,20 @@ func writeOrphanSeedCandidate(t *testing.T, root, name string) string {
 }
 
 // TestDiagnoseFindsAnOrphanedBlock is the check with teeth: a seed MEMORY.md
-// carries a well-formed managed block, but the ledger is empty. The strip
-// pass works FROM the ledger, so nothing will ever remove this block — that
-// is exactly the state this check exists to surface.
+// carries a well-formed managed block, but the ledger is empty. This test owns
+// only that the check FIRES and names a remedy; its SEVERITY is owned by
+// TestDiagnoseCallsAnOrphanedSeedBlockANoteBecauseTheNextSyncStripsIt, which
+// also runs the sync that proves the severity right. This test used to assert
+// SeverityProblem and Problems() == 1, and both were assertions on a bug: the
+// seed strip pass is not ledger-only, so it removes this block by itself. The
+// Report.Problems() pin those lines carried moved to
+// TestDiagnoseFindsOrphanedRulesBlocksInBothManagedFiles, where a real
+// SeverityProblem still exists to count.
 func TestDiagnoseFindsAnOrphanedBlock(t *testing.T) {
 	home := t.TempDir()
 	path := writeOrphanSeedCandidate(t, filepath.Join(home, "agent-memory"), "orphan-agent")
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -754,22 +766,8 @@ func TestDiagnoseFindsAnOrphanedBlock(t *testing.T) {
 	if found == nil {
 		t.Fatalf("want a CheckOrphanedBlock finding for %s, got %+v", path, rep.Findings)
 	}
-	if found.Severity != SeverityProblem {
-		t.Errorf("an orphaned block needs attention — got severity %q", found.Severity)
-	}
 	if found.Remedy == "" {
 		t.Error("every finding must name what resolves it")
-	}
-	// The report has exactly one finding and it is a SeverityProblem, so
-	// Problems() must report 1 — pins Report.Problems() itself, not just the
-	// per-check finding. A Problems() that always returns 0 (or that counts
-	// every finding regardless of severity) satisfies every other assertion
-	// in this file, because none of them call Problems() directly: the human
-	// renderer's trailing summary line and the --json "problems" field both
-	// derive from it, so a wrong count here propagates silently everywhere
-	// that reads it, right down to scripts/smoke.sh's D1 gate.
-	if got := rep.Problems(); got != 1 {
-		t.Errorf("Problems() = %d, want 1 (one SeverityProblem finding, zero notes)", got)
 	}
 }
 
@@ -782,7 +780,7 @@ func TestDiagnoseDoesNotCallALedgeredBlockAnOrphan(t *testing.T) {
 	path := writeOrphanSeedCandidate(t, filepath.Join(home, "agent-memory"), "orphan-agent")
 	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"orphan-agent": {path}}}, nil))
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	for _, f := range rep.Findings {
 		if f.Check == CheckOrphanedBlock {
@@ -817,7 +815,7 @@ func TestDiagnoseFindsOrphanedRulesBlocksInBothManagedFiles(t *testing.T) {
 	// manifest), and exercising that path here doubles as coverage that
 	// checkOrphanedBlocks doesn't require a manifest file to exist.
 
-	rep := Diagnose(home, []string{proj})
+	rep := Diagnose(home, []string{proj}, "", "", "")
 
 	found := map[string]bool{}
 	for _, f := range rep.Findings {
@@ -836,6 +834,20 @@ func TestDiagnoseFindsOrphanedRulesBlocksInBothManagedFiles(t *testing.T) {
 	}
 	if !found[claudePath] {
 		t.Errorf("want a CheckOrphanedBlock finding for %s, got %+v", claudePath, rep.Findings)
+	}
+	// Two SeverityProblem findings and one CheckAuth note, so Problems() must
+	// report 2. This pins Report.Problems() itself, not just the per-check
+	// finding, and it lives here because the rules half is the half that
+	// legitimately produces a problem (the seed half is a note: see
+	// TestDiagnoseCallsAnOrphanedSeedBlockANoteBecauseTheNextSyncStripsIt).
+	// A Problems() that always returned 0, or that counted every finding
+	// regardless of severity, satisfies every other assertion in this file,
+	// because none of them call Problems() directly: the human renderer's
+	// trailing summary line and the --json "problems" field both derive from
+	// it, so a wrong count propagates silently everywhere that reads it,
+	// right down to scripts/smoke.sh's D1 gate.
+	if got := rep.Problems(); got != 2 {
+		t.Errorf("Problems() = %d, want 2 (two SeverityProblem findings, one note)", got)
 	}
 }
 
@@ -865,7 +877,7 @@ func TestDiagnoseReportsAMalformedMarkerOnALedgeredSeed(t *testing.T) {
 	}
 	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"ledgered-agent": {path}}}, nil))
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -926,7 +938,7 @@ func TestDiagnoseReportsAnUnreadableSeedMarkerFile(t *testing.T) {
 		t.Skip("mode 000 did not block os.ReadFile here — permissions not enforced, skipping")
 	}
 
-	rep := Diagnose(home, nil)
+	rep := Diagnose(home, nil, "", "", "")
 
 	var found *Finding
 	for i := range rep.Findings {
@@ -964,7 +976,7 @@ func TestDiagnoseWritesNothing(t *testing.T) {
 		}
 
 		beforeHome, beforeProj := treeSnapshot(t, home), treeSnapshot(t, proj)
-		_ = Diagnose(home, []string{proj})
+		_ = Diagnose(home, []string{proj}, "", "", "")
 		assertTreeUnchanged(t, "sync root", home, beforeHome)
 		assertTreeUnchanged(t, "project", proj, beforeProj)
 	})
@@ -979,11 +991,513 @@ func TestDiagnoseWritesNothing(t *testing.T) {
 		proj := t.TempDir()
 
 		before := treeSnapshot(t, parent)
-		_ = Diagnose(home, []string{proj})
+		_ = Diagnose(home, []string{proj}, "", "", "")
 
 		if _, err := os.Stat(home); !os.IsNotExist(err) {
 			t.Errorf("Diagnose created the sync root it was asked to inspect (stat err: %v)", err)
 		}
 		assertTreeUnchanged(t, "sync root's parent", parent, before)
 	})
+}
+
+// findingsForCheck returns every finding a check produced, so a gate can
+// assert both presence and absence without hard-coding an index into a list
+// other checks also append to.
+func findingsForCheck(rep Report, c Check) []Finding {
+	var out []Finding
+	for _, f := range rep.Findings {
+		if f.Check == c {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// An install.json that will not read stops this machine reporting deployments
+// while every other part of the sync keeps working, which is exactly the class
+// of silent breakage doctor exists to surface. It is a PROBLEM, not a note:
+// the file needs a human, and the obvious repair (delete it) costs this
+// machine its identity, so the remedy has to say so.
+func TestDiagnoseReportsAnUnreadableInstallFile(t *testing.T) {
+	home := t.TempDir()
+	ipath := filepath.Join(t.TempDir(), "install.json")
+	if err := os.WriteFile(ipath, []byte(`{"installId": "abc`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := Diagnose(home, nil, ipath, "", "")
+
+	found := findingsForCheck(rep, CheckInstall)
+	if len(found) != 1 {
+		t.Fatalf("want exactly one CheckInstall finding, got %+v", rep.Findings)
+	}
+	f := found[0]
+	if f.Severity != SeverityProblem {
+		t.Fatalf("an unreadable install identity must be a PROBLEM, got %q", f.Severity)
+	}
+	if f.Path != ipath {
+		t.Fatalf("finding path = %q, want %q", f.Path, ipath)
+	}
+	if !strings.Contains(f.Remedy, "NEW install id") {
+		t.Fatalf("the remedy must name what deleting the file costs, got %q", f.Remedy)
+	}
+	if rep.Problems() == 0 {
+		t.Fatal("Problems() = 0 while an unreadable install identity was found")
+	}
+}
+
+// An unparseable pins.json stops every held pin from applying silently:
+// runSync must not guess at a file it cannot read, so doctor names it a
+// PROBLEM, the same severity CheckInstall gives its own unreadable case.
+func TestDiagnoseReportsAnUnparseablePinsFile(t *testing.T) {
+	home := t.TempDir()
+	ppath := filepath.Join(t.TempDir(), "pins.json")
+	if err := os.WriteFile(ppath, []byte("{not valid json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := Diagnose(home, nil, "", ppath, "")
+
+	found := findingsForCheck(rep, CheckPins)
+	if len(found) != 1 {
+		t.Fatalf("want exactly one CheckPins finding, got %+v", rep.Findings)
+	}
+	if found[0].Severity != SeverityProblem {
+		t.Fatalf("an unparseable pin file must be a PROBLEM, got %q", found[0].Severity)
+	}
+	if found[0].Path != ppath {
+		t.Fatalf("finding path = %q, want %q", found[0].Path, ppath)
+	}
+	if found[0].Remedy == "" {
+		t.Error("every finding must name what resolves it")
+	}
+}
+
+// insertRevision numbers revisions from 1, so a pin holding a smaller number
+// can only come from a hand-edited file, the same class checkInstall's own
+// doc comment assumes for its unreadable case.
+func TestDiagnoseReportsAPinBelowRevisionOne(t *testing.T) {
+	home := t.TempDir()
+	ppath := filepath.Join(t.TempDir(), "pins.json")
+	must(t, savePins(ppath, []Pin{{ArtifactID: "a", Type: "skill", Name: "bad", Revision: 0}}))
+
+	rep := Diagnose(home, nil, "", ppath, "")
+
+	found := findingsForCheck(rep, CheckPins)
+	if len(found) != 1 {
+		t.Fatalf("want exactly one CheckPins finding, got %+v", rep.Findings)
+	}
+	if found[0].Severity != SeverityProblem {
+		t.Fatalf("a pin below revision 1 must be a PROBLEM, got %q", found[0].Severity)
+	}
+	if !strings.Contains(found[0].Detail, "skill/bad") {
+		t.Errorf("detail must name the offending pin, got %q", found[0].Detail)
+	}
+}
+
+// The healthy and the never-pinned cases are both SILENT. A machine that has
+// never run 'orbeat-sync pin' has no pins.json, and turning that into a
+// finding would put a permanent line in front of every developer who has
+// never used the feature.
+func TestDiagnoseIsSilentOnAHealthyOrAbsentPinsFile(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+
+	absent := filepath.Join(dir, "pins.json")
+	if found := findingsForCheck(Diagnose(home, nil, "", absent, ""), CheckPins); len(found) != 0 {
+		t.Fatalf("an absent pins.json produced %+v, want nothing", found)
+	}
+
+	must(t, savePins(absent, []Pin{{ArtifactID: "a", Type: "skill", Name: "good", Revision: 3}}))
+	rep := Diagnose(home, nil, "", absent, "")
+	if found := findingsForCheck(rep, CheckPins); len(found) != 0 {
+		t.Fatalf("a valid pins.json produced %+v, want nothing", found)
+	}
+	if rep.Problems() != 0 {
+		t.Fatalf("a healthy tree with a valid pins file must report zero problems, got %+v", rep.Findings)
+	}
+}
+
+// The healthy and the never-reported cases are both SILENT. A machine that has
+// never filed a report has no install.json, and turning that into a finding
+// would put a permanent line in front of every user of a server that does not
+// record deployments at all.
+func TestDiagnoseIsSilentOnAHealthyOrAbsentInstallFile(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+
+	absent := filepath.Join(dir, "install.json")
+	if found := findingsForCheck(Diagnose(home, nil, absent, "", ""), CheckInstall); len(found) != 0 {
+		t.Fatalf("an absent install.json produced %+v, want nothing", found)
+	}
+
+	if _, err := EnsureInstallID(absent); err != nil {
+		t.Fatal(err)
+	}
+	rep := Diagnose(home, nil, absent, "", "")
+	if found := findingsForCheck(rep, CheckInstall); len(found) != 0 {
+		t.Fatalf("a valid install.json produced %+v, want nothing", found)
+	}
+	if rep.Problems() != 0 {
+		t.Fatalf("a healthy tree with a valid install id must report zero problems, got %+v", rep.Findings)
+	}
+}
+
+// An unledgered SEED block is a note, not a problem, because the seed strip
+// pass is not ledger-driven: seed.go's candidate set is the UNION of the
+// ledger and a filesystem scan of <claudeDir>/agent-memory and each
+// registered project's .claude/agent-memory, which are exactly the roots
+// checkOrphanedSeedsUnder scans. Every block this check can report is
+// therefore already a strip candidate on the next ordinary sync.
+//
+// The test does not stop at the severity: it runs the sync the note promises
+// and asserts the block is gone, so the claim in the finding is checked
+// rather than its wording. Telling an operator to hand-edit a file that
+// fixes itself is what doctor's own Severity doc calls the main way a
+// diagnostic does harm.
+func TestDiagnoseCallsAnOrphanedSeedBlockANoteBecauseTheNextSyncStripsIt(t *testing.T) {
+	home := t.TempDir()
+	path := writeOrphanSeedCandidate(t, filepath.Join(home, "agent-memory"), "orphan-agent")
+
+	rep := Diagnose(home, nil, "", "", "")
+
+	var found *Finding
+	for i := range rep.Findings {
+		if rep.Findings[i].Check == CheckOrphanedBlock && rep.Findings[i].Path == path {
+			found = &rep.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("want a CheckOrphanedBlock finding for %s, got %+v", path, rep.Findings)
+	}
+	if found.Severity != SeverityNote {
+		t.Errorf("the seed strip pass fs-scans this same root, so this self-corrects: want severity %q, got %q", SeverityNote, found.Severity)
+	}
+	if strings.Contains(found.Remedy, "by hand") {
+		t.Errorf("the remedy must not send an operator to hand-edit a block the next sync removes: %q", found.Remedy)
+	}
+	if !strings.Contains(found.Remedy, "orbeat-sync sync") {
+		t.Errorf("the remedy must name the sync that removes it: %q", found.Remedy)
+	}
+	if got := rep.Problems(); got != 0 {
+		t.Errorf("a self-correcting condition must not count as a problem: Problems() = %d, want 0", got)
+	}
+
+	// The reproduction, and the reason the severity above is what it is: one
+	// ordinary ReconcileSeeds with nothing entitled removes the very block
+	// the old finding told the operator to delete by hand.
+	res, err := ReconcileSeeds(home, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.Stripped != 1 {
+		t.Fatalf("the next sync must strip the block the note promises it strips, got Stripped=%d", res.Stripped)
+	}
+	if strings.Contains(readFileT(t, path), "ORBEAT-SEED") {
+		t.Fatal("the block survived the sync, so the note's claim would be false")
+	}
+}
+
+// writeStrandedSeed writes a healthy ORBEAT-SEED block for name into
+// <proj>/.claude/agent-memory/<name>/MEMORY.md and returns the path. The
+// caller decides whether proj is registered; that decision is the whole
+// subject of the tests below.
+func writeStrandedSeed(t *testing.T, proj, name string) string {
+	t.Helper()
+	dir := filepath.Join(proj, ".claude", "agent-memory", name)
+	must(t, os.MkdirAll(dir, 0o755))
+	path := filepath.Join(dir, "MEMORY.md")
+	must(t, os.WriteFile(path, []byte(renderSeedBlock(name, "governed body")+"\nagent notes\n"), 0o644))
+	return path
+}
+
+// TestDiagnoseReportsAStrandedSeedLedgerEntry pins the gap the seed
+// containment narrowing opened: ReconcileSeeds picks each candidate's
+// containment boundary out of the roots the RUN was handed (claudeDir plus
+// every registered project), so a ledger path under none of them is skipped
+// and its entry preserved. The block is then stranded twice over, because
+// doctor's own orphan scan only walks those same roots and never sees it
+// either.
+//
+// The test does not stop at the finding. It runs the sync and asserts the
+// block SURVIVES, so what is checked is the claim ("nothing removes this on
+// its own") rather than its wording.
+func TestDiagnoseReportsAStrandedSeedLedgerEntry(t *testing.T) {
+	home := t.TempDir()
+	unregistered := t.TempDir()
+	path := writeStrandedSeed(t, unregistered, "stray")
+	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"stray": {path}}}, nil))
+
+	rep := Diagnose(home, nil, "", "", "")
+
+	var found *Finding
+	for i := range rep.Findings {
+		if rep.Findings[i].Check == CheckStrandedEntry && rep.Findings[i].Path == path {
+			found = &rep.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("want a CheckStrandedEntry finding for %s, got %+v", path, rep.Findings)
+	}
+	if found.Severity != SeverityProblem {
+		t.Errorf("nothing removes a stranded block on its own, so it needs action: want severity %q, got %q", SeverityProblem, found.Severity)
+	}
+	if !strings.Contains(found.Remedy, "orbeat-sync project add "+unregistered) {
+		t.Errorf("the remedy must name the project to register: %q", found.Remedy)
+	}
+	if !strings.Contains(found.Remedy, "orbeat-sync project remove "+unregistered) {
+		t.Errorf("the remedy must name the removal that strips the block: %q", found.Remedy)
+	}
+
+	// The reproduction, and the reason the severity above is what it is: an
+	// ordinary sync with nothing entitled leaves the block exactly where it is.
+	res, err := ReconcileSeeds(home, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.Stripped != 0 {
+		t.Fatalf("the strip pass must skip an untrusted ledger path, got Stripped=%d", res.Stripped)
+	}
+	if !strings.Contains(readFileT(t, path), "ORBEAT-SEED") {
+		t.Fatal("the sync removed the block, so this finding would be a false positive")
+	}
+}
+
+// TestDiagnoseDoesNotCallASeedUnderARegisteredProjectStranded is the negative
+// half, and its first arm exists so the second cannot pass vacuously. A check
+// that derives its subjects from a manifest reports nothing when the
+// derivation is empty, which looks identical to reporting nothing because the
+// tree is healthy. The unregistered arm proves this exact fixture IS a subject
+// the check examines before the registered arm asserts silence on it.
+func TestDiagnoseDoesNotCallASeedUnderARegisteredProjectStranded(t *testing.T) {
+	home := t.TempDir()
+	proj := t.TempDir()
+	path := writeStrandedSeed(t, proj, "stray")
+	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"stray": {path}}}, nil))
+
+	// Non-vacuity: unregistered, this fixture must produce the finding.
+	if got := findingsForCheck(Diagnose(home, nil, "", "", ""), CheckStrandedEntry); len(got) != 1 {
+		t.Fatalf("the fixture must be a subject this check examines, or the assertion below proves nothing: want 1 stranded finding with no project registered, got %+v", got)
+	}
+
+	// Registered, the strip pass reaches it, so nothing is stranded.
+	if got := findingsForCheck(Diagnose(home, []string{proj}, "", "", ""), CheckStrandedEntry); len(got) != 0 {
+		t.Errorf("a seed under a registered project is reached by the strip pass, so it is not stranded: got %+v", got)
+	}
+}
+
+// TestRulesLedgerEntriesDoNotStrand records what the rules half actually does
+// now (B23 fix): rules used to be immune to stranding, because ReconcileRules
+// opened its containment root directly AT the ledgered project root with no
+// check that the root was one this run actually registered — the exact
+// escape trustedSeedBoundary closed for seeds. That made this test's OLD
+// assertion (Stripped==1 for an unregistered project) the documented shape
+// of the vulnerability, not a safe design choice: a tampered or stale
+// manifest entry could point the rules strip pass at any directory and have
+// its ORBEAT-RULES block silently removed. rules.go now consults a trusted
+// set (registered projects) the same way ReconcileSeeds consults
+// trustedSeedBoundary, so an unregistered project's block is preserved
+// instead — rules CAN strand now, exactly like seeds can.
+//
+// doctor's checkStrandedEntries still does not walk the Rules ledger (see its
+// own doc comment for why that is a known, separate gap rather than a
+// contradiction): the assertion below that Diagnose reports nothing for this
+// fixture is therefore still true, but for a different reason than before —
+// not because rules cannot strand, but because doctor does not yet check for
+// it.
+func TestRulesLedgerEntriesDoNotStrand(t *testing.T) {
+	home := t.TempDir()
+	unregistered := t.TempDir()
+	agents := filepath.Join(unregistered, "AGENTS.md")
+	must(t, os.WriteFile(agents, []byte("dev content\n\n"+renderRulesBlock("## org\n\nrule body")), 0o644))
+	must(t, saveManifest(home, manifest{Rules: []string{unregistered}}, nil))
+
+	res, err := ReconcileRules(home, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("reconcile rules: %v", err)
+	}
+	if res.Stripped != 0 {
+		t.Fatalf("an unregistered project's rules ledger entry must be preserved, not stripped, got Stripped=%d (warnings %v, failures %v)", res.Stripped, res.Warnings, res.Failures)
+	}
+	if !strings.Contains(readFileT(t, agents), "ORBEAT-RULES") {
+		t.Fatal("the block must survive: an unregistered project is untrusted, and the strip pass must not touch it")
+	}
+
+	// doctor does not (yet) walk the Rules ledger for stranded entries — see
+	// checkStrandedEntries' own doc comment — so it stays silent about this
+	// fixture even though the block above is, in fact, now stranded.
+	must(t, saveManifest(home, manifest{Rules: []string{unregistered}}, nil))
+	if got := findingsForCheck(Diagnose(home, nil, "", "", ""), CheckStrandedEntry); len(got) != 0 {
+		t.Errorf("doctor does not walk the Rules ledger yet, so it must report nothing here — got %+v (if this now fires, checkStrandedEntries has been extended to Rules and this comment/test should be updated together)", got)
+	}
+}
+
+// TestDiagnoseDoesNotStrandALedgerLineWhoseFileIsGone pins the presence
+// requirement. A ledger entry outside every trusted root whose MEMORY.md is
+// no longer on disk holds no governed block, so reporting it would send an
+// operator to register and de-register a project in order to strip nothing.
+// The first arm is the non-vacuity guard: with the block present this exact
+// fixture IS reported, so the silence below is about the missing file and not
+// about the fixture falling outside the check.
+func TestDiagnoseDoesNotStrandALedgerLineWhoseFileIsGone(t *testing.T) {
+	home := t.TempDir()
+	unregistered := t.TempDir()
+	path := writeStrandedSeed(t, unregistered, "stray")
+	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"stray": {path}}}, nil))
+
+	if got := findingsForCheck(Diagnose(home, nil, "", "", ""), CheckStrandedEntry); len(got) != 1 {
+		t.Fatalf("the fixture must be a subject this check examines, or the assertion below proves nothing: want 1, got %+v", got)
+	}
+
+	must(t, os.Remove(path))
+	if got := findingsForCheck(Diagnose(home, nil, "", "", ""), CheckStrandedEntry); len(got) != 0 {
+		t.Errorf("no block is on disk, so nothing is stranded and the remedy would strip nothing: got %+v", got)
+	}
+}
+
+// TestStrandedSeedRemedyNamesAProjectOnlyWhenThereIsOne: validSeedPath accepts
+// an agent-memory tree anywhere, not only under a project's .claude, so the
+// generic branch is live rather than defensive. Four directories up from
+// /Users/bob/agent-memory/x/MEMORY.md is /Users, and a remedy that told an
+// operator to run 'project add /Users' would put her whole home directory
+// under sync's management to clean up one file.
+func TestStrandedSeedRemedyNamesAProjectOnlyWhenThereIsOne(t *testing.T) {
+	projectScope := strandedSeedRemedy("/srv/repo/.claude/agent-memory/x/MEMORY.md")
+	if !strings.Contains(projectScope, "orbeat-sync project add /srv/repo") {
+		t.Errorf("a project-scope path has a project to name: %q", projectScope)
+	}
+
+	loose := strandedSeedRemedy("/Users/bob/agent-memory/x/MEMORY.md")
+	if strings.Contains(loose, "/Users") {
+		t.Errorf("four directories up from a non-project layout is an ancestor, not a project, and registering it is worse than saying nothing: %q", loose)
+	}
+	if !strings.Contains(loose, "orbeat-sync project add") {
+		t.Errorf("the generic branch must still name the command that clears it: %q", loose)
+	}
+}
+
+// TestLedgerDriftDoesNotPromiseSelfCorrectionForAnUntrustedPath pins the one
+// case where "no action needed, this self-corrects" is a lie.
+//
+// checkLedgerDrift notes a ledgered seed file that is not on disk and tells the
+// operator the entry "drops on its own". That is true while the path lies under
+// a trusted root: the strip pass reaches it, nothing marks it failed, and the
+// preservation loop does not re-add it. For a path under NO trusted root it is
+// false in the opposite direction: ReconcileSeeds skips the entry before it
+// ever touches the filesystem, marks it failedPaths, and preserves it forever,
+// so the entry outlives every sync the operator will ever run.
+//
+// The behaviour is correct and is NOT what this test changes. The skip happens
+// before any file I/O precisely so an untrusted path is never touched, which
+// means the run genuinely cannot know the file is gone. What was wrong is
+// doctor promising a self-correction that cannot happen.
+func TestLedgerDriftDoesNotPromiseSelfCorrectionForAnUntrustedPath(t *testing.T) {
+	home := t.TempDir()
+	unregistered := t.TempDir()
+	// A ledger entry whose shape is valid and whose file does NOT exist, under
+	// no trusted root: not stranded (nothing is on disk to strip) and not
+	// self-correcting (the entry is preserved).
+	gone := filepath.Join(unregistered, ".claude", "agent-memory", "vanished", "MEMORY.md")
+	must(t, saveManifest(home, manifest{Seeds: map[string][]string{"vanished": {gone}}}, nil))
+
+	rep := Diagnose(home, nil, "", "", "")
+
+	var drift *Finding
+	for i := range rep.Findings {
+		if rep.Findings[i].Check == CheckLedgerDrift && rep.Findings[i].Path == gone {
+			drift = &rep.Findings[i]
+		}
+	}
+	if drift == nil {
+		t.Fatalf("the fixture must produce a ledger-drift finding, or the assertions below prove nothing: got %+v", rep.Findings)
+	}
+	if strings.Contains(drift.Remedy, "no action needed") || strings.Contains(drift.Detail, "drops on its own") {
+		t.Errorf("this entry is preserved by every future sync, so promising self-correction is false:\n  detail: %q\n  remedy: %q", drift.Detail, drift.Remedy)
+	}
+
+	// The reproduction behind the assertion: a sync leaves the entry in place.
+	if _, err := ReconcileSeeds(home, nil, nil, nil); err != nil {
+		t.Fatalf("ReconcileSeeds: %v", err)
+	}
+	m, err := loadManifest(home)
+	if err != nil {
+		t.Fatalf("loadManifest: %v", err)
+	}
+	if len(m.Seeds["vanished"]) == 0 {
+		t.Fatal("the entry dropped after all, so the remedy above was right and this test is wrong")
+	}
+}
+
+// A hand-edited projects.json can carry a shape-invalid entry (validProjectPath:
+// not absolute, not already-clean, or empty) — B25 already made LoadProjects
+// drop it rather than turn it into a load error, so every OTHER, valid entry
+// keeps working. What B25 left open is visibility: the drop is silent, so the
+// project it names silently stops syncing with nothing anywhere telling the
+// developer why. This is a PROBLEM, not a note: unlike a malformed Rules/Seeds
+// ledger entry (which self-heals — the owning reconciler warns and drops it
+// from ITS OWN ledger on its next save), nothing here ever repairs a
+// projects.json entry — the file is user-authored and orbeat-sync never
+// rewrites an existing line to fix its shape, only silently skips it forever.
+func TestDiagnoseReportsAMalformedProjectsFileEntry(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good-proj")
+	must(t, os.MkdirAll(good, 0o755))
+
+	pj := filepath.Join(dir, "cfg", "projects.json")
+	must(t, os.MkdirAll(filepath.Dir(pj), 0o700))
+	raw := `{"projects":["` + good + `", "relative/path", "."]}`
+	must(t, os.WriteFile(pj, []byte(raw), 0o644))
+
+	rep := Diagnose(home, nil, "", "", pj)
+
+	found := findingsForCheck(rep, CheckProjectsFile)
+	if len(found) != 2 {
+		t.Fatalf("want exactly 2 CheckProjectsFile findings (one per malformed entry), got %d: %+v", len(found), rep.Findings)
+	}
+	gotPaths := map[string]bool{}
+	for _, f := range found {
+		if f.Severity != SeverityProblem {
+			t.Errorf("a malformed projects.json entry must be a PROBLEM (nothing self-heals it), got %q for %q", f.Severity, f.Path)
+		}
+		if f.Remedy == "" {
+			t.Error("every finding must name what resolves it")
+		}
+		gotPaths[f.Path] = true
+	}
+	if !gotPaths["relative/path"] || !gotPaths["."] {
+		t.Fatalf("findings must name the actual malformed entries, got %+v", found)
+	}
+	if gotPaths[good] {
+		t.Fatalf("the shape-valid entry must not be reported, got %+v", found)
+	}
+	if rep.Problems() == 0 {
+		t.Fatal("Problems() = 0 while a malformed projects.json entry was found")
+	}
+}
+
+// The healthy and the absent cases are both SILENT, mirroring CheckPins and
+// CheckInstall: a machine that has never registered a project has no
+// projects.json, and a well-formed one is not news.
+func TestDiagnoseIsSilentOnAHealthyOrAbsentProjectsFile(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+
+	absent := filepath.Join(dir, "projects.json")
+	if found := findingsForCheck(Diagnose(home, nil, "", "", absent), CheckProjectsFile); len(found) != 0 {
+		t.Fatalf("an absent projects.json produced %+v, want nothing", found)
+	}
+
+	good := filepath.Join(dir, "good-proj")
+	must(t, os.MkdirAll(good, 0o755))
+	if _, err := AddProject(absent, good, nil); err != nil {
+		t.Fatal(err)
+	}
+	rep := Diagnose(home, nil, "", "", absent)
+	if found := findingsForCheck(rep, CheckProjectsFile); len(found) != 0 {
+		t.Fatalf("a valid projects.json produced %+v, want nothing", found)
+	}
+	if rep.Problems() != 0 {
+		t.Fatalf("a healthy tree with a valid projects.json must report zero problems, got %+v", rep.Findings)
+	}
 }

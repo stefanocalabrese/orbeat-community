@@ -10,6 +10,7 @@ const LABELS: Record<string, string> = {
   "/admin/artifact-entitlements": "Artifact entitlements",
   "/admin/roles": "Roles",
   "/admin/entitlements": "Entitlements",
+  "/admin/virtual-keys": "Virtual keys",
   "/admin/audit": "Audit log",
 };
 

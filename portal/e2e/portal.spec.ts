@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
+const API_BASE = "http://localhost:8080";
+
 async function login(page: Page, user: string, pass: string) {
   await page.goto("/");
   await page.getByRole("button", { name: /sign in/i }).click();
@@ -32,8 +34,16 @@ test("boss creates server, role, entitlement via admin UI", async ({ page }) => 
   await page.getByRole("button", { name: /new server/i }).click();
   await form.getByLabel(/name/i).fill("e2e-upstream");
   await form.getByLabel(/endpoint/i).fill("http://upstream:9000/mcp");
+  // Captured (the concurrency.spec.ts/roles.spec.ts idiom: registered before
+  // the click, read from the BROWSER's own request) so the audit check below
+  // can prove THIS create's own event exists, not merely that some
+  // server.create row survives.
+  const createServerResponse = page.waitForResponse(
+    (r) => r.request().method() === "POST" && r.url() === `${API_BASE}/v1/admin/servers`,
+  );
   await page.getByRole("button", { name: /^create$/i }).click();
   await expect(page.getByRole("cell", { name: "e2e-upstream", exact: true })).toBeVisible();
+  const createdServerId = ((await (await createServerResponse).json()) as { id: string }).id;
 
   // Create the role that the entitlement will reference.
   // orbeat roles are stored in Postgres and must match the IdP realm roles.
@@ -59,7 +69,43 @@ test("boss creates server, role, entitlement via admin UI", async ({ page }) => 
   await expect(page.getByRole("cell", { name: "e2e-upstream", exact: true })).toBeVisible();
 
   await page.getByRole("link", { name: "Audit" }).click();
-  await expect(page.getByText("server.create").first()).toBeVisible();
+  // The audit log is one shared, size-capped (default 100 rows per page)
+  // table for the whole e2e run: pagination.spec.ts alone writes 105+
+  // server.create events in well under a second when it runs concurrently.
+  // Filtering by action is the pattern `9a92728` established for
+  // audit-filters.spec.ts: it narrows the competition to other server.create
+  // rows only. That narrowing alone is NOT enough here the way it is for
+  // audit-filters.spec.ts's role.create check, role.create is written by
+  // only two specs, but server.create is exactly what pagination.spec.ts
+  // floods, so even the filtered first page can push this test's own row
+  // off (reproduced live: a full-suite run at 9 workers failed here with
+  // the row genuinely absent from the filtered page-1 response, not merely
+  // hidden by an unfiltered one). So on top of the action filter, this walks
+  // "Load more" (AuditPage.tsx's own pagination, bounded by its own
+  // exhaustion rather than a clock) until the CAPTURED server id's row is
+  // found, proving it is THIS test's own row rather than merely some other
+  // spec's server.create surviving in its place.
+  await page.getByLabel("Filter by action").fill("server.create");
+  await page.getByRole("button", { name: /apply filters/i }).click();
+  const auditRow = page.getByRole("cell", { name: createdServerId, exact: true });
+  const auditLoadMore = page.getByRole("button", { name: "Load more", exact: true });
+  for (
+    let i = 0;
+    i < 50 &&
+    !(await auditRow
+      .waitFor({ state: "visible", timeout: 2_000 })
+      .then(() => true)
+      .catch(() => false));
+    i++
+  ) {
+    if (!(await auditLoadMore.isVisible().catch(() => false))) break;
+    const before = await page.locator("tbody tr").count();
+    await auditLoadMore.click();
+    await expect.poll(() => page.locator("tbody tr").count(), { timeout: 15_000 }).toBeGreaterThan(before);
+  }
+  await expect(auditRow, `audit event for created server ${createdServerId} never appeared`).toBeVisible({
+    timeout: 5_000,
+  });
 
   // ── Artifacts: create a skill and assert publish status ──────────────────
   await page.getByRole("link", { name: "Artifacts" }).click();

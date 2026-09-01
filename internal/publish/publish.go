@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -66,6 +65,12 @@ func (p *Publisher) isRemote() bool {
 type Result struct {
 	Commit  string // commit now on the target; "" only when publishing is disabled (on success)
 	Changed bool   // true when this run committed new content
+	// Attempt is 1 for the first run after a mutation and increments for each
+	// retry of a run that failed, resetting on success. It is filled in by the
+	// Worker, not by PublishOnce, because a single publish knows nothing about
+	// the sequence it belongs to. Without it a recovery and a first-try success
+	// are indistinguishable in the audit trail.
+	Attempt int
 }
 
 // PublishOnce renders current state and reconciles the git target, returning
@@ -314,18 +319,66 @@ type Enqueuer interface {
 	Enqueue()
 }
 
+// oncePublisher is the single method the Worker loop needs. It exists so the
+// loop's retry behaviour can be driven by a scripted publisher in tests: the
+// real *Publisher talks to git, and a retry schedule cannot be tested through
+// something whose failures are that expensive to arrange.
+type oncePublisher interface {
+	PublishOnce(ctx context.Context) (Result, error)
+}
+
+// Retry schedule for a failed publish. A failure is retried on its own, with
+// no further Enqueue, because the desired end state is that the marketplace
+// matches the catalog, and nothing else in the system will notice that it does
+// not. Retries never give up: giving up silently would leave exactly the stale
+// marketplace this slice exists to prevent, and publish_state plus the
+// marketplace.publish audit events are what an operator watches instead.
+//
+// No jitter, deliberately. Jitter spreads a thundering herd across many
+// clients; there is one publish worker per orbeat instance, and it retries one
+// target, so jitter would add a moving part with nothing to spread.
+const (
+	defaultRetryBase = 5 * time.Second
+	defaultRetryMax  = 30 * time.Minute
+)
+
+// nextRetryDelay returns how long to wait before the (failures+1)-th attempt:
+// base doubled once per prior failure, capped at max. Pure, so the schedule is
+// pinned by a test that never waits for a clock.
+func nextRetryDelay(failures int, base, max time.Duration) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	d := base
+	for i := 1; i < failures; i++ {
+		if d >= max {
+			return max
+		}
+		d *= 2
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
 // Worker debounces publish requests and runs them serially. Construct with
 // NewWorker, call Start(ctx) once, and Enqueue() on each artifact mutation.
 type Worker struct {
-	p        *Publisher
-	onResult func(ctx context.Context, res Result, err error)
-	ch       chan struct{}
-	debounce time.Duration
+	p         oncePublisher
+	onResult  func(ctx context.Context, res Result, err error)
+	ch        chan struct{}
+	debounce  time.Duration
+	retryBase time.Duration
+	retryMax  time.Duration
 }
 
 // NewWorker creates a Worker. onResult is called after each PublishOnce (may be nil).
-func NewWorker(p *Publisher, debounce time.Duration, onResult func(ctx context.Context, res Result, err error)) *Worker {
-	return &Worker{p: p, onResult: onResult, ch: make(chan struct{}, 1), debounce: debounce}
+func NewWorker(p oncePublisher, debounce time.Duration, onResult func(ctx context.Context, res Result, err error)) *Worker {
+	return &Worker{
+		p: p, onResult: onResult, ch: make(chan struct{}, 1), debounce: debounce,
+		retryBase: defaultRetryBase, retryMax: defaultRetryMax,
+	}
 }
 
 // Enqueue requests a publish (non-blocking; coalesces with any pending request).
@@ -337,31 +390,80 @@ func (w *Worker) Enqueue() {
 }
 
 // Start runs the worker until ctx is cancelled.
+//
+// Two waits, and which one the loop is in is the whole design. With no failure
+// outstanding it blocks for an Enqueue. With one outstanding it waits for the
+// backoff OR an Enqueue, whichever lands first: a mutation during a backoff is
+// a fresh reason to publish and should not queue behind a wait that could be
+// half an hour long. An Enqueue does NOT reset the failure count, only a
+// successful publish does, so a persistently broken target keeps backing off
+// however busy the catalog is.
 func (w *Worker) Start(ctx context.Context) {
+	failures := 0
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-w.ch:
-			t := time.NewTimer(w.debounce)
+		if failures == 0 {
 			select {
 			case <-ctx.Done():
-				if !t.Stop() {
-					<-t.C
-				}
 				return
-			case <-t.C:
+			case <-w.ch:
 			}
-			res, err := w.p.PublishOnce(ctx)
-			if w.onResult != nil {
-				w.onResult(ctx, res, err)
+			if !sleepOrDone(ctx, w.debounce) {
+				return
 			}
+		} else if !w.waitBeforeRetry(ctx, failures) {
+			return
+		}
+
+		attempt := failures + 1
+		res, err := w.p.PublishOnce(ctx)
+		res.Attempt = attempt
+		if err != nil {
+			failures++
+		} else {
+			failures = 0
+		}
+		if w.onResult != nil {
+			w.onResult(ctx, res, err)
 		}
 	}
 }
 
+// waitBeforeRetry blocks until the backoff elapses or an Enqueue arrives,
+// returning false when ctx ended first (the caller must stop). An Enqueue is
+// followed by the ordinary debounce, so a burst of mutations during a backoff
+// still coalesces into one publish.
+func (w *Worker) waitBeforeRetry(ctx context.Context, failures int) bool {
+	t := time.NewTimer(nextRetryDelay(failures, w.retryBase, w.retryMax))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	case <-w.ch:
+		return sleepOrDone(ctx, w.debounce)
+	}
+}
+
+// sleepOrDone waits for d, returning false if ctx ended first.
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // ActiveArtifacts maps active store artifacts to marketplace input values.
-// It is the single bridge between store.Artifact and marketplace.Artifact.
+// It is ONE of three construction sites turning a store.Artifact into a
+// marketplace.Artifact, not the single bridge this comment claimed until audit
+// finding C7. The other two are internal/api/sync.go's Channel-2 conversions.
+// That matters concretely: add a field, trust the old sentence, update only
+// here, and the field reaches the marketplace and never reaches orbeat-sync,
+// which is the memory_scope-shaped distribution hole.
 func ActiveArtifacts(ctx context.Context, st *store.Store, tenantID string) ([]marketplace.Artifact, error) {
 	rows, err := st.ListActiveOrgArtifacts(ctx, tenantID)
 	if err != nil {
@@ -374,23 +476,113 @@ func ActiveArtifacts(ctx context.Context, st *store.Store, tenantID string) ([]m
 	return out, nil
 }
 
-// gitURLUserinfoRe matches the userinfo component of a scheme://userinfo@host
-// URL (scheme requires "://" so bare local paths and SCP-like "git@host:path"
-// syntax, which has no scheme, never match).
-var gitURLUserinfoRe = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^/@\s]*@`)
+// isSchemeByte reports whether c may appear in a URI scheme
+// (RFC 3986: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )).
+func isSchemeByte(c byte) bool {
+	return isASCIILetter(c) || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// hasSchemeBefore reports whether the "://" at sep is preceded by a URI
+// scheme: a non-empty run of scheme bytes containing at least one letter,
+// since any letter in that run is itself a legal scheme start. That is exactly
+// what the old `[a-zA-Z][a-zA-Z0-9+.-]*://` regex accepted, and it is what
+// keeps a bare local path and an SCP-like "git@host:path" (no scheme at all)
+// out of the redactor.
+func hasSchemeBefore(msg string, sep int) bool {
+	for i := sep; i > 0; i-- {
+		c := msg[i-1]
+		if !isSchemeByte(c) {
+			return false
+		}
+		if isASCIILetter(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// isURLBoundary reports whether c ends a URL token inside an error message.
+// Whitespace only: it cannot appear in a URL go-git actually dialed, and it is
+// what separates the URL from the prose wrapped around it.
+func isURLBoundary(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	}
+	return false
+}
 
 // redactURLUserinfo strips embedded URL credentials (https://user:token@host)
 // from an error message before it is persisted (audit G12): a misconfigured
 // ORBEAT_MARKETPLACE_GIT_URL carrying a token, or any go-git error that echoes
 // the remote URL verbatim, would otherwise leak the token into publish_state,
-// the audit table, and the portal UI that renders both. Idempotent: "***"
-// itself matches the userinfo character class, so redacting an
-// already-redacted message is a no-op rather than corrupting it further.
+// the audit table, the portal UI that renders both, and cmd/api's structured
+// log on stdout.
+//
+// The rule, stated in full because a comment that overclaims here is worse
+// than none. A URL runs from its "scheme://" to the first whitespace. Within
+// that token the userinfo is everything up to the LAST "@". That is the same
+// rule net/url applies inside an authority, and it is what makes a password
+// containing "@" (https://user:p@ss@host) redact whole instead of half-way.
+//
+// The deliberate over-approximation is that the scan does NOT stop at the
+// first "/". RFC 3986 ends the authority there, so a strict parse reads
+// https://user:b64/tok@host as a credential-free path and redacts nothing,
+// while base64 material, base64(user:pass), and GitLab/Gitea deploy tokens
+// routinely contain "/". A slash is not legal in userinfo, so the string alone
+// cannot say which reading is right; the ambiguity is resolved toward
+// redacting.
+//
+// What that costs, and it is a real cost: a URL whose PATH contains "@" and
+// carries no credential is over-redacted, host included, so
+// "https://github.com/org/repo@v1.git" becomes "https://***@v1.git". A
+// legibility loss on a message that held no secret, traded for never emitting
+// one. Two things it still does not touch, also deliberately: an SCP-like
+// "git@host:path" (no scheme, a conventional public login, key-based auth),
+// and any "user@host" in prose that no "scheme://" precedes.
+//
+// Idempotent: after one pass the token holds exactly one "@", the one in
+// "***@", so the last-"@" rule selects it again and rewrites it unchanged.
 func redactURLUserinfo(msg string) string {
-	return gitURLUserinfoRe.ReplaceAllStringFunc(msg, func(m string) string {
-		i := strings.Index(m, "://")
-		return m[:i+len("://")] + "***@"
-	})
+	if !strings.Contains(msg, "://") {
+		return msg
+	}
+	var b strings.Builder
+	i := 0
+	for {
+		off := strings.Index(msg[i:], "://")
+		if off < 0 {
+			break
+		}
+		sep := i + off
+		after := sep + len("://")
+		if !hasSchemeBefore(msg, sep) {
+			b.WriteString(msg[i:after])
+			i = after
+			continue
+		}
+		end := after
+		for end < len(msg) && !isURLBoundary(msg[end]) {
+			end++
+		}
+		// No "@" anywhere in the token means no userinfo in it, and none in
+		// any nested URL either, since the token spans them all.
+		at := strings.LastIndexByte(msg[after:end], '@')
+		if at < 0 {
+			b.WriteString(msg[i:end])
+			i = end
+			continue
+		}
+		b.WriteString(msg[i:after])
+		b.WriteString("***@")
+		i = after + at + 1
+	}
+	b.WriteString(msg[i:])
+	return b.String()
 }
 
 // redactedError wraps a publish error so its message can never carry embedded
@@ -436,6 +628,14 @@ func RecordResult(ctx context.Context, st *store.Store, tenantID string, res Res
 		} else {
 			ae.Metadata = map[string]any{"noop": true}
 		}
+	}
+	// Recorded only past the first try, so the common case stays exactly the
+	// shape it has always been and the presence of the key is itself the
+	// signal. On a failure it says how long this has been going; on a success
+	// it marks the run as a recovery, which is otherwise indistinguishable
+	// from an ordinary publish.
+	if res.Attempt > 1 {
+		ae.Metadata["attempt"] = res.Attempt
 	}
 	if _, err := st.AppendAuditEvent(ctx, ae); err != nil {
 		slog.Warn("audit publish", "err", err)

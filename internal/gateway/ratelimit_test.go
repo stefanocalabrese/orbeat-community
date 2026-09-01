@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sync"
 	"testing"
 	"time"
 
@@ -23,37 +22,20 @@ import (
 	"github.com/stefanocalabrese/orbeat-community/internal/store"
 )
 
-// swappableBearerRoundTripper lets a test change which bearer token attaches
-// to subsequent requests over the SAME underlying transport (the same
-// Mcp-Session-Id / jsonrpc2 connection). Used by
-// TestRateLimitTwoPrincipalsOnOneConnectionDoNotStarveEachOther to prove the
-// rate-limit key comes from the CURRENT call's req.GetExtra().TokenInfo, not
-// from ctx: swapping the token mid-connection changes what GetExtra() sees on
-// the NEXT POST without changing the jsonrpc2 connection's own frozen ctx
-// (bound once, at whichever POST first created the connection).
-type swappableBearerRoundTripper struct {
-	mu          sync.Mutex
-	token       string
-	allowedHost string
-	base        http.RoundTripper
-}
-
-func (b *swappableBearerRoundTripper) setToken(tok string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.token = tok
-}
-
-func (b *swappableBearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	b.mu.Lock()
-	tok := b.token
-	b.mu.Unlock()
-	if tok != "" && r.URL.Host == b.allowedHost {
-		r = r.Clone(r.Context())
-		r.Header.Set("Authorization", "Bearer "+tok)
-	}
-	return b.base.RoundTrip(r)
-}
+// A prior version of this file drove both principals over ONE shared
+// Mcp-Session-Id by swapping the Authorization header mid-connection
+// (swappableBearerRoundTripper, since removed). Fable-audit B14 made that
+// setup unreachable in production and therefore wrong to test: withSession's
+// mint-time binding (A1, server.go) now refuses ANY later request whose
+// principal resolves to a session other than the one its Mcp-Session-Id was
+// bound to, and two OAuth clients sharing a subject but not an azp resolve
+// to DIFFERENT sessions (sessionCache is keyed on ratelimit.KeyFor(p), not
+// bare subject) -- so swapping tokens mid-connection now correctly 404s
+// ("gateway session rebuilt") instead of silently serving both identities
+// off one transport session, and a test built on that no longer happening
+// would be asserting a security regression. TestRateLimitTwoPrincipalsDoNot
+// StarveEachOther below drives two SEPARATE connections instead, which is
+// what two distinct OAuth clients actually do in production.
 
 // ratelimitTestFixture sets up a tenant, an "orbeat-user" role, one upstream
 // exposing an "echo" tool, and an entitlement granting that tool — the
@@ -219,18 +201,18 @@ func TestConcurrencyCapRejectedToolCallErrorsWithoutAuditRow(t *testing.T) {
 	}
 }
 
-// TestRateLimitTwoPrincipalsOnOneConnectionDoNotStarveEachOther is the
-// per-principal isolation assertion, and the vehicle for the ctx-vs-GetExtra
-// red-proof: both principals share the SAME subject (hence the SAME cached
-// gateway session — s.sessions is keyed by subject alone — and hence the
-// SAME jsonrpc2 connection ctx, frozen at whichever call first established
-// it) but different ClientID (azp), mirroring the real scenario spec §4.2
-// names: one human's Claude Code and Codex sharing a subject. tool-a
-// exhausts its own bucket; tool-b, a different rate-limit key, must still be
-// served. This can only hold if the key comes from the CURRENT call's
-// req.GetExtra().TokenInfo — a ctx-based key would collapse both onto
-// whichever token happened to open the connection.
-func TestRateLimitTwoPrincipalsOnOneConnectionDoNotStarveEachOther(t *testing.T) {
+// TestRateLimitTwoPrincipalsDoNotStarveEachOther is the per-principal
+// isolation assertion: two OAuth clients (same human subject, different
+// ClientID/azp -- spec §4.2's "one human's Claude Code and Codex sharing a
+// subject") each hold their OWN connection, exactly as two real MCP clients
+// would. tool-a exhausts its own bucket; tool-b, a different rate-limit key
+// (ratelimit.KeyFor: "subject|azp"), must still be served.
+//
+// This used to drive both principals over ONE shared connection by swapping
+// the bearer token mid-stream -- see the removed swappableBearerRoundTripper
+// comment above for why fable-audit B14 made that setup itself invalid to
+// test (withSession now refuses exactly that swap with a 404).
+func TestRateLimitTwoPrincipalsDoNotStarveEachOther(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -248,33 +230,23 @@ func TestRateLimitTwoPrincipalsOnOneConnectionDoNotStarveEachOther(t *testing.T)
 	httpSrv := httptest.NewServer(gw.Handler())
 	t.Cleanup(httpSrv.Close)
 
-	parsed, err := url.Parse(httpSrv.URL)
-	if err != nil {
-		t.Fatalf("parse url: %v", err)
-	}
-	rt := &swappableBearerRoundTripper{token: "shared-tok-a", allowedHost: parsed.Host, base: http.DefaultTransport}
-	httpClient := &http.Client{Transport: rt}
-	transport := &mcp.StreamableClientTransport{Endpoint: httpSrv.URL + "/mcp", HTTPClient: httpClient}
-	client := mcp.NewClient(&mcp.Implementation{Name: "e2e-client", Version: "0"}, nil)
-	cs, err := client.Connect(ctx, transport, nil) // initialize as tool-a
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(func() { _ = cs.Close() })
+	csA := connectThroughGateway(t, ctx, httpSrv.URL+"/mcp", "shared-tok-a")
+	t.Cleanup(func() { _ = csA.Close() })
+	csB := connectThroughGateway(t, ctx, httpSrv.URL+"/mcp", "shared-tok-b")
+	t.Cleanup(func() { _ = csB.Close() })
 
 	// tool-a's sole token, consumed.
-	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "fixture__echo", Arguments: json.RawMessage(`{"text":"a1"}`)}); err != nil {
+	if _, err := csA.CallTool(ctx, &mcp.CallToolParams{Name: "fixture__echo", Arguments: json.RawMessage(`{"text":"a1"}`)}); err != nil {
 		t.Fatalf("tool-a's first call (within its burst) should succeed: %v", err)
 	}
 	// tool-a is now throttled.
-	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "fixture__echo", Arguments: json.RawMessage(`{"text":"a2"}`)}); err == nil {
+	if _, err := csA.CallTool(ctx, &mcp.CallToolParams{Name: "fixture__echo", Arguments: json.RawMessage(`{"text":"a2"}`)}); err == nil {
 		t.Fatal("tool-a's second call should have been throttled")
 	}
 
-	// Swap to tool-b's token on the SAME connection (same Mcp-Session-Id,
-	// same frozen jsonrpc2 connection ctx bound at tool-a's initialize).
-	rt.setToken("shared-tok-b")
-	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "fixture__echo", Arguments: json.RawMessage(`{"text":"b1"}`)}); err != nil {
+	// tool-b, on its OWN connection, is a different rate-limit key and must
+	// not be starved by tool-a's throttling.
+	if _, err := csB.CallTool(ctx, &mcp.CallToolParams{Name: "fixture__echo", Arguments: json.RawMessage(`{"text":"b1"}`)}); err != nil {
 		t.Fatalf("tool-b should not be starved by tool-a's throttling: %v", err)
 	}
 
@@ -317,7 +289,8 @@ func TestRateLimitInitializeHasSeparateBudgetAndToolsListIsUnlimited(t *testing.
 	}
 
 	// A second, SEPARATE connection (fresh Mcp-Session-Id) from the SAME
-	// (subject, azp) reuses the cached gateway session (subject-keyed) but
+	// (subject, azp) no longer reuses the cached gateway session, which is keyed
+	// on subject and azp together since audit B14, but
 	// still performs its OWN initialize handshake, on the SAME now-drained
 	// initialize budget.
 	parsed, err := url.Parse(httpSrv.URL)
@@ -365,6 +338,17 @@ func TestRateLimitInitializeHasSeparateBudgetAndToolsListIsUnlimited(t *testing.
 // fourth limiter/setter pair, THIS TEST NEEDS A NEW LINE wiring it in, or its
 // sweeper leaks with exactly zero coverage, the same way the three above did
 // before this test existed.
+//
+// That obligation is now partly enforced rather than purely manual:
+// TestServerCloseCoversEveryCloserTypedField (closer_coverage_test.go) derives
+// every io.Closer-typed field on Server by reflection and fails if
+// Server.Close() doesn't call .Close() on it, so a fourth field left
+// unwired fails THAT gate even with no line added here — it needs no real
+// instance to catch a missing wire, only a static AST read of Close()'s
+// body. It does NOT replace this test: it cannot prove closing a field
+// actually stops a goroutine, only that Close() reaches it syntactically.
+// Adding the real fixture line here is still what gives a new field the
+// same dynamic (goleak) proof the three above already have.
 func TestServerCloseStopsEveryLimiterSweeperGoroutine(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

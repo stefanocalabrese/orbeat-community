@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -84,9 +85,12 @@ func TestCheckSeatCapBothBoundaries(t *testing.T) {
 	}
 }
 
-// TestCheckSeatCapNeverBlocksExistingUser is the direct verification for the
-// brief's "an existing user inside the window must never be blocked"
-// requirement: a subject already known to the tenant is re-resolved
+// TestCheckSeatCapNeverBlocksExistingUser is the direct verification that an
+// existing user is never blocked by the cap. No brief states that
+// requirement: an earlier version of this comment quoted one, and
+// checkSeatCap's own doc comment (seatcap.go) records where the quotation
+// came from and what actually justifies the rule. The verification itself is
+// unaffected: a subject already known to the tenant is re-resolved
 // repeatedly WHILE the tenant is at its seat cap, and must never be
 // rejected, while a genuinely brand-new subject, at the same moment, IS
 // rejected. This is what proves checkSeatCap's existence-check-first
@@ -180,6 +184,57 @@ func TestCheckSeatCapIgnoresStaleExistingUser(t *testing.T) {
 	// "at cap" framing cannot show on its own.
 	if _, err := r.Resolve(ctx, auth.Principal{Subject: "seat-stale", Email: "stale@x.io"}); err != nil {
 		t.Fatalf("a stale-but-known subject must not be treated as a new signup: %v", err)
+	}
+}
+
+// TestCheckSeatCapIgnoresSCIMProvisionedNeverAuthenticatedUsers is audit B9's
+// end-to-end headline scenario, driven through the real checkSeatCap ->
+// CountActiveUsers path: "an IdP provisioning 10 users exhausts the free
+// tier with zero logins." seatLimit rows are provisioned via
+// store.UpsertProvisionedUser directly, standing in for a SCIM
+// implementation's own POST /scim/v2/Users calls (internal/api's
+// TestSCIMCreatedUserDoesNotConsumeASeatUntilFirstLogin proves that handler
+// calls the same store method), and NONE of them ever call Resolve. A
+// genuinely new human subject arriving after the tenant is "full" of
+// provisioned-only rows must still be ADMITTED.
+func TestCheckSeatCapIgnoresSCIMProvisionedNeverAuthenticatedUsers(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.New(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	tenantName := "seatcap-scim-provisioned-" + t.Name()
+	tn, err := s.GetOrCreateTenantByName(ctx, tenantName)
+	if err != nil {
+		t.Fatalf("tenant: %v", err)
+	}
+
+	const seatLimit = 3
+	for i := 0; i < seatLimit; i++ {
+		if _, err := s.UpsertProvisionedUser(ctx, store.User{
+			TenantID: tn.ID, Subject: fmt.Sprintf("scim-provisioned-%d", i), DisplayName: fmt.Sprintf("Provisioned %d", i),
+		}); err != nil {
+			t.Fatalf("provision seat %d: %v", i, err)
+		}
+	}
+
+	r := NewResolver(s, tenantName)
+	r.seatLimit = seatLimit
+
+	// The decisive assertion: a brand-new HUMAN subject, arriving into a
+	// tenant that already holds seatLimit provisioned-but-never-authenticated
+	// rows, must be admitted -- a bug reproducing B9 would reject this with
+	// SeatLimitError, exactly the "exhausts the free tier with zero logins"
+	// failure the finding describes.
+	rc, err := r.Resolve(ctx, auth.Principal{Subject: "first-real-human-login", Email: "human@x.io"})
+	if err != nil {
+		t.Fatalf("a real human subject was rejected even though every existing seat is a SCIM-provisioned row "+
+			"that never authenticated: %v", err)
+	}
+	if rc.UserID == "" {
+		t.Fatal("Resolve returned an empty UserID on success")
 	}
 }
 

@@ -187,6 +187,61 @@ func TestLoadScanLLMOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadDCRDefaults(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://x")
+	t.Setenv("ORBEAT_DCR_CLIENT_ID", "")
+	t.Setenv("ORBEAT_DCR_CLIENT_SECRET_REF", "")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.DCRClientID != "" || c.DCRClientSecretRef != "" {
+		t.Fatalf("want empty DCR defaults (disabled), got %q / %q", c.DCRClientID, c.DCRClientSecretRef)
+	}
+}
+
+func TestLoadDCROverrides(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://x")
+	t.Setenv("ORBEAT_DCR_CLIENT_ID", "orbeat-dcr")
+	t.Setenv("ORBEAT_DCR_CLIENT_SECRET_REF", "vault:secret/orbeat/dcr#secret")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.DCRClientID != "orbeat-dcr" || c.DCRClientSecretRef != "vault:secret/orbeat/dcr#secret" {
+		t.Fatalf("overrides not applied: %q / %q", c.DCRClientID, c.DCRClientSecretRef)
+	}
+}
+
+// TestLoadInterceptDefault pins Intercept's off-by-default shape (design
+// spec §4): unset ORBEAT_INTERCEPT must load as the empty string, the same
+// sentinel OTelEndpoint and ScanLLMEndpoint use for "disabled" -- cmd/gateway
+// reads this exact emptiness to decide whether to install the interceptor at
+// all (Task 4's wiring gate covers that half; this pins the config half).
+func TestLoadInterceptDefault(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://x")
+	t.Setenv("ORBEAT_INTERCEPT", "")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Intercept != "" {
+		t.Fatalf("want empty Intercept (disabled) by default, got %q", c.Intercept)
+	}
+}
+
+func TestLoadInterceptOverride(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://x")
+	t.Setenv("ORBEAT_INTERCEPT", "1")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Intercept != "1" {
+		t.Fatalf("override not applied: got %q, want %q", c.Intercept, "1")
+	}
+}
+
 func TestLoadMarketplaceGitTimeoutDefault(t *testing.T) {
 	t.Setenv("ORBEAT_DB_URL", "postgres://x")
 	t.Setenv("ORBEAT_MARKETPLACE_GIT_TIMEOUT", "")
@@ -524,4 +579,243 @@ func TestRequireOIDC(t *testing.T) {
 			t.Fatalf("Load must succeed without OIDC vars (gateway path): %v", err)
 		}
 	})
+}
+
+// TestDeploymentRegistryParsing covers the one knob in this file that turns on
+// data collection about named people, so its table leans on the cases that
+// must NOT count as a yes.
+//
+// "yes" and "on" are in the table deliberately. Both read as affirmative to a
+// human writing a .env file and neither is accepted by strconv.ParseBool, so
+// this pins that they land on OFF rather than silently enabling collection,
+// and it pins that the accessor never grew a friendlier parser later.
+func TestDeploymentRegistryParsing(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://example")
+
+	for _, tc := range []struct {
+		name string
+		val  string
+		want bool
+	}{
+		{"unset is off", "", false},
+		{"explicit false", "false", false},
+		{"explicit zero", "0", false},
+		{"yes is NOT a yes", "yes", false},
+		{"on is NOT a yes", "on", false},
+		{"garbage is off", "maybe", false},
+		{"true", "true", true},
+		{"one", "1", true},
+		{"TRUE", "TRUE", true},
+		{"padded true is trimmed", "  true  ", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ORBEAT_DEPLOYMENT_REGISTRY", tc.val)
+			c, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := c.DeploymentRegistryEnabled(); got != tc.want {
+				t.Errorf("DeploymentRegistryEnabled(%q) = %v, want %v", tc.val, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeploymentRetentionInvertsTheAuditDefault asserts the two retention
+// defaults IN THE SAME Load, which is the only way to see the property that
+// matters. Each on its own is unremarkable; the pair is the design decision
+// (spec docs/specs/2026-08-22-orbeat-artifact-deployment-registry-design.md
+// sec 7.2): audit retention is OFF unless the operator asks for it because an
+// audit row is a compliance record whose deletion is a loss, deployment
+// retention is ON at 90 days because a deployment row is a claim about a named
+// person's machine that stops being true once that machine goes quiet.
+//
+// A deployments-only assertion cannot see the regression this exists to catch:
+// the retention loop was extracted so both subjects share one runRetention,
+// and a shared default would silently turn audit pruning ON for every existing
+// operator, deleting compliance records nobody asked to delete.
+//
+// The bad-value rows are the second half, and they fall in OPPOSITE
+// directions on purpose. For audit, an unreadable value collapses to 0 so a
+// typo can never start deleting audit rows. For deployments, 0 is the
+// dangerous answer, so an unreadable value collapses to 90 and only a readable
+// "0" keeps rows forever.
+func TestUsageFlushIntervalParsing(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://example")
+
+	for _, tc := range []struct {
+		name string
+		env  string
+		want time.Duration
+	}{
+		{"unset defaults to 60s", "", 60 * time.Second},
+		{"explicit value honoured", "30s", 30 * time.Second},
+		{"unparseable falls back to default", "garbage", 60 * time.Second},
+		{"zero falls back to default (a zero-interval ticker is nonsensical)", "0s", 60 * time.Second},
+		{"negative falls back to default", "-5s", 60 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ORBEAT_USAGE_FLUSH_INTERVAL", tc.env)
+			c, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := c.UsageFlushIntervalDuration(); got != tc.want {
+				t.Errorf("UsageFlushIntervalDuration(%q) = %v, want %v", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUsageRetentionDefaultsOnLikeDeploymentRetention(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://example")
+
+	for _, tc := range []struct {
+		name string
+		env  string
+		want int
+	}{
+		{"unset defaults to 90 (on)", "", 90},
+		{"explicit zero keeps usage rows forever", "0", 0},
+		{"explicit window is honoured", "30", 30},
+		{"unparseable falls back to the default", "notanint", 90},
+		{"negative falls back to the default", "-5", 90},
+		{"padded value is trimmed", "  45  ", 45},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ORBEAT_USAGE_RETENTION_DAYS", tc.env)
+			c, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := c.UsageRetentionDaysN(); got != tc.want {
+				t.Errorf("UsageRetentionDaysN(%q) = %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeploymentRetentionInvertsTheAuditDefault(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://example")
+
+	for _, tc := range []struct {
+		name          string
+		deploymentEnv string
+		auditEnv      string
+		wantDeploy    int
+		wantAudit     int
+	}{
+		{"both unset: deployments on at 90, audit off", "", "", 90, 0},
+		{"explicit zero keeps deployment rows forever", "0", "", 0, 0},
+		{"explicit window is honoured", "30", "30", 30, 30},
+		{"unparseable falls opposite ways", "notanint", "notanint", 90, 0},
+		{"negative falls opposite ways", "-5", "-5", 90, 0},
+		{"padded value is trimmed", "  45  ", "", 45, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ORBEAT_DEPLOYMENT_RETENTION_DAYS", tc.deploymentEnv)
+			t.Setenv("ORBEAT_AUDIT_RETENTION_DAYS", tc.auditEnv)
+			c, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := c.DeploymentRetentionDaysN(); got != tc.wantDeploy {
+				t.Errorf("DeploymentRetentionDaysN(%q) = %d, want %d", tc.deploymentEnv, got, tc.wantDeploy)
+			}
+			if got := c.AuditRetentionDaysN(); got != tc.wantAudit {
+				t.Errorf("AuditRetentionDaysN(%q) = %d, want %d: the shared retention loop must not "+
+					"have given audit retention the deployment default", tc.auditEnv, got, tc.wantAudit)
+			}
+		})
+	}
+}
+
+// slashBearingCredentialURL is the URL that motivated the fix: a GitHub App
+// installation token, base64 material, or a GitLab/Gitea deploy token routinely
+// contains "/", and a "/" inside the userinfo makes the authority unparseable,
+// so url.Parse returns `invalid port ":b64" after host`. The guard used to read
+// that parse error as "nothing to object to" and return nil, which ACCEPTED the
+// one input class it exists to reject.
+const slashBearingCredentialURL = "https://x-access-token:b64/token+val@github.com/o/r"
+
+func TestLoadRejectsMarketplaceGitURLWithASlashBearingCredential(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://x")
+	t.Setenv("ORBEAT_MARKETPLACE_GIT_URL", slashBearingCredentialURL)
+	t.Setenv("ORBEAT_MARKETPLACE_GIT_CREDENTIAL_REF", "")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("a credential containing '/' was accepted: url.Parse fails on it, and a parse " +
+			"failure used to mean accepted")
+	}
+	if !strings.Contains(err.Error(), "ORBEAT_MARKETPLACE_GIT_CREDENTIAL_REF") {
+		t.Fatalf("error should point at ORBEAT_MARKETPLACE_GIT_CREDENTIAL_REF, got: %v", err)
+	}
+	// The message must not carry the token it just refused, which rules out
+	// wrapping url.Error: its own text quotes the whole URL.
+	if strings.Contains(err.Error(), "b64/token+val") {
+		t.Fatalf("refusal echoes the credential: %v", err)
+	}
+}
+
+// A credential whose token starts with digits and contains "/" PARSES cleanly:
+// "user:12345" is a valid host:port, and the rest becomes a path, so u.User is
+// nil and the old userinfo test never fired. It is the same defect on the other
+// side of the parse.
+func TestLoadRejectsMarketplaceGitURLWhoseCredentialLooksLikeAPort(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://x")
+	t.Setenv("ORBEAT_MARKETPLACE_GIT_URL", "https://user:12345/tok@github.com/o/r.git")
+	if _, err := Load(); err == nil {
+		t.Fatal("a credential that parses as host:port plus a path was accepted")
+	}
+}
+
+// An unparseable value with no credential in it is still refused rather than
+// silently accepted, because "orbeat could not understand this URL" is never a
+// reason to proceed with it.
+func TestLoadRejectsAnUnparseableMarketplaceGitURL(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://x")
+	t.Setenv("ORBEAT_MARKETPLACE_GIT_URL", "https://example.test:notaport/repo.git")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("an unparseable ORBEAT_MARKETPLACE_GIT_URL was accepted")
+	}
+	if !strings.Contains(err.Error(), "not a parseable URL") {
+		t.Fatalf("want the parse refusal, got: %v", err)
+	}
+}
+
+// The shapes that must keep working, restated here rather than trusted to the
+// older tests, because this change widened the rule and each of these is a value
+// a real deployment sets: the prod compose passes a local path, make
+// smoke-remote uses git://, and SCP syntax carries a "@" that is a login, not a
+// secret.
+func TestLoadStillAcceptsTheLegitimateMarketplaceGitURLShapes(t *testing.T) {
+	for _, raw := range []string{
+		"/data/marketplace",
+		"git://gitserver/marketplace.git",
+		"git@github.com:org/repo.git",
+		"https://example.test/repo.git",
+		"file:///var/lib/orbeat/marketplace",
+		"",
+	} {
+		t.Run("value="+raw, func(t *testing.T) {
+			t.Setenv("ORBEAT_DB_URL", "postgres://x")
+			t.Setenv("ORBEAT_MARKETPLACE_GIT_URL", raw)
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load refused a legitimate value: %v", err)
+			}
+		})
+	}
+}
+
+// The cost of the widened rule, pinned so it is a decision on the record rather
+// than a surprise: a path "@" with no credential is refused too. internal/publish
+// already accepts the same over-approximation (it over-redacts the same URL), and
+// the two layers now agree on one rule. If this ever needs to change, change both.
+func TestLoadRefusesAPathAtSignAndThatIsTheAcceptedCost(t *testing.T) {
+	t.Setenv("ORBEAT_DB_URL", "postgres://x")
+	t.Setenv("ORBEAT_MARKETPLACE_GIT_URL", "https://github.com/org/repo@v1.git")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected the documented over-approximation to refuse a path '@'")
+	}
 }

@@ -9,7 +9,7 @@ import (
 
 func TestInTxCommits(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t)
+	s := newProductionShapedStore(t)
 	tn, err := s.GetOrCreateTenantByName(ctx, t.Name())
 	if err != nil {
 		t.Fatalf("tenant: %v", err)
@@ -26,7 +26,7 @@ func TestInTxCommits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InTx: %v", err)
 	}
-	roles, _ := s.ListRolesPage(ctx, tn.ID, nil, 0)
+	roles, _ := s.ListRolesPage(ctx, tn.ID, nil, 0, false, "")
 	if len(roles) != 1 || roles[0].ID != roleID {
 		t.Fatalf("committed role not visible: %+v", roles)
 	}
@@ -34,7 +34,7 @@ func TestInTxCommits(t *testing.T) {
 
 func TestInTxRollsBackOnError(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t)
+	s := newProductionShapedStore(t)
 	tn, err := s.GetOrCreateTenantByName(ctx, t.Name())
 	if err != nil {
 		t.Fatalf("tenant: %v", err)
@@ -49,7 +49,7 @@ func TestInTxRollsBackOnError(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("want sentinel, got %v", err)
 	}
-	roles, _ := s.ListRolesPage(ctx, tn.ID, nil, 0)
+	roles, _ := s.ListRolesPage(ctx, tn.ID, nil, 0, false, "")
 	if len(roles) != 0 {
 		t.Fatalf("rollback failed, roles persisted: %+v", roles)
 	}
@@ -57,7 +57,7 @@ func TestInTxRollsBackOnError(t *testing.T) {
 
 func TestInTxRollsBackOnPanic(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t)
+	s := newProductionShapedStore(t)
 	tn, err := s.GetOrCreateTenantByName(ctx, t.Name())
 	if err != nil {
 		t.Fatalf("tenant: %v", err)
@@ -75,7 +75,7 @@ func TestInTxRollsBackOnPanic(t *testing.T) {
 			panic("boom")
 		})
 	}()
-	roles, _ := s.ListRolesPage(ctx, tn.ID, nil, 0)
+	roles, _ := s.ListRolesPage(ctx, tn.ID, nil, 0, false, "")
 	if len(roles) != 0 {
 		t.Fatalf("panic rollback failed, roles persisted: %+v", roles)
 	}
@@ -96,7 +96,14 @@ func TestInTxRollsBackOnPanic(t *testing.T) {
 // gate unfalsifiable.
 func TestInTxPropagatesEveryStoreField(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t)
+	// newProductionShapedStore, NOT newTestStore (audit C1). newTestStore calls
+	// New, i.e. NewWithTracer(ctx, dbURL, nil), so a Store field populated from
+	// a NewWithTracer PARAMETER is zero in the parent, zero in the child, and
+	// this comparison passes for it whatever InTx does. Red-proven in the audit:
+	// a `tracer` field added that way left this gate green while sitting nil
+	// inside every transaction. TestInTxFixtureLeavesNoFieldZero
+	// (store_fixture_test.go) is what keeps the fixture honest.
+	s := newProductionShapedStore(t)
 
 	var child *Store
 	err := s.InTx(ctx, func(tx *Store) error {
@@ -155,7 +162,7 @@ parent-derived want: %+v`, *child, want)
 // crashing the test binary), not quietly.
 func TestInTxRejectsNesting(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t)
+	s := newProductionShapedStore(t)
 
 	// t.Error (not t.Fatal) inside the InTx closure: t.Fatal calls runtime.Goexit,
 	// which would unwind the goroutine mid-transaction — before the outer InTx gets

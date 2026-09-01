@@ -41,15 +41,59 @@ type Resolver struct {
 	providers map[string]SecretsProvider
 }
 
-// NewResolver returns a Resolver with all built-in providers registered.
+// NewResolver returns a Resolver for CATALOG refs: the ones an admin writes
+// over HTTP into mcp_server.secret_ref / tls_ca_ref and the gateway later turns
+// into an upstream credential. Its "env" provider enforces the
+// ORBEAT_SECRET_ENV_ALLOW prefix allowlist (audit A4).
+//
 // Enterprise-only providers (Vault, AWS Secrets Manager) are added by
 // registerEnterpriseProviders — never named here directly — so this
 // constructor compiles unchanged in a generated Community tree, which has no
 // VaultProvider/AWSSMProvider (docs/specs/2026-08-19-orbeat-community-
 // repo-generation-design.md §4).
+//
+// WHY THIS PACKAGE READS AN ENVIRONMENT VARIABLE, when internal/config is what
+// normally reads env. Routing the allowlist through internal/config would mean
+// changing this constructor's signature, and the signature is load-bearing: the
+// v1.11.0 and v1.12.0 changelog entries both record that the gateway and the
+// publisher gained new secret backends "for free" precisely because it did not
+// change, and every call site (internal/api, internal/gateway, and 40-odd
+// tests) depends on that. It would also move the policy one call away from the
+// os.LookupEnv it constrains, so anyone constructing EnvProvider{} directly
+// would silently get no policy at all. Reading it here keeps the zero value
+// restricted, which is the fail-closed polarity: forgetting to wire the
+// allowlist denies rather than permits. The cost is one env var this package
+// owns; it is documented in .env.example beside the rest.
 func NewResolver() *Resolver {
 	r := &Resolver{providers: map[string]SecretsProvider{
-		"env": EnvProvider{},
+		"env": newEnvProvider(),
+	}}
+	registerEnterpriseProviders(r.providers)
+	return r
+}
+
+// NewProcessConfigResolver returns a Resolver for refs that come out of the
+// PROCESS ENVIRONMENT itself, namely ORBEAT_MARKETPLACE_GIT_CREDENTIAL_REF,
+// ORBEAT_SCAN_LLM_KEY_REF and ORBEAT_DCR_CLIENT_SECRET_REF, and never out of the
+// database. Its "env" provider has the allowlist OFF.
+//
+// The two populations need different policies, and one list cannot express
+// both. An allowlist over process-config refs buys nothing: whoever sets
+// ORBEAT_DCR_CLIENT_SECRET_REF=env:ORBEAT_DCR_CLIENT_SECRET already owns the
+// environment, so no privilege boundary is crossed and nothing is being
+// prevented. Applying one anyway is not merely useless, it is breaking:
+// deploy/docker-compose.yml sets ORBEAT_SCAN_LLM_KEY_REF to
+// "env:ORBEAT_FAKE_LLM_KEY" and cmd/api's buildScanner resolves it at startup
+// with "fail closed: bad key ref aborts startup", so the default allowlist
+// would stop the committed dev stack from booting.
+//
+// Conversely, this resolver must NEVER be handed a ref that came out of the
+// catalog: an admin who can name any variable can name this deployment's git
+// push token as an upstream's bearer credential. Only cmd/api builds one, and
+// only for the three config refs above.
+func NewProcessConfigResolver() *Resolver {
+	r := &Resolver{providers: map[string]SecretsProvider{
+		"env": EnvProvider{unrestricted: true},
 	}}
 	registerEnterpriseProviders(r.providers)
 	return r

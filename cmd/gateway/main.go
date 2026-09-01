@@ -17,11 +17,13 @@ import (
 	"github.com/stefanocalabrese/orbeat-community/internal/authz"
 	"github.com/stefanocalabrese/orbeat-community/internal/config"
 	"github.com/stefanocalabrese/orbeat-community/internal/gateway"
+	"github.com/stefanocalabrese/orbeat-community/internal/govern"
 	"github.com/stefanocalabrese/orbeat-community/internal/logging"
 	"github.com/stefanocalabrese/orbeat-community/internal/ratelimit"
 	"github.com/stefanocalabrese/orbeat-community/internal/secrets"
 	"github.com/stefanocalabrese/orbeat-community/internal/store"
 	"github.com/stefanocalabrese/orbeat-community/internal/telemetry"
+	"github.com/stefanocalabrese/orbeat-community/internal/version"
 )
 
 const (
@@ -79,6 +81,28 @@ func healthProbe(defAddr string) int {
 	return 0
 }
 
+// interceptorFor decides the runtime call-interception scanner to install
+// (Task 4 of docs/plans/orbeat-runtime-interception-2026-08-25.md; design
+// spec §4): scanner when cfg.Intercept is set, nil when it is unset (the
+// default). Returning nil rather than a scanner that finds nothing is the
+// point -- internal/gateway's interceptArguments/interceptResult (intercept.go)
+// both short-circuit on a nil interceptor before touching the store or the
+// scanner at all, so "off" here means the hook is never installed, not
+// installed-and-inert.
+//
+// Factored out of run() as a pure function (govern.Scanner in, govern.Scanner
+// out, no *gateway.Server) so the off path is unit-testable without dialing a
+// database: run() itself cannot be exercised end to end in this package (it
+// connects to cfg.DBURL before reaching gw.SetInterceptor), the same
+// constraint cmd/api/dcr_client_wiring_test.go's TestRunWiresDCRClient notes
+// for its own equivalent call.
+func interceptorFor(cfg config.Config, scanner govern.Scanner) govern.Scanner {
+	if cfg.Intercept == "" {
+		return nil
+	}
+	return scanner
+}
+
 func run() int {
 	cfg, err := config.Load()
 	if err != nil {
@@ -101,9 +125,16 @@ func run() int {
 	defer stop()
 
 	tel, shutdownTel, err := telemetry.Setup(ctx, telemetry.Config{
-		Endpoint:       cfg.OTelEndpoint,
-		ServiceName:    orDefault(cfg.OTelServiceName, "orbeat-gateway"),
-		ServiceVersion: "dev",
+		Endpoint:    cfg.OTelEndpoint,
+		ServiceName: orDefault(cfg.OTelServiceName, "orbeat-gateway"),
+		// version.Version, not a literal. This was hardcoded "dev" until audit
+		// C8, while release.yml injects the real tag into internal/version via
+		// -ldflags, so every trace and metric emitted by a signed release image
+		// was attributed to "dev" and no telemetry could be tied to a release.
+		// internal/version's own doc says it "must be the ONLY place the
+		// version is read from" and names three consumers; this was a silent
+		// fourth. Gated by TestOTelServiceVersionIsNotALiteral.
+		ServiceVersion: version.Version,
 		SampleRatio:    cfg.OTelSampleRatio,
 		Insecure:       cfg.OTelInsecure,
 	})
@@ -140,7 +171,19 @@ func run() int {
 		slog.Warn("otel pool gauges", "err", err) // non-fatal
 	}
 
-	v, err := auth.NewValidator(ctx, auth.Config{
+	// context.Background(), deliberately NOT ctx: the JWKS cache has to outlive
+	// the shutdown signal so requests still in flight during the drain can
+	// validate. auth.NewValidator passes this context to jwk.NewCache, which
+	// starts httprc's controller goroutine; that goroutine returns on
+	// ctx.Done(), and once it is gone every jwk.Cache.Lookup sends on a channel
+	// nobody receives from, so Validate blocks until the CALLER's context
+	// expires and then fails. It does not fall back to cached keys. Wiring ctx
+	// here therefore made every request arriving inside srv.Shutdown's 10s
+	// drain below burn its whole deadline instead of validating. cmd/api's
+	// run() passes context.Background() for the same reason; nothing needs to
+	// cancel this context, because the refresh goroutine dies with the process.
+	// Pinned by TestJWKSRefreshContextSurvivesShutdownSignal.
+	v, err := auth.NewValidator(context.Background(), auth.Config{
 		Issuer:       cfg.OIDCIssuer,
 		Audience:     cfg.OIDCAudience,
 		DiscoveryURL: cfg.OIDCDiscoveryURL,
@@ -148,6 +191,17 @@ func run() int {
 	if err != nil {
 		return fatal("auth", err)
 	}
+
+	// Resolve the single tenant once at startup so the usage counter and
+	// quota enforcer below can be constructed for a concrete tenant id,
+	// mirroring cmd/api/main.go's identical resolve-once-at-startup step
+	// for its own publish closures. GetOrCreateTenantByName is idempotent
+	// (INSERT … ON CONFLICT) and safe to call before traffic.
+	tn, err := st.GetOrCreateTenantByName(ctx, cfg.TenantName)
+	if err != nil {
+		return fatal("resolve tenant", err)
+	}
+	tenantID := tn.ID
 
 	resolver := authz.NewResolver(st, cfg.TenantName)
 	gw := gateway.New(st, resolver, gateway.NewTokenVerifier(v), secrets.NewResolver(), cfg.GatewayResourceURL, cfg.OIDCIssuer)
@@ -168,6 +222,60 @@ func run() int {
 	// not apply here, but that invariant is a second, separate fact about the
 	// same duration, not a redefinition of what the duration itself means.
 	gw.SetInflightCap(ratelimit.NewConcurrency(cfg.GatewayMaxInflightN(8), rateLimitTTL))
+	// Runtime call interception (Task 4 of docs/plans/orbeat-runtime-
+	// interception-2026-08-25.md): interceptorFor returns nil unless
+	// ORBEAT_INTERCEPT is set, and gw.SetInterceptor(nil) is New()'s own
+	// default -- so this line changes nothing for a deployment that never
+	// set the variable.
+	gw.SetInterceptor(interceptorFor(cfg, govern.NewDefaultScanner()))
+
+	// Usage metering and quota enforcement (docs/specs/2026-08-25-orbeat-
+	// usage-metering-design.md; docs/plans/orbeat-usage-metering-2026-08-25.md
+	// Task 5). Unlike SetInterceptor above, both are wired UNCONDITIONALLY:
+	// there is no ORBEAT_USAGE_* on/off knob for the counter or the
+	// enforcer themselves (config.UsageFlushIntervalDuration's doc comment
+	// states why: counting is cheap and is the entire point of the
+	// subsystem, and enforcement is already off in every practical sense
+	// until an admin creates a role_quota row). uc/qe are both edition-safe
+	// to construct and install in every build: usage.community.go and
+	// quota.community.go's no-op counterparts make Count/Check inert in a
+	// Community build without cmd/gateway needing its own edition branch,
+	// exactly like SetInterceptor's nil-scanner pattern above.
+	uc := gateway.NewUsageCounter(st, tenantID)
+	qe := gateway.NewQuotaEnforcer(st, tenantID)
+	gw.SetUsageCounter(uc)
+	gw.SetQuotaEnforcer(qe)
+
+	// The periodic ticker (flush + quota-cache refresh, same interval, per
+	// spec section 3: "refreshed on the same interval"). Its own context
+	// (not the signal ctx) so it stops in an ordered way AFTER the HTTP
+	// server drains, mirroring cmd/api's retention loops and publish
+	// worker; the explicit shutdown flush below is what actually persists
+	// whatever this loop's own cancellation left in memory. RunUsageTicker's
+	// own doc comment explains why the shutdown flush is deliberately NOT
+	// inside it.
+	usageCtx, cancelUsage := context.WithCancel(context.Background())
+	usageDone := make(chan struct{})
+	go func() {
+		gateway.RunUsageTicker(usageCtx, uc.Flush, qe.RefreshAll, cfg.UsageFlushIntervalDuration())
+		close(usageDone)
+	}()
+
+	// The entitlement-change nudge: a Postgres LISTEN that drops a tenant's
+	// cached sessions when its entitlements, roles or servers change, so a
+	// revocation lands in seconds instead of at the next five-minute rebuild.
+	//
+	// Its own context, like the ticker above, so it stops after the HTTP server
+	// drains. It is deliberately NOT part of readiness and nothing waits for
+	// it: if it never connects, the gateway behaves exactly as it did before
+	// the nudge existed, which is the whole reason this is safe to start
+	// fire-and-forget.
+	nudgeCtx, cancelNudge := context.WithCancel(context.Background())
+	nudgeDone := make(chan struct{})
+	go func() {
+		gw.StartEntitlementNudge(nudgeCtx)
+		close(nudgeDone)
+	}()
 
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: gw.Handler(), ReadHeaderTimeout: 5 * time.Second}
 
@@ -195,6 +303,25 @@ func run() int {
 		slog.Error("server", "err", err)
 		exit = 1
 	}
+
+	// Stop the periodic ticker, THEN flush once more explicitly. Without
+	// this final flush, a stopped gateway silently loses up to one flush
+	// interval's worth of usage: the ticker's own last tick is not
+	// synchronized with shutdown, so relying on it alone would leave
+	// whatever was counted since then stranded in memory and discarded when
+	// the process exits. A fresh context (not shutdownCtx above, which may
+	// already be near its deadline by the time execution reaches here, and
+	// not the signal ctx, which is already Done) bounds this last write.
+	cancelNudge()
+	<-nudgeDone
+	cancelUsage()
+	<-usageDone
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := uc.Flush(flushCtx); err != nil {
+		slog.Error("usage flush on shutdown", "err", err)
+	}
+	cancelFlush()
+
 	gw.Close() // drain cached upstream MCP connections
 	return exit
 }

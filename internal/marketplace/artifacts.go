@@ -138,7 +138,16 @@ func RenderArtifactsPlugin(artifacts []Artifact) (map[string]string, error) {
 			}
 			files[base+"/agents/"+a.Name+".md"] = content
 		default:
-			// unknown type — skipped; Type is constrained at the DB + API layer.
+			// Reached by `rule`, which is a VALID type at both the DB and the
+			// API layer and has no Channel-1 representation by design
+			// (v1.14.0): rules are delivered by orbeat-sync into each
+			// project's AGENTS.md, not as plugin files. Skipping is correct
+			// here; what was not correct is that an org-visibility rule used
+			// to be skipped here AND excluded from Channel 2 for being org
+			// visibility, so it reached nobody at all from the default value
+			// of `visibility`. store.ListActiveOrgRules and
+			// api.handleSyncArtifacts close that; this comment used to claim
+			// the type could not get here.
 		}
 	}
 	return files, nil
@@ -183,6 +192,27 @@ func RenderMarketplace(opts Options, artifacts []Artifact) (map[string]string, e
 	for p, c := range artFiles {
 		files[p] = c
 	}
-	files[".claude-plugin/marketplace.json"] = renderMarketplaceManifest(len(artifacts) > 0)
+	// Decided by what was actually RENDERED, not by how many artifacts came in
+	// (audit C8). RenderArtifactsPlugin skips the `rule` type by design, since
+	// rules are delivered by orbeat-sync into each project's AGENTS.md and have
+	// no Channel-1 representation. So a tenant whose only org artifacts are
+	// rules had len(artifacts) > 0 and no rendered content, and the old
+	// expression listed an orbeat-artifacts plugin containing nothing: a user
+	// who installs it gets an empty plugin and no error, on the one surface
+	// that is supposed to tell them what is available.
+	//
+	// Derived from artFiles rather than by re-testing a.Type here, because a
+	// second copy of "which types render" is exactly what drifts: the same
+	// shape as publish.go's three construction sites (audit C7). The plugin
+	// manifest is always written, so it is discounted by name rather than by
+	// assuming a count.
+	pluginManifest := "plugins/" + ArtifactsPluginName + "/.claude-plugin/plugin.json"
+	rendered := 0
+	for path := range artFiles {
+		if path != pluginManifest {
+			rendered++
+		}
+	}
+	files[".claude-plugin/marketplace.json"] = renderMarketplaceManifest(rendered > 0)
 	return files, nil
 }

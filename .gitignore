@@ -29,3 +29,7 @@ portal/dist/
 
 # Production secrets — only the .example ships.
 deploy/.env.prod
+
+# Generated Homebrew formula + checksums for the public tap repo
+# (stefanocalabrese/homebrew-orbeat); never committed here, copied by hand.
+/dist/

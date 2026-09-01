@@ -11,9 +11,14 @@ import { FormField, inputCls } from "../../components/FormField";
 import { QueryGate } from "../../components/QueryGate";
 import { Button } from "../../components/ui/Button";
 import { Card, Panel } from "../../components/ui/Card";
+import { SortableTh } from "../../components/ui/AdminListControls";
 
 export default function ArtifactEntitlementsPage() {
-  const ents = useArtifactEntitlements();
+  // order-only: artifact-entitlements REFUSE ?q= with 400 on mere presence
+  // (useArtifactEntitlements's params type carries no q field at all), so
+  // this page renders no search box; see ListSearchBox's own comment.
+  const [order, setOrder] = useState<"asc" | "desc">("asc");
+  const ents = useArtifactEntitlements({ order });
   const { rows: entitlements } = ents;
   const roles = useRoles();
   const artifacts = useAdminArtifacts();
@@ -50,7 +55,7 @@ export default function ArtifactEntitlementsPage() {
       <table className="w-full text-sm">
         <thead className="bg-inset">
           <tr>
-            <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">Role</th>
+            <SortableTh label="Role" order={order} onToggle={() => setOrder(order === "asc" ? "desc" : "asc")} />
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">Artifact</th>
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint" />
           </tr>
@@ -173,9 +178,26 @@ export default function ArtifactEntitlementsPage() {
             </FormField>
             {roleArtifacts.length === 0 ? (
               <p className="text-sm text-faint">
-                No role-visibility artifacts exist yet. Set an artifact's
-                visibility to <span className="font-medium text-text">role</span> on the
-                Artifacts page first.
+                {artifacts.hasNextPage ? (
+                  // B35: `roleArtifacts` is filtered from only the artifacts
+                  // LOADED so far (page 1 of useAdminArtifacts here) — zero
+                  // matches on THIS page is not evidence zero exist overall,
+                  // so the copy must not assert a global fact from a
+                  // page-1 sample.
+                  <>
+                    None of the artifacts loaded so far are role-visibility, but more artifacts
+                    exist that have not loaded yet. Click{" "}
+                    <span className="font-medium text-text">Load more</span> on the Artifacts page,
+                    or set an artifact's visibility to{" "}
+                    <span className="font-medium text-text">role</span> there.
+                  </>
+                ) : (
+                  <>
+                    No role-visibility artifacts exist yet. Set an artifact's visibility to{" "}
+                    <span className="font-medium text-text">role</span> on the Artifacts page
+                    first.
+                  </>
+                )}
               </p>
             ) : (
               <FormField

@@ -23,7 +23,7 @@ func TestDecodeJSONOrFailMapsMalformedJSONTo400(t *testing.T) {
 
 // TestDecodeJSONOrFailMapsOversizedBodyTo413 proves a body rejected by
 // http.MaxBytesReader (the maxBytesMiddleware wraps every mutating route with
-// one — see TestMaxBytesMiddlewareCapsPostAndPutBodies) maps to 413, not the
+// one — see TestMaxBytesMiddlewareCapsPostPutPatchBodies) maps to 413, not the
 // generic 400 "invalid JSON body" (audit B3).
 func TestDecodeJSONOrFailMapsOversizedBodyTo413(t *testing.T) {
 	rec := httptest.NewRecorder()

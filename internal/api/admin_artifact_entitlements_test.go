@@ -104,7 +104,7 @@ func TestArtifactEntitlementForeignRoleIs400(t *testing.T) {
 		t.Fatalf("foreign role=%d, want 400", rec.Code)
 	}
 	// No entitlement, no audit (validation precedes auditedTx).
-	if ents, _ := st.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0); len(ents) != 0 {
+	if ents, _ := st.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0, false); len(ents) != 0 {
 		t.Fatalf("must not create cross-tenant entitlement: %+v", ents)
 	}
 	if evs, _ := st.ListAuditEventsByTenant(ctx, tn.ID, 10); len(evs) != 0 {
@@ -128,7 +128,7 @@ func TestArtifactEntitlementForeignArtifactIs400(t *testing.T) {
 		t.Fatalf("foreign artifact=%d, want 400", rec.Code)
 	}
 	// No entitlement, no audit (validation precedes auditedTx).
-	if ents, _ := st.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0); len(ents) != 0 {
+	if ents, _ := st.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0, false); len(ents) != 0 {
 		t.Fatalf("must not create cross-tenant entitlement: %+v", ents)
 	}
 	if evs, _ := st.ListAuditEventsByTenant(ctx, tn.ID, 10); len(evs) != 0 {

@@ -111,9 +111,10 @@ func (s *Store) MCPServerExistsInTenant(ctx context.Context, tenantID, id string
 // mcpServerKeys is mcp_server's sort order (id appended by keysetTail).
 var mcpServerKeys = []sortKey{{Col: "name", Cast: "text"}}
 
-// MCPServerCursor is the keyset position just after m.
-func MCPServerCursor(m MCPServer) ListCursor {
-	return ListCursor{Keys: []string{m.Name}, ID: m.ID}
+// MCPServerCursor is the keyset position just after m, walked in direction
+// desc (?order), see RoleCursor's doc comment for why desc must match.
+func MCPServerCursor(m MCPServer, desc bool) ListCursor {
+	return ListCursor{Keys: []string{m.Name}, ID: m.ID, Sort: sortIdentity("mcp_server", mcpServerKeys, desc)}
 }
 
 // mcpServerPageSQL builds the tenant-scoped keyset page query and its
@@ -121,13 +122,19 @@ func MCPServerCursor(m MCPServer) ListCursor {
 // ListMCPServersPage so the index-usage test can EXPLAIN the exact SQL+args
 // pair that runs in production, and so the caller never has to reconstruct
 // the correspondence between the two by hand.
-func mcpServerPageSQL(tenantID string, cursor *ListCursor, limit int) (string, []any, error) {
-	const base = `SELECT ` + mcpServerCols + ` FROM mcp_server WHERE tenant_id = $1`
-	tail, tailArgs, err := keysetTail("mcp_server", mcpServerKeys, false, cursor, limit, 1)
+//
+// $2 is the ?q= substring search filter (docs/plans/orbeat-admin-search-sort-
+// 2026-08-27.md Task 4), the same NULL-means-no-filter shape rolePageSQL uses
+// (rbac.go) and for the same reasons, see likeSearchArg's doc comment
+// (paging.go). Applied in SQL before keysetTail's cursor predicate and LIMIT.
+func mcpServerPageSQL(tenantID string, cursor *ListCursor, limit int, desc bool, search string) (string, []any, error) {
+	const base = `SELECT ` + mcpServerCols + ` FROM mcp_server
+		WHERE tenant_id = $1 AND ($2::text IS NULL OR name ILIKE $2)`
+	tail, tailArgs, err := keysetTail("mcp_server", mcpServerKeys, desc, cursor, limit, 2)
 	if err != nil {
 		return "", nil, err
 	}
-	return base + tail, append([]any{tenantID}, tailArgs...), nil
+	return base + tail, append([]any{tenantID, likeSearchArg(search)}, tailArgs...), nil
 }
 
 // queryMCPServers runs sql (with args) and scans every row into an MCPServer
@@ -151,15 +158,20 @@ func (s *Store) queryMCPServers(ctx context.Context, sql string, args ...any) ([
 
 // ListMCPServersByTenant returns ALL catalog entries for a tenant, name-ordered.
 // It is the unpaginated convenience over ListMCPServersPage — the gateway's
-// session build, /v1/catalog and the slug-collision check all need the full set.
+// session build, /v1/catalog and the slug-collision check all need the full
+// set, unfiltered: none of those callers is a search box, so search is
+// always "".
 func (s *Store) ListMCPServersByTenant(ctx context.Context, tenantID string) ([]MCPServer, error) {
-	return s.ListMCPServersPage(ctx, tenantID, nil, 0)
+	return s.ListMCPServersPage(ctx, tenantID, nil, 0, false, "")
 }
 
 // ListMCPServersPage returns up to limit catalog entries for a tenant ordered
-// (name, id), starting strictly after cursor. limit <= 0 means no limit.
-func (s *Store) ListMCPServersPage(ctx context.Context, tenantID string, cursor *ListCursor, limit int) ([]MCPServer, error) {
-	sql, args, err := mcpServerPageSQL(tenantID, cursor, limit)
+// (name, id), or (name DESC, id DESC) when desc is true (?order=desc) --
+// starting strictly after cursor. limit <= 0 means no limit. search is an
+// optional ?q= substring match against name, case-insensitive and unindexed
+// by design, see likeSearchArg's doc comment (paging.go). "" means no filter.
+func (s *Store) ListMCPServersPage(ctx context.Context, tenantID string, cursor *ListCursor, limit int, desc bool, search string) ([]MCPServer, error) {
+	sql, args, err := mcpServerPageSQL(tenantID, cursor, limit, desc, search)
 	if err != nil {
 		// Distinct prefix from queryMCPServers' query-failure branch: this is
 		// a cursor-shape/arity error building the SQL, not a DB error running
@@ -182,6 +194,28 @@ func (s *Store) ListMCPServersPage(ctx context.Context, tenantID string, cursor 
 // but the version is stale" (ErrVersionMismatch): a plain UPDATE...RETURNING
 // cannot tell those apart, since both return zero rows.
 //
+// secretRef and tlsCARef are the tri-state PUT contract for the two opaque
+// reference columns (audit B37/defect 1 of the 2026-09-01 fix): nil means
+// "this write does not mention the field, leave the stored value exactly as
+// it is"; a pointer to "" means an explicit clear (stored as NULL, matching
+// CreateMCPServer's own NULLIF convention); a pointer to a non-empty string
+// replaces it. m.SecretRef/m.TLSCARef are IGNORED by this function — the two
+// explicit parameters are the only inputs that reach the SET clause — so a
+// caller cannot accidentally revive the old bug by populating those fields on
+// m instead of passing the tri-state params: CreateMCPServer is the only
+// function that still reads them, and it has no "existing value" to preserve
+// in the first place, so its plain-string NULLIF-of-empty-string contract is
+// unaffected and deliberately unchanged (a create's absent field and an
+// explicit empty string mean the same thing: no reference at all).
+//
+// The CASE expressions below are why no precedent fetch is needed here even
+// though "leave unchanged" now requires knowing the current value: the
+// decision (keep the column / NULL it / replace it) is made IN SQL, against
+// the row this statement already holds, in the same statement that enforces
+// the row_version guard — so the "leave unchanged" outcome is exactly as
+// race-safe as every other field this UPDATE writes, rather than resting on
+// a caller-side read-then-merge that a concurrent write could invalidate.
+//
 // The CTE below runs the UPDATE exactly once — a data-modifying CTE always
 // does, regardless of how many times its name is referenced by the outer
 // query — and reports existence and update-success as two counts. On success
@@ -190,13 +224,16 @@ func (s *Store) ListMCPServersPage(ctx context.Context, tenantID string, cursor 
 // guarantee exactly one output row even when the UPDATE matches zero) with a
 // fully nullable-scan duplicate of scanMCPServer, which is meaningfully more
 // code for a codepath that is not hot (admin console traffic).
-func (s *Store) UpdateMCPServer(ctx context.Context, m MCPServer) (MCPServer, error) {
+func (s *Store) UpdateMCPServer(ctx context.Context, m MCPServer, secretRef, tlsCARef *string) (MCPServer, error) {
 	const q = `
 		WITH cur AS (SELECT 1 FROM mcp_server WHERE tenant_id=$1 AND id=$2),
 		     upd AS (
 		       UPDATE mcp_server SET
 		         name=$3, description=$4, transport=$5, endpoint_or_command=$6,
-		         version=$7, protocol_version=$8, secret_ref=NULLIF($9,''), tls_ca_ref=NULLIF($10,''), status=$11
+		         version=$7, protocol_version=$8,
+		         secret_ref = CASE WHEN $9::text IS NULL THEN secret_ref ELSE NULLIF($9,'') END,
+		         tls_ca_ref = CASE WHEN $10::text IS NULL THEN tls_ca_ref ELSE NULLIF($10,'') END,
+		         status=$11
 		       WHERE tenant_id=$1 AND id=$2 AND row_version=$12
 		       RETURNING 1
 		     )
@@ -204,7 +241,7 @@ func (s *Store) UpdateMCPServer(ctx context.Context, m MCPServer) (MCPServer, er
 	var existsCnt, updCnt int
 	err := s.db.QueryRow(ctx, q,
 		m.TenantID, m.ID, m.Name, m.Description, m.Transport, m.EndpointOrCommand,
-		m.Version, m.ProtocolVersion, m.SecretRef, m.TLSCARef, m.Status, m.RowVersion,
+		m.Version, m.ProtocolVersion, secretRef, tlsCARef, m.Status, m.RowVersion,
 	).Scan(&existsCnt, &updCnt)
 	if err != nil {
 		// idCastNotFound's pgx.ErrNoRows arm never fires here (the SELECT above

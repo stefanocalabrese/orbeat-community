@@ -25,8 +25,8 @@ import (
 // throttled.
 //
 // obs (Task 7, spec §9) reports every rejection to the ratelimit.rejected
-// counter and, at most once per key per streak, a sampled log breadcrumb.
-// Its zero value is safe, so callers that do not care about this
+// counter and, at most once per key per logSampleInterval, a sampled log
+// breadcrumb. Its zero value is safe, so callers that do not care about this
 // telemetry (most direct-construction tests) can pass Observability{}.
 func HTTP(l *Limiter, deny func(http.ResponseWriter, *http.Request), obs Observability, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

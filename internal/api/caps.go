@@ -53,7 +53,7 @@ func (s *Server) checkRoleCap(ctx context.Context, tenantID string) error {
 	if max <= 0 {
 		return nil
 	}
-	roles, err := s.store.ListRolesPage(ctx, tenantID, nil, 0)
+	roles, err := s.store.ListRolesPage(ctx, tenantID, nil, 0, false, "")
 	if err != nil {
 		return err
 	}

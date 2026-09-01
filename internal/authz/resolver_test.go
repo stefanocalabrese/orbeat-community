@@ -3,6 +3,7 @@ package authz
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -102,8 +103,20 @@ func TestResolve(t *testing.T) {
 // TestResolveSteadyStateNoWrite pins audit B4 at the Resolver layer (not just
 // the underlying store functions): once a tenant+user exist and nothing about
 // the principal changed, a repeat Resolve of the SAME principal must not
-// rewrite either row. xmin (the Postgres system column recording the
-// inserting/updating transaction) is a direct, cheap change-detector — it
+// rewrite either row.
+//
+// The users half of that is narrower than it sounds, and the narrowing is why
+// it still passes. The two Resolve calls below are milliseconds apart, so
+// last_seen_at is nowhere near internal/store's one-hour
+// lastSeenWriteThreshold and the staleness write reason cannot fire. What is
+// pinned is therefore "no write WITHIN the staleness threshold", which is the
+// property audit B4 was about; a Resolve an hour later legitimately rewrites
+// the users row, and this test would be wrong to forbid it. The tenant half
+// has no such reason and is unqualified: GetOrCreateTenantByName writes only
+// when the row is absent.
+//
+// xmin (the Postgres system column recording the
+// inserting/updating transaction) is a direct, cheap change-detector: it
 // advances on every UPDATE, including a no-op one, so xmin stability proves
 // "no write happened," not merely "the visible fields look the same." Before
 // the B4 fix this test fails on both rows: Resolve's tenant/user upserts
@@ -176,5 +189,95 @@ func TestResolveSteadyStateNoWrite(t *testing.T) {
 	}
 	if xminAfterChange := xmin("users", rc.UserID); xminAfterChange == userXminBefore {
 		t.Fatalf("expected an email change to rewrite the user row (xmin unchanged: %s)", xminAfterChange)
+	}
+}
+
+// TestResolveRefusesDeactivatedUser is the whole point of SCIM in orbeat
+// (docs/specs/2026-08-25-orbeat-scim-design.md sec 2). A deactivated person
+// still holds a valid Keycloak token; if Resolve does not refuse them, SCIM
+// deprovisioning is theatre.
+//
+// Red-proven by hand: commenting out Resolve's checkDeactivated call (the
+// mutant "Resolve ignores the column") makes the `err == nil` branch below
+// fire instead, i.e. this test fails with "a deactivated user was resolved".
+func TestResolveRefusesDeactivatedUser(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.New(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	r := NewResolver(s, "deactivated-"+t.Name())
+	p := auth.Principal{Subject: "kc-deact-1", Email: "d@x.io"}
+
+	rc, err := r.Resolve(ctx, p)
+	if err != nil {
+		t.Fatalf("first Resolve (must succeed, seeds the row): %v", err)
+	}
+	if err := s.DeactivateUser(ctx, rc.TenantID, rc.UserID); err != nil {
+		t.Fatalf("DeactivateUser: %v", err)
+	}
+
+	if _, err := r.Resolve(ctx, p); err == nil {
+		t.Fatal("a deactivated user was resolved; their token still works and SCIM deprovisioning is theatre")
+	} else {
+		var de DeactivatedUserError
+		if !errors.As(err, &de) {
+			t.Fatalf("expected a DeactivatedUserError distinguishable via errors.As (a deactivated "+
+				"user is a 403, not a 500), got %v (%T)", err, err)
+		}
+		if de.Subject != p.Subject {
+			t.Fatalf("DeactivatedUserError.Subject = %q, want %q", de.Subject, p.Subject)
+		}
+	}
+}
+
+// TestResolveDeactivationSurvivesRepeatedResolve is gate 2 of Task 1
+// (docs/plans/orbeat-scim-2026-08-25.md): "a deactivated user's next request
+// must not silently revive them." Resolve is called three times after
+// deactivation, not once, because the FIRST refusal proves nothing about
+// whether that very call's own machinery quietly undid the deactivation on
+// its way to refusing -- only a SECOND (and third) call, reading the
+// database fresh each time, can show the state is durable rather than a
+// one-shot check that a side effect immediately invalidates.
+//
+// Honest caveat, found while red-proving this test against the "UpsertUser
+// clears deactivated_at" mutant: under THIS resolver's chosen design
+// (checkDeactivated runs and short-circuits BEFORE UpsertUser is ever
+// called -- see Resolve's doc comment), that mutant is UNREACHABLE from
+// Resolve entirely once a user is known-deactivated, because Resolve never
+// reaches UpsertUser for such a subject again. This test therefore does NOT
+// catch that mutant (verified by hand: applying it, this test still passes).
+// The mutant IS caught, at the store layer where UpsertUser's write path
+// actually executes, by store.TestUpsertUserPreservesDeactivation
+// (internal/store/user_test.go), which calls UpsertUser directly on an
+// already-deactivated row. Kept here anyway because it pins a real property
+// Resolve must have on its own merits: repeated resolution of a deactivated
+// subject stays refused, which a caching bug or an accidental early-return
+// swallowing the error on retry could otherwise break silently.
+func TestResolveDeactivationSurvivesRepeatedResolve(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.New(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	r := NewResolver(s, "deactivated-repeat-"+t.Name())
+	p := auth.Principal{Subject: "kc-deact-repeat", Email: "dr@x.io"}
+
+	rc, err := r.Resolve(ctx, p)
+	if err != nil {
+		t.Fatalf("seed Resolve: %v", err)
+	}
+	if err := s.DeactivateUser(ctx, rc.TenantID, rc.UserID); err != nil {
+		t.Fatalf("DeactivateUser: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := r.Resolve(ctx, p); err == nil {
+			t.Fatalf("Resolve attempt %d after deactivation succeeded; the deactivation did not survive", i)
+		}
 	}
 }

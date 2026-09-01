@@ -1,0 +1,42 @@
+-- +goose Up
+-- THE COLUMN THAT MAKES KEYCLOAK CLEANUP ACTUALLY HAPPEN (audit finding A10).
+--
+-- Until this migration, nothing in orbeat had ever deleted a Keycloak client.
+-- Not revoke, not role deletion. bestEffortDeleteKeycloakClient
+-- (internal/api/admin_virtual_keys.ee.go) needed
+-- registration_access_token_ref, which 00020 added and which is empty on
+-- every row that has ever existed, because a secretRef points at a value
+-- someone provisioned ahead of time and the registration access token is a
+-- value orbeat first learns about at request time. So every revoke took the
+-- no-ref branch, logged "orphaned", and the clients accumulated forever.
+--
+-- WHY A SECOND COLUMN INSTEAD OF REUSING THE FIRST. They hold different
+-- things and must not be confused: _ref is a scheme-routed POINTER resolved
+-- through secrets.Resolver, _sealed is the VALUE itself, encrypted. Writing
+-- ciphertext into a column every reader treats as a ref would make
+-- secrets.Resolver's fail-closed unknown-scheme path the thing standing
+-- between a corrupted row and a bearer token sent to Keycloak. 00020's column
+-- keeps its meaning and its behaviour.
+--
+-- WHAT IS IN IT: AES-256-GCM ciphertext, base64url, tagged "vk1." -- see
+-- internal/secrets/seal.ee.go's TokenSealer for the construction, the
+-- client_id-as-AAD binding, and the measurement (a real Keycloak 26.2
+-- container) showing that a LEAKED registration access token is an
+-- authentication bypass and not merely a delete capability, which is why this
+-- column is not plain text.
+--
+-- The sealing key is derived from the deployment's own DCR service-account
+-- client secret, so no new configuration is required and no deployment gets
+-- this feature "shipped but inert". The consequence, stated in
+-- docs/upgrade-guide.md and the production runbook: rotating that secret
+-- makes every already-sealed token unopenable, which degrades to exactly the
+-- pre-A10 behaviour (warn and orphan) rather than to anything worse.
+--
+-- DEFAULT '' rather than NULL: every existing row genuinely has no token, and
+-- '' is the same "nothing on file" value registration_access_token_ref
+-- already uses, so scanVirtualKey needs no nullable handling for a second
+-- field.
+ALTER TABLE virtual_key ADD COLUMN registration_access_token_sealed text NOT NULL DEFAULT '';
+
+-- +goose Down
+ALTER TABLE virtual_key DROP COLUMN registration_access_token_sealed;

@@ -19,9 +19,13 @@ var artifactNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 // ReconcileResult summarizes a sync run.
 type ReconcileResult struct {
 	Added, Updated, Removed int
-	// Unchanged counts managed files whose on-disk bytes already equal the
-	// desired content — skipped without a write, so their mtimes are untouched
-	// (mirrors Seed/RulesResult.Unchanged).
+	// Unchanged counts files whose on-disk bytes already equal the desired
+	// content, skipped without a write, so their mtimes are untouched
+	// (mirrors Seed/RulesResult.Unchanged). It deliberately does NOT say
+	// "managed": a file the ledger did not name and whose bytes already match
+	// is adopted into the ledger and counted here (see the write loop's
+	// adoption branch), which is what makes "delete the manifest and sync"
+	// the recovery doctor advertises.
 	Unchanged int
 	// Handled counts artifacts of a file-backed type (see fileBackedTypes) that
 	// this reconciler processed, regardless of whether the write actually
@@ -31,10 +35,68 @@ type ReconcileResult struct {
 	// same relative path. This is the authoritative count for callers (e.g.
 	// cmd/sync's summary line) — do not recompute it from artifact types
 	// outside this package.
-	Handled  int
-	Skipped  []string // unmanaged files with a colliding name (left untouched)
-	Warnings []string // non-fatal notices, e.g. an unrecognized artifact type this client skipped
+	Handled int
+	// Skipped names unmanaged files with a colliding name, left untouched.
+	// Only ones whose content DIFFERS from the desired content: a byte-identical
+	// unmanaged file is adopted instead, since there is nothing there to lose.
+	Skipped []string
+	// Warnings holds non-fatal notices: an unrecognized artifact type this
+	// client skipped, or a Files ledger entry whose shape this client could
+	// never have written (validManagedFilePath).
+	Warnings []string
 	Failures []string // units (or the manifest save) that should have synced but did not (non-fatal I/O)
+	// Applied names the artifacts whose content is on disk after this run, at
+	// the revision the server served. It is NOT the entitled set, and the gap
+	// is the whole point: an unmanaged-name collision leaves the developer's
+	// own file in place (see Skipped), and a failed write leaves the previous
+	// bytes there (see Failures). Both are served-but-not-applied, and neither
+	// is visible from the artifact list the server sent. Unchanged IS applied:
+	// the change detection below skips the write only when the bytes already
+	// match, and the file being correct is the only thing an applied record
+	// claims.
+	//
+	// Recorded inside the write loop, while the artifact is still in hand. The
+	// counters above and manifest.Files carry PATHS, and nothing in this client
+	// maps a path back to an artifact id, so an applied set reconstructed
+	// afterwards would be a second mapping free to drift from this one.
+	//
+	// Ordered by ArtifactID, because the write loop ranges over a map.
+	//
+	// In plan mode (--dry-run) this names what a real run WOULD apply: the
+	// writes are recorded rather than performed, so nothing was actually
+	// applied and a caller must not report it as such. That filter belongs to
+	// the caller, the same division of labour saveManifest documents for the
+	// manifest's own recorded write.
+	Applied []AppliedArtifact
+}
+
+// AppliedArtifact is one artifact a reconciler put (or found already) on disk,
+// paired with the revision the server served it as. Both fields come straight
+// from Artifact's two unconditional identity fields.
+type AppliedArtifact struct {
+	ArtifactID string
+	Revision   int
+}
+
+// appendApplied records id at revision, dropping an artifact the server never
+// identified. An empty ID means the server predates the DTO's id field
+// (Artifact.ID), so there is no key any deployment record could be stored
+// under; an entry naming none is not a fact, and the reporting path must
+// not run against such a server at all.
+func appendApplied(dst []AppliedArtifact, id string, revision int) []AppliedArtifact {
+	if id == "" {
+		return dst
+	}
+	return append(dst, AppliedArtifact{ArtifactID: id, Revision: revision})
+}
+
+// desiredFile is one rendered path's content plus the identity of the artifact
+// that produced it. The identity rides along because the write loop is the last
+// place the artifact is in hand: see ReconcileResult.Applied.
+type desiredFile struct {
+	content    string
+	artifactID string
+	revision   int
 }
 
 // fileBackedTypes is the single source of truth for which artifact types
@@ -65,6 +127,12 @@ type manifest struct {
 	// block (AGENTS.md + CLAUDE.md), so a later sync strips exactly the projects
 	// no longer entitled/registered. Shape-validated before the strip pass.
 	Rules []string `json:"rules,omitempty"`
+	// Globals is the ledger of USER-LEVEL instruction files carrying an
+	// ORBEAT-RULES block (migration 00025's global scope): absolute paths, so a
+	// file whose tool is later uninstalled can still be stripped by path alone.
+	// Untrusted like the two ledgers above, shape-checked by
+	// validGlobalRulesPath before the strip pass touches anything.
+	Globals []string `json:"globals,omitempty"`
 }
 
 // Reconcile writes to claudeDir the SUBSET of the given artifacts that this
@@ -72,7 +140,10 @@ type manifest struct {
 // "subagent"), and removes orbeat-managed files no longer entitled. It NEVER
 // modifies or deletes a file it does not manage (tracked via
 // claudeDir/.orbeat-sync-manifest.json); a desired path that already exists
-// but isn't managed is skipped (a user's hand-authored file wins).
+// but isn't managed and whose content DIFFERS is skipped (a user's
+// hand-authored file wins). One that already holds the exact desired bytes is
+// adopted into the ledger instead: nothing on disk changes, and it is the only
+// case in which taking ownership can lose nothing.
 //
 // Artifact types this client doesn't render to disk are intentionally NOT an
 // error: a type owned by another reconciler (e.g. "rule", owned by
@@ -117,7 +188,11 @@ func Reconcile(claudeDir string, artifacts []Artifact, plan *Plan) (ReconcileRes
 		oldSet[f] = true
 	}
 
-	desired := make(map[string]string, len(artifacts))
+	// Keyed by rendered path, so two artifacts rendering to the same path
+	// collapse to the last one, which is also the only one whose bytes could
+	// end up on disk, and therefore the only one Applied may name. Handled
+	// still counts both, per its own doc above.
+	desired := make(map[string]desiredFile, len(artifacts))
 	for _, a := range artifacts {
 		pathFn, ok := fileBackedTypes[a.Type]
 		if !ok {
@@ -131,29 +206,67 @@ func Reconcile(claudeDir string, artifacts []Artifact, plan *Plan) (ReconcileRes
 		if !artifactNameRe.MatchString(a.Name) {
 			return res, markFatal(fmt.Errorf("reconcile: unsafe artifact name %q", a.Name))
 		}
-		desired[pathFn(a.Name)] = a.Content
+		desired[pathFn(a.Name)] = desiredFile{content: a.Content, artifactID: a.ID, revision: a.Revision}
 	}
 
 	managed := make([]string, 0, len(desired))
-	for rel, content := range desired {
+	for rel, want := range desired {
 		full, err := resolveContained(claudeDir, rel)
 		if err != nil {
 			return res, err // fatal: traversal
 		}
 		_, statErr := root.stat(full)
 		exists := statErr == nil
-		if exists && !oldSet[rel] {
-			res.Skipped = append(res.Skipped, rel) // unmanaged collision — don't clobber
-			continue
-		}
-		if exists && oldSet[rel] {
-			// Change detection: a managed file whose bytes already match is left
-			// alone (no write, mtime untouched) so a steady-state sync is a
-			// no-op instead of rewriting the whole tree every run. A read error
-			// is NOT a failure here — fall through and let the write decide.
-			if cur, readErr := root.readFile(full); readErr == nil && string(cur) == content {
+		if exists {
+			// Change detection: a file whose bytes already match is left alone
+			// (no write, mtime untouched) so a steady-state sync is a no-op
+			// instead of rewriting the whole tree every run. A read error is
+			// NOT a failure here: for a ledgered path it falls through and lets
+			// the write decide, for an unledgered one it falls through to the
+			// collision skip below, which is where an unreadable stranger
+			// belongs anyway.
+			//
+			// The ledger is deliberately NOT consulted for this branch, and
+			// that is the whole of the A9 fix. An unledgered file whose bytes
+			// already equal the desired content is ADOPTED here: recorded in
+			// `managed` so the rebuilt ledger names it, and counted Unchanged.
+			// Both doctor remedies that say "delete the manifest entirely and
+			// run 'orbeat-sync sync'" were false without it, because every
+			// entitled artifact already on disk was classified as an unmanaged
+			// collision, skipped, and left out of the rebuilt ledger, freezing
+			// it at its current content on that run and on every run after.
+			//
+			// The narrowness is the safety argument, so do not widen it: bytes
+			// EQUAL to the desired content is the one case in which adoption
+			// changes nothing on disk and can destroy nothing, because there is
+			// no version of the file to lose. A file whose content DIFFERS is
+			// still the developer's until they say otherwise, and it keeps the
+			// collision skip below.
+			//
+			// "Destroys nothing" is a claim about THIS run only. Adoption
+			// transfers OWNERSHIP: the path enters `managed`, so the rebuilt
+			// ledger names it, and a later de-entitlement then authorizes the
+			// root.remove in the loop below. The same file this run left
+			// untouched is the file a future run deletes. That is what the byte
+			// comparison is really buying, and why it is the whole gate: the
+			// only file this hands orbeat the right to delete is one whose
+			// content orbeat would have written itself.
+			// TestReconcileAdoptsAnIdenticalUnledgeredFile puts its load-bearing
+			// assertion on exactly that, de-entitling afterwards and requiring
+			// the removal, because reporting Unchanged proves nothing about
+			// ownership.
+			if cur, readErr := root.readFile(full); readErr == nil && string(cur) == want.content {
 				res.Unchanged++
 				managed = append(managed, rel)
+				// Applied: the bytes on disk are the served bytes. A run that
+				// wrote nothing at all still deployed everything it was asked
+				// to, and a registry that only counted writes would report a
+				// steady-state fleet as having nothing installed.
+				res.Applied = appendApplied(res.Applied, want.artifactID, want.revision)
+				continue
+			}
+			if !oldSet[rel] {
+				res.Skipped = append(res.Skipped, rel) // unmanaged collision, don't clobber
 				continue
 			}
 		}
@@ -161,7 +274,7 @@ func Reconcile(claudeDir string, artifacts []Artifact, plan *Plan) (ReconcileRes
 		// (contained beneath claudeDir), so a crash mid-write can never leave a
 		// torn SKILL.md/agent file behind, and an escaping symlink component
 		// fails the write instead of following it out of the root.
-		if err := root.writeAtomic(full, []byte(content), root.existingPerm(full, 0o644)); err != nil {
+		if err := root.writeAtomic(full, []byte(want.content), root.existingPerm(full, 0o644)); err != nil {
 			res.Failures = append(res.Failures, fmt.Sprintf("%s: reconcile: write: %v", rel, err))
 			if oldSet[rel] {
 				managed = append(managed, rel) // preserve: update failed, retry next run
@@ -174,7 +287,11 @@ func Reconcile(claudeDir string, artifacts []Artifact, plan *Plan) (ReconcileRes
 			res.Added++
 		}
 		managed = append(managed, rel)
+		res.Applied = appendApplied(res.Applied, want.artifactID, want.revision)
 	}
+	// The loop above ranges over a map, so without this two identical runs
+	// would produce different orderings of the same set.
+	sort.Slice(res.Applied, func(i, j int) bool { return res.Applied[i].ArtifactID < res.Applied[j].ArtifactID })
 
 	// Remove managed files no longer desired.
 	for _, rel := range m.Files {
@@ -184,6 +301,47 @@ func Reconcile(claudeDir string, artifacts []Artifact, plan *Plan) (ReconcileRes
 		full, err := resolveContained(claudeDir, rel)
 		if err != nil {
 			return res, err // fatal: traversal
+		}
+		// A7: the traversal guard above was the ONLY thing standing between an
+		// untrusted ledger entry and root.remove, and it passes anything that
+		// stays inside the sync root. A manifest holding
+		// {"files":["CLAUDE.md","settings.json"]} therefore deleted both:
+		// ~/.claude/CLAUDE.md is this client's own global-rules target and
+		// ~/.claude/settings.json is Claude Code's configuration. Shape-check the
+		// entry the way the three sibling ledgers already shape-check theirs.
+		//
+		// Ordered AFTER resolveContained on purpose: a traversing entry stays a
+		// fatalError that aborts the run at exit 2, which is the contract the
+		// fatalError taxonomy states and the state doctor's CheckManifest
+		// finding tells the operator about. Refusing it here instead would
+		// quietly downgrade a containment escape to a warning.
+		//
+		// DROPPED, not preserved, and the ledger-preservation rule the rest of
+		// this client follows (v1.15.0's cost asymmetry) genuinely does not
+		// apply. Preservation buys a retry of a unit this run could not
+		// complete; there is no unit here. validManagedFilePath is a pure
+		// function of the string FOR A GIVEN BUILD, since it derives its accepted
+		// set from fileBackedTypes, so an entry THIS binary refuses it refuses on
+		// every run of this binary, and the removal being retried can never
+		// happen. Keeping it would reprint this warning forever, which is the
+		// stranded entry doctor exists to complain about. Both sibling ledgers
+		// that shape-check (validRulesPath, and validGlobalRulesPath with its
+		// explicit "a bad line must not become a denial of service" argument)
+		// drop too.
+		//
+		// "Every FUTURE run" would be the stronger claim and it is not available:
+		// fileBackedTypes grows, so a downgrade (a newer orbeat-sync that manages
+		// a third file-backed type, then this build run against the manifest it
+		// left) reaches here holding a perfectly legitimate entry.
+		// Dropping it is still right, since this build cannot render, own or
+		// remove a file whose type it does not know; the newer client re-adopts
+		// it on its next run through the byte-equality branch above, and until
+		// then the file sits on disk unmanaged. That is why the warning below
+		// does not name a culprit.
+		if !validManagedFilePath(rel) {
+			res.Warnings = append(res.Warnings, fmt.Sprintf(
+				"ignoring sync ledger file entry %q: this orbeat-sync writes no such path, so it was hand-edited, tampered with, or written by a newer orbeat-sync managing a file type this one does not know; dropped from the ledger, nothing on disk was touched", rel))
+			continue
 		}
 		rmErr := root.remove(full)
 		if rmErr != nil && !os.IsNotExist(rmErr) {
@@ -276,6 +434,43 @@ func openRootedFor(dir string, plan *Plan) (*rooted, error) {
 		return nil, err
 	}
 	return openRootedPlanned(dir, plan)
+}
+
+// validManagedFilePath shape-checks one entry of the Files ledger before the
+// removal loop acts on it, the way validSeedPath, validRulesPath and
+// validGlobalRulesPath shape-check theirs. The manifest is a user-editable
+// file on disk, so every entry is untrusted input; this was the only ledger
+// whose entries reached an action, root.remove, behind nothing but the
+// traversal guard.
+//
+// The accepted set is DERIVED from fileBackedTypes rather than restated: an
+// entry is valid iff some registered type's path function, applied to a name
+// this client would accept (artifactNameRe), reproduces the entry byte for
+// byte. A hand-written pattern would be exactly the second table
+// fileBackedTypes' own doc comment warns about, free to drift the day a third
+// file-backed type is added, and drift here means either deleting a file the
+// client does own or refusing to clean up one it wrote.
+//
+// The candidate name is the varying path segment, with and without its
+// extension, which covers both shapes the map emits today
+// (skills/<slug>/SKILL.md, agents/<slug>.md) and any future one whose only
+// variable part is a single segment. A shape whose name spans more than one
+// segment would need this loop widened, and TestValidManagedFilePathAccepts-
+// EveryFileBackedType fails the moment one is added.
+func validManagedFilePath(rel string) bool {
+	for _, seg := range strings.Split(rel, "/") {
+		for _, name := range [2]string{seg, strings.TrimSuffix(seg, filepath.Ext(seg))} {
+			if !artifactNameRe.MatchString(name) {
+				continue
+			}
+			for _, pathFn := range fileBackedTypes {
+				if pathFn(name) == rel {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // resolveContained joins rel under claudeDir and verifies the result stays inside

@@ -426,7 +426,7 @@ func TestPlanMatchesApply_ReconcileRules(t *testing.T) {
 
 	round1 := []Artifact{{Name: "std", Type: "rule", Content: "RULE-1"}}
 	for _, fx := range []fixture{planFx, applyFx} {
-		if _, err := ReconcileRules(fx.home, []string{fx.keep, fx.drop}, round1, nil); err != nil {
+		if _, err := ReconcileRules(fx.home, projs(fx.keep, fx.drop), round1, nil); err != nil {
 			t.Fatalf("setup ReconcileRules: %v", err)
 		}
 	}
@@ -445,14 +445,14 @@ func TestPlanMatchesApply_ReconcileRules(t *testing.T) {
 
 	before := treeSnapshotAll(t, rootsFor(planFx))
 	var p Plan
-	if _, err := ReconcileRules(planFx.home, []string{planFx.keep, planFx.nw}, round2, &p); err != nil {
+	if _, err := ReconcileRules(planFx.home, projs(planFx.keep, planFx.nw), round2, &p); err != nil {
 		t.Fatalf("plan run: %v", err)
 	}
 	assertAllTreesUnchanged(t, rootsFor(planFx), before)
 	planned := planOps(t, p.Changes(), rootsFor(planFx))
 
 	applied := realOps(t, rootsFor(applyFx), func() {
-		if _, err := ReconcileRules(applyFx.home, []string{applyFx.keep, applyFx.nw}, round2, nil); err != nil {
+		if _, err := ReconcileRules(applyFx.home, projs(applyFx.keep, applyFx.nw), round2, nil); err != nil {
 			t.Fatalf("apply run: %v", err)
 		}
 	})

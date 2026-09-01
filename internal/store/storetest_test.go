@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -151,4 +153,15 @@ func explain(t *testing.T, s *Store, sql string, args ...any) string {
 		t.Fatalf("plan rows: %v", err)
 	}
 	return b.String()
+}
+
+// isConstraintViolation reports whether err came from the named Postgres
+// constraint or index. Matching the NAME, not just the SQLSTATE, is what makes
+// the assertions built on it discriminating: artifact carries several CHECKs
+// and several unique keys, so "some integrity constraint fired" would pass on
+// the wrong one and read as proof of the right one. errors.As reaches through
+// store.transition, which wraps the pgx error with %w.
+func isConstraintViolation(err error, name string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.ConstraintName == name
 }

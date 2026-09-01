@@ -46,11 +46,11 @@ func syncArtifactNames(t *testing.T, srv *Server, tn store.Tenant, roleIDs []str
 // every other field, and returns the fresh row.
 //
 // Deliberately NOT through handleUpdateArtifact: this helper serves the test
-// that pins what the DISTRIBUTION query does with dormant grants, and the
-// handler's identity lock (name/type/visibility frozen while an approved
-// snapshot is live) is edition-specific, so driving the flip through it would
-// make that test assert one thing in this repo's build and another in the
-// generated Community tree.
+// that pins what the DISTRIBUTION query does with dormant grants, so it wants
+// the flip and its re-approval with no HTTP layer in between. The handler is
+// exercised for the flip itself by TestSyncChannelFollowsApprovedVisibility
+// (artifact_identity_distribution_test.go), which is where the deferral
+// belongs.
 func setVisibility(t *testing.T, s *store.Store, tenantID, id, visibility string) store.Artifact {
 	t.Helper()
 	ctx := context.Background()
@@ -82,8 +82,11 @@ func setVisibility(t *testing.T, s *store.Store, tenantID, id, visibility string
 // behaviour this whole change exists to make legible, and which nothing pinned
 // before: per-role grants are NOT deleted when an artifact is switched to org
 // visibility. They stop being consulted (store.ListEntitledArtifacts filters on
-// visibility='role') and go dormant, and switching back to role revives every
-// one of them, with nobody re-granting anything.
+// approved_visibility='role') and go dormant, and switching back to role revives
+// every one of them, with nobody re-granting anything. setVisibility below
+// re-approves after each flip, which is why the dormancy is observable here at
+// all: since migration 00016 the channel follows the APPROVED visibility, so an
+// unapproved flip changes nothing a developer receives.
 //
 // The assertion that carries the point is the entitlement IDS: the same rows,
 // by primary key, serve the artifact again after the round trip. A test that
@@ -142,7 +145,7 @@ func TestArtifactVisibilityFlipMakesGrantsDormantThenRevivesThem(t *testing.T) {
 	if got := syncArtifactNames(t, srv, tn, roleIDs); !slices.Equal(got, []string{"dormant-skill"}) {
 		t.Fatalf("sync after the flip back = %v, want [dormant-skill]", got)
 	}
-	ents, err := st.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0)
+	ents, err := st.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0, false)
 	if err != nil {
 		t.Fatalf("list entitlements: %v", err)
 	}
@@ -222,16 +225,33 @@ func decodeRoleGrants(t *testing.T, rec *httptest.ResponseRecorder) (present boo
 // shipped. Red-proven by deleting the metadata block from handleUpdateArtifact,
 // which fails the roleGrantsAffected, roleGrantsEffect and roles assertions in
 // both directions.
+//
+// The two roleGrantsEffect values asserted here are the DEFERRED ones. Since
+// migration 00016 distribution reads approved_visibility, so a flip on a row
+// whose snapshot has not caught up has not happened yet, and the value has to
+// say so: "revived" on a pending flip would tell an operator alice already has
+// the artifact back. Changing the VALUE rather than the doc comment is what
+// makes that correction detectable at all, and this test is where it is
+// detected: a rewording would have left it green. The sibling tests below
+// cover the in-effect values.
 func TestArtifactUpdateAuditRecordsVisibilityFlipGrants(t *testing.T) {
 	ctx := context.Background()
 	srv, st, tn, _ := newArtifactServer(t)
+	// Pinned rather than left at New's edition-specific default: a generated
+	// Community tree copies this ordinary _test.go verbatim and would
+	// auto-approve each flip inside the same auditedTx, making every effect
+	// below the immediate one. Pinning makes both trees run the same path and
+	// assert the same values (maybeAutoApprove is shared and gated only on
+	// this field). The immediate half is TestArtifactUpdateAuditVisibility
+	// EffectIsImmediateUnderAutoApprove's job.
+	srv.autoApprove = false
 
 	platform, _ := st.CreateRole(ctx, tn.ID, "platform")
 	security, _ := st.CreateRole(ctx, tn.ID, "security")
-	// Left as a draft (no approved snapshot): the handler's identity lock
-	// freezes visibility while one is live, and lifting it needs the
-	// Enterprise-only withdraw route, which the generated Community tree does
-	// not have. A draft flips in both editions.
+	// Left as a draft, so nothing is distributed at all and every flip below is
+	// pending on a first approval. The approved-snapshot case, where the flip
+	// is pending against a snapshot that is actively shipping, is
+	// TestArtifactUpdateAuditVisibilityEffectOnAnApprovedArtifact's job.
 	art, err := st.CreateArtifact(ctx, store.Artifact{
 		TenantID: tn.ID, Type: "skill", Name: "flipped-skill", Description: "d",
 		Content: "---\nname: flipped-skill\ndescription: d\n---\nbody", Visibility: "role",
@@ -247,13 +267,13 @@ func TestArtifactUpdateAuditRecordsVisibilityFlipGrants(t *testing.T) {
 		}
 	}
 
-	// role -> org: two grants go dormant.
+	// role -> org: two grants will go dormant, once the flip is approved.
 	rec := updateArtifactVisibility(t, srv, tn, art, "org")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("flip to org = %d, body %s", rec.Code, rec.Body)
 	}
 	ev := lastAuditEvent(t, st, tn.ID, "artifact.update")
-	assertFlipMetadata(t, ev, "role", "org", "dormant", 2, []string{"platform", "security"})
+	assertFlipMetadata(t, ev, "role", "org", "goes_dormant_on_approval", 2, []string{"platform", "security"})
 
 	// The response carries the same numbers, so the caller learns what its own
 	// write did without re-querying.
@@ -265,7 +285,7 @@ func TestArtifactUpdateAuditRecordsVisibilityFlipGrants(t *testing.T) {
 		t.Errorf("response roleGrants = {count:%v roles:%v truncated:%v}, want {2 [platform security] false}", count, roles, truncated)
 	}
 
-	// org -> role: the same two grants revive.
+	// org -> role: the same two grants revive, once the flip is approved.
 	flipped, err := st.GetArtifact(ctx, tn.ID, art.ID)
 	if err != nil {
 		t.Fatalf("re-read artifact: %v", err)
@@ -275,7 +295,7 @@ func TestArtifactUpdateAuditRecordsVisibilityFlipGrants(t *testing.T) {
 		t.Fatalf("flip back to role = %d, body %s", rec.Code, rec.Body)
 	}
 	ev = lastAuditEvent(t, st, tn.ID, "artifact.update")
-	assertFlipMetadata(t, ev, "org", "role", "revived", 2, []string{"platform", "security"})
+	assertFlipMetadata(t, ev, "org", "role", "revives_on_approval", 2, []string{"platform", "security"})
 
 	// An update that does NOT move the visibility writes none of those keys:
 	// the record describes a transition, so it must not appear where there was
@@ -305,6 +325,125 @@ func TestArtifactUpdateAuditRecordsVisibilityFlipGrants(t *testing.T) {
 	if present, count, _, _ := decodeRoleGrants(t, rec); !present || count != 2 {
 		t.Errorf("roleGrants on a non-flip update = (present %v, count %v), want (true, 2)", present, count)
 	}
+}
+
+// TestArtifactUpdateAuditVisibilityEffectOnAnApprovedArtifact is the half its
+// sibling above cannot reach: a flip on an artifact that is actively being
+// distributed, where "pending" means developers keep receiving it on the old
+// channel meanwhile.
+//
+// It also pins the arm that is easiest to get wrong by branching on the edition
+// instead of on the row. The second flip here goes BACK to the visibility the
+// snapshot still carries, so there is nothing left pending and the honest value
+// is the immediate one, even though auto-approve is off and no approval
+// happened. A grantsEffect that keyed on s.autoApprove would report
+// "revives_on_approval" there and be wrong: those grants never went dormant,
+// because the flip away from role never reached distribution.
+//
+// The approved_visibility read before each assertion is the premise, not the
+// gate. Without it a green here would not distinguish "the effect value tracks
+// the snapshot" from "the snapshot happened to move too".
+func TestArtifactUpdateAuditVisibilityEffectOnAnApprovedArtifact(t *testing.T) {
+	ctx := context.Background()
+	srv, st, tn, _ := newArtifactServer(t)
+	srv.autoApprove = false // see the sibling above for why this is pinned
+
+	platform, _ := st.CreateRole(ctx, tn.ID, "platform")
+	art, err := st.CreateArtifact(ctx, store.Artifact{
+		TenantID: tn.ID, Type: "skill", Name: "shipping-skill", Description: "d",
+		Content: "---\nname: shipping-skill\ndescription: d\n---\nbody", Visibility: "role",
+	})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	if _, err := st.CreateArtifactEntitlement(ctx, store.ArtifactEntitlement{
+		TenantID: tn.ID, RoleID: platform.ID, ArtifactID: art.ID,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	approveArtifact(t, st, tn.ID, art.ID)
+
+	// role -> org, deferred: the snapshot still says role, so the grants are
+	// still live and every entitled developer still receives this artifact.
+	approved, err := st.GetArtifact(ctx, tn.ID, art.ID)
+	if err != nil {
+		t.Fatalf("re-read artifact: %v", err)
+	}
+	if approved.ApprovedVisibility != "role" {
+		t.Fatalf("precondition: approvedVisibility = %q, want role", approved.ApprovedVisibility)
+	}
+	if rec := updateArtifactVisibility(t, srv, tn, approved, "org"); rec.Code != http.StatusOK {
+		t.Fatalf("flip to org = %d, body %s", rec.Code, rec.Body)
+	}
+	pending, err := st.GetArtifact(ctx, tn.ID, art.ID)
+	if err != nil {
+		t.Fatalf("re-read artifact: %v", err)
+	}
+	if pending.Visibility != "org" || pending.ApprovedVisibility != "role" {
+		t.Fatalf("precondition: after the flip visibility/approvedVisibility = %q/%q, want org/role: "+
+			"the flip has to be pending for the deferred value to be the true one",
+			pending.Visibility, pending.ApprovedVisibility)
+	}
+	ev := lastAuditEvent(t, st, tn.ID, "artifact.update")
+	assertFlipMetadata(t, ev, "role", "org", "goes_dormant_on_approval", 1, []string{"platform"})
+
+	// org -> role, and this one IS in effect: approved_visibility never left
+	// role, so the grants never went dormant and nothing is waiting on an
+	// approval to bring them back.
+	if rec := updateArtifactVisibility(t, srv, tn, pending, "role"); rec.Code != http.StatusOK {
+		t.Fatalf("flip back to role = %d, body %s", rec.Code, rec.Body)
+	}
+	back, err := st.GetArtifact(ctx, tn.ID, art.ID)
+	if err != nil {
+		t.Fatalf("re-read artifact: %v", err)
+	}
+	if back.ApprovedVisibility != "role" {
+		t.Fatalf("precondition: approvedVisibility = %q, want role (the snapshot must not have moved)",
+			back.ApprovedVisibility)
+	}
+	ev = lastAuditEvent(t, st, tn.ID, "artifact.update")
+	assertFlipMetadata(t, ev, "org", "role", "revived", 1, []string{"platform"})
+}
+
+// TestArtifactUpdateAuditVisibilityEffectIsImmediateUnderAutoApprove is the
+// Community arm: tx.UpdateArtifact and s.maybeAutoApprove run in the same
+// auditedTx, so approved_visibility moves with the live column and the flip is
+// in effect before the audit row is written. The value has to be the plain
+// "dormant" there, and it is the same grantsEffect call reaching it from the
+// row rather than from an edition check.
+func TestArtifactUpdateAuditVisibilityEffectIsImmediateUnderAutoApprove(t *testing.T) {
+	ctx := context.Background()
+	srv, st, tn, _ := newArtifactServer(t)
+	srv.autoApprove = true
+
+	platform, _ := st.CreateRole(ctx, tn.ID, "platform")
+	art, err := st.CreateArtifact(ctx, store.Artifact{
+		TenantID: tn.ID, Type: "skill", Name: "auto-skill", Description: "d",
+		Content: "---\nname: auto-skill\ndescription: d\n---\nbody", Visibility: "role",
+	})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	if _, err := st.CreateArtifactEntitlement(ctx, store.ArtifactEntitlement{
+		TenantID: tn.ID, RoleID: platform.ID, ArtifactID: art.ID,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	if rec := updateArtifactVisibility(t, srv, tn, art, "org"); rec.Code != http.StatusOK {
+		t.Fatalf("flip to org = %d, body %s", rec.Code, rec.Body)
+	}
+	flipped, err := st.GetArtifact(ctx, tn.ID, art.ID)
+	if err != nil {
+		t.Fatalf("re-read artifact: %v", err)
+	}
+	if flipped.ApprovedVisibility != "org" {
+		t.Fatalf("precondition: approvedVisibility = %q, want org: auto-approve must have promoted the "+
+			"flip in the same transaction, or the immediate value below is not the true one",
+			flipped.ApprovedVisibility)
+	}
+	ev := lastAuditEvent(t, st, tn.ID, "artifact.update")
+	assertFlipMetadata(t, ev, "role", "org", "dormant", 1, []string{"platform"})
 }
 
 // assertFlipMetadata checks every visibility-flip key by VALUE.
@@ -489,6 +628,13 @@ func waitForBlockedAPIQuery(t *testing.T, substr string, timeout time.Duration) 
 func TestArtifactUpdateGrantReportIsNotABeforePicture(t *testing.T) {
 	ctx := context.Background()
 	srv, st, tn, _ := newArtifactServer(t)
+	// Pinned for the same reason as the flip tests above: roleGrantsEffect now
+	// reports whether the flip has reached distribution, so its value is
+	// edition-dependent unless auto-approve is fixed. The subject here is the
+	// grant COUNT and the role names, and pinning keeps the effect string from
+	// making an unrelated assertion tier-dependent in a generated Community
+	// tree, where this ordinary _test.go is copied verbatim.
+	srv.autoApprove = false
 
 	art, err := st.CreateArtifact(ctx, store.Artifact{
 		TenantID: tn.ID, Type: "skill", Name: "race-skill", Description: "d",
@@ -564,7 +710,7 @@ func TestArtifactUpdateGrantReportIsNotABeforePicture(t *testing.T) {
 	}
 
 	ev := lastAuditEvent(t, st, tn.ID, "artifact.update")
-	assertFlipMetadata(t, ev, "role", "org", "dormant", 3,
+	assertFlipMetadata(t, ev, "role", "org", "goes_dormant_on_approval", 3,
 		[]string{"aaa-team", "bbb-team", "ccc-team"})
 }
 

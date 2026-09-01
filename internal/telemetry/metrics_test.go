@@ -199,6 +199,42 @@ func TestSessionLookupCounterRecords(t *testing.T) {
 	}
 }
 
+// TestMetricsPinnedPayloadRaceFallbackCounterRecords pins that NewMetrics
+// wires up orbeat.sync.pin.payload_race_fallback the same way as every
+// sibling counter above. The behavior-specific assertions (that
+// resolveSyncPayload increments it ONLY on the missing-payload arm, never on
+// an ordinary served pin) live in internal/api, the one package that can
+// drive the real decision function; this test just proves the instrument
+// itself exists and is wired into NewMetrics, which is the registration half
+// open-points.md's row asks for regardless of whether the fallback branch
+// itself can be driven through a running handler.
+func TestMetricsPinnedPayloadRaceFallbackCounterRecords(t *testing.T) {
+	rdr := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(rdr))
+	m := NewMetrics(mp.Meter("orbeat-test"))
+	m.PinnedPayloadRaceFallback.Add(context.Background(), 1)
+
+	var rm metricdata.ResourceMetrics
+	if err := rdr.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	var found bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, md := range sm.Metrics {
+			if md.Name != "orbeat.sync.pin.payload_race_fallback" {
+				continue
+			}
+			if _, ok := md.Data.(metricdata.Sum[int64]); !ok {
+				t.Fatalf("orbeat.sync.pin.payload_race_fallback data type = %T, want metricdata.Sum[int64]", md.Data)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("orbeat.sync.pin.payload_race_fallback counter not recorded")
+	}
+}
+
 // TestRegisterSessionGaugeReadsCallback pins RegisterSessionGauge's wiring:
 // the observable gauge reports whatever count() returns at collection time.
 func TestRegisterSessionGaugeReadsCallback(t *testing.T) {

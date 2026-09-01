@@ -72,3 +72,59 @@ func TestEmptyEntitlements(t *testing.T) {
 		t.Fatal("expected deny with no entitlements")
 	}
 }
+
+// TestAuthorizingEntitlementAttributesToTheGrantingRole is Task 1's
+// correction gate: a subject holding TWO roles, where only ONE of them
+// grants the tool being called, must attribute the call to the GRANTING
+// role -- never the session's first role regardless of which one actually
+// authorized it (docs/specs/2026-08-25-orbeat-usage-metering-design.md
+// section 2). A fixture where the subject holds only one role cannot tell
+// "the correct role" apart from "whichever role happened to be present", so
+// both orderings are built deliberately: the granting role listed second
+// catches a "always return ents[0]'s role" mutant, and the granting role
+// listed first catches the opposite "always return the last match" mutant.
+func TestAuthorizingEntitlementAttributesToTheGrantingRole(t *testing.T) {
+	cases := []struct {
+		name       string
+		ents       []store.Entitlement
+		wantRoleID string
+	}{
+		{
+			name: "granting role listed second",
+			ents: []store.Entitlement{
+				{RoleID: "role-viewer", MCPServerID: "s1", AllowedTools: []string{"list"}},  // does NOT grant "write"
+				{RoleID: "role-editor", MCPServerID: "s1", AllowedTools: []string{"write"}}, // grants "write"
+			},
+			wantRoleID: "role-editor",
+		},
+		{
+			name: "granting role listed first",
+			ents: []store.Entitlement{
+				{RoleID: "role-editor", MCPServerID: "s1", AllowedTools: []string{"write"}}, // grants "write"
+				{RoleID: "role-viewer", MCPServerID: "s1", AllowedTools: []string{"list"}},  // does NOT grant "write"
+			},
+			wantRoleID: "role-editor",
+		},
+	}
+	for _, c := range cases {
+		got, ok := AuthorizingEntitlement(c.ents, "s1", "write")
+		if !ok {
+			t.Fatalf("%s: AuthorizingEntitlement = not ok, want ok (role-editor grants \"write\")", c.name)
+		}
+		if got.RoleID != c.wantRoleID {
+			t.Errorf("%s: RoleID = %q, want %q -- a subject holding two roles, only one of which grants "+
+				"the tool, must attribute to the GRANTING role, never the session's first role regardless "+
+				"of which one actually authorized the call", c.name, got.RoleID, c.wantRoleID)
+		}
+	}
+
+	// A call neither role grants must report not-ok, not a zero-value role
+	// mistaken for an attribution.
+	ents := []store.Entitlement{
+		{RoleID: "role-viewer", MCPServerID: "s1", AllowedTools: []string{"list"}},
+		{RoleID: "role-editor", MCPServerID: "s1", AllowedTools: []string{"write"}},
+	}
+	if _, ok := AuthorizingEntitlement(ents, "s1", "delete"); ok {
+		t.Fatal("AuthorizingEntitlement(s1, delete) = ok, want not ok -- neither role grants \"delete\"")
+	}
+}

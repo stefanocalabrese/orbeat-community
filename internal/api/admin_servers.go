@@ -13,8 +13,12 @@ import (
 	"github.com/stefanocalabrese/orbeat-community/internal/store"
 )
 
-// serverInput is the admin write DTO. It carries the secret REFERENCE (never a
-// raw secret) and the endpoint/command, which the read-only catalog DTO omits.
+// serverInput is the admin CREATE write DTO. It carries the secret REFERENCE
+// (never a raw secret) and the endpoint/command, which the read-only catalog
+// DTO omits. SecretRef/TLSCARef are plain strings here, deliberately NOT the
+// *string tri-state serverUpdateInput below uses: a create has no existing
+// value to preserve, so an omitted field and an explicit "" mean exactly the
+// same thing ("no reference at all") — there is no third state to express.
 type serverInput struct {
 	Name              string `json:"name"`
 	Description       string `json:"description"`
@@ -25,6 +29,41 @@ type serverInput struct {
 	SecretRef         string `json:"secretRef"`
 	TLSCARef          string `json:"tlsCaRef"`
 	Status            string `json:"status"`
+}
+
+// serverUpdateInput is the admin UPDATE write DTO (PUT /v1/admin/servers/{id}).
+// It differs from serverInput ONLY in SecretRef/TLSCARef's type, and that
+// difference is the whole fix for defect 1 (2026-09-01, BREAKING): before
+// this, an update wrote plain strings straight into NULLIF of empty string, so an
+// OMITTED key and an EXPLICIT "" were byte-identical on the wire and both
+// wiped the stored reference — and since GetMCPServer/toAdminServerDTO never
+// echo either ref back (hasSecret/hasTlsCa booleans only, by design), no
+// read-modify-write caller could ever have resent the value it couldn't
+// read, so every partial update silently destroyed both refs.
+//
+// *string makes the three states an update can express explicit at the type
+// level rather than resting on a caller-side convention nothing enforces:
+//   - nil (the key is absent from the JSON body): leave the stored value
+//     exactly as it is. This is the new default, and it is what makes a
+//     script that PATCHes only, say, `status` safe to write for the first
+//     time.
+//   - a pointer to "" (the key is present with an empty value): explicit
+//     clear.
+//   - a pointer to a non-empty string: replace.
+//
+// See UpdateMCPServer's own doc comment (internal/store/mcpserver.go) for how
+// this reaches SQL, and validateServerWrite's doc comment for how a nil skips
+// validation (there is no new value on this write to validate).
+type serverUpdateInput struct {
+	Name              string  `json:"name"`
+	Description       string  `json:"description"`
+	Transport         string  `json:"transport"`
+	EndpointOrCommand string  `json:"endpointOrCommand"`
+	Version           string  `json:"version"`
+	ProtocolVersion   string  `json:"protocolVersion"`
+	SecretRef         *string `json:"secretRef"`
+	TLSCARef          *string `json:"tlsCaRef"`
+	Status            string  `json:"status"`
 }
 
 // adminServerDTO is the admin read projection: like the catalog DTO plus the
@@ -193,12 +232,25 @@ func validEndpoint(endpoint string) bool {
 // granularity; the invariant is the absence of the value, not one message.
 // TestServerWriteSurfacesSpecificRefReason pins the granularity so a
 // "simplification" back to one static string cannot pass silently.
-func validateServerWrite(resolver *secrets.Resolver, endpoint, secretRef, tlsCARef string) (msg string, ok bool) {
+// secretRef and tlsCARef are *string so a single validator serves both
+// serverInput (create, always non-nil — see its own doc comment) and
+// serverUpdateInput (update, nil means "this write does not mention the
+// field"). A nil is skipped entirely rather than treated as "": there is no
+// new value on this write to check, and ValidateRef's own contract already
+// treats "" as valid-and-meaningless (an explicit clear needs no scheme), so
+// folding nil into "" would happen to produce the same answer today but for
+// the wrong reason — a future ValidateRef change with a side effect for ""
+// (a metric, a deprecation warning) would then fire on every omitted field
+// on every update, which nothing about "the caller didn't mention this
+// field" should ever trigger.
+func validateServerWrite(resolver *secrets.Resolver, endpoint string, secretRef, tlsCARef *string) (msg string, ok bool) {
 	if !validEndpoint(endpoint) {
 		return "endpointOrCommand must be an absolute http(s) URL with a host and no embedded credentials", false
 	}
-	if err := resolver.ValidateRef(secretRef); err != nil {
-		return err.Error(), false
+	if secretRef != nil {
+		if err := resolver.ValidateRef(*secretRef); err != nil {
+			return err.Error(), false
+		}
 	}
 	// Structural only: ValidateRef checks the scheme is registered and the
 	// locator is usable. It deliberately does NOT resolve the ref or check that
@@ -210,10 +262,65 @@ func validateServerWrite(resolver *secrets.Resolver, endpoint, secretRef, tlsCAR
 	// both now share the same validator and the same error text, and an admin
 	// who typo'd tlsCaRef's scheme needs to know that, not "secretRef" by
 	// omission.
-	if err := resolver.ValidateRef(tlsCARef); err != nil {
-		return "tlsCaRef: " + err.Error(), false
+	if tlsCARef != nil {
+		if err := resolver.ValidateRef(*tlsCARef); err != nil {
+			return "tlsCaRef: " + err.Error(), false
+		}
 	}
 	return "", true
+}
+
+// derefRefOrUnchanged renders a tri-state update field for the deny-audit
+// path (handleUpdateServer's ErrVersionMismatch arm), which records the
+// ATTEMPTED write since nothing was persisted. nil (the request never
+// mentioned this field) is rendered as the literal "(unchanged)" rather than
+// "" — the two are not the same attempt, and a deny row claiming an admin
+// tried to clear a ref they never touched would misname a security-relevant
+// event on the one surface that exists to describe it accurately (audit A4).
+// A non-nil pointer, including one to "" (an explicit attempted clear), is
+// rendered as its dereferenced value like every other field this metadata
+// records.
+func derefRefOrUnchanged(p *string) string {
+	if p == nil {
+		return "(unchanged)"
+	}
+	return *p
+}
+
+// serverWriteAuditMetadata is the audit metadata every mcp_server write
+// records. It exists because "name" alone made the audit trail unable to
+// distinguish adding a legitimate MCP server from pointing one at an
+// attacker's host with a credential ref of the attacker's choosing (audit A4):
+// the endpoint and the two refs ARE the security-relevant content of the
+// write, and neither was recorded.
+//
+// Recording the refs is safe, and the reason is a precondition rather than a
+// hope: every ALLOW-path caller runs validateServerWrite first, so by the
+// time this is called each ref is either empty or a well-formed
+// "<scheme>:<locator>" with a registered scheme and a locator that scheme
+// accepts. A raw secret pasted into the secretRef field has already been
+// refused with a 400 that does not echo it, so it can never reach this map.
+// That is also why the values may be recorded verbatim while the 400
+// messages next door may not name them.
+//
+// Empty refs are recorded as "" rather than omitted, so "this server carries no
+// credential" is an assertion in the row instead of an absence a reader has to
+// interpret. handleUpdateServer's ErrVersionMismatch (DENY) arm is the one
+// caller that does NOT pass a validated ref straight through: it renders a
+// tri-state *string first (derefRefOrUnchanged), so the value that reaches
+// this map there can also be the literal "(unchanged)" — a nil the request
+// never mentioned that field, not a well-formed ref. That value is still
+// exactly what it claims to be (the field genuinely was not part of the
+// attempted write), so it does not weaken the "safe to record verbatim"
+// argument above; it is simply a third case the ALLOW-path callers never
+// produce.
+func serverWriteAuditMetadata(name, endpoint, secretRef, tlsCARef string) map[string]any {
+	return map[string]any{
+		"name":              name,
+		"endpointOrCommand": endpoint,
+		"secretRef":         secretRef,
+		"tlsCaRef":          tlsCARef,
+	}
 }
 
 // checkServerSlugCollision rejects a create/update whose name would collide
@@ -267,7 +374,7 @@ func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "status must be one of active, disabled")
 		return
 	}
-	if msg, ok := validateServerWrite(s.secrets, in.EndpointOrCommand, in.SecretRef, in.TLSCARef); !ok {
+	if msg, ok := validateServerWrite(s.secrets, in.EndpointOrCommand, &in.SecretRef, &in.TLSCARef); !ok {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
@@ -294,7 +401,8 @@ func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		return store.AuditEvent{
 			TenantID: rc.TenantID, Actor: p.Subject, Action: "server.create",
 			Target: created.ID, Decision: "allow",
-			Metadata: map[string]any{"name": created.Name},
+			Metadata: serverWriteAuditMetadata(created.Name, created.EndpointOrCommand,
+				created.SecretRef, created.TLSCARef),
 		}, nil
 	})
 	if err != nil {
@@ -308,6 +416,10 @@ func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 // nextCursor heuristic (len(rows)==limit means "possibly more"; an exact
 // multiple of limit costs one extra empty page) is documented once, on
 // handleListRoles above — it applies identically here.
+//
+// ?q= searches name, the same column this list sorts on, IN SQL, see
+// handleListRoles' comment on why (identical reasoning, applies to every
+// search-supporting list).
 func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 	rc, _, ok := s.resolved(w, r)
 	if !ok {
@@ -318,7 +430,12 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	servers, err := s.store.ListMCPServersPage(r.Context(), rc.TenantID, cursor, limit)
+	desc, err := sortOrderParams(r, mcpServerSortName)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	servers, err := s.store.ListMCPServersPage(r.Context(), rc.TenantID, cursor, limit, desc, searchParam(r))
 	if err != nil {
 		fail(w, err)
 		return
@@ -329,7 +446,7 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 	}
 	next := ""
 	if len(servers) == limit && limit > 0 {
-		next = encodeListCursor(store.MCPServerCursor(servers[len(servers)-1]))
+		next = encodeListCursor(store.MCPServerCursor(servers[len(servers)-1], desc))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"servers": out, "limit": limit, "nextCursor": next})
 }
@@ -365,7 +482,7 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var in serverInput
+	var in serverUpdateInput
 	if !decodeJSONOrFail(w, r, &in) {
 		return
 	}
@@ -393,10 +510,14 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m := store.MCPServer{
+		// SecretRef/TLSCARef are deliberately NOT set here: UpdateMCPServer
+		// ignores them on m and takes the tri-state in.SecretRef/in.TLSCARef as
+		// explicit parameters instead (see that function's own doc comment) —
+		// setting them on m as well would be dead code inviting a future editor
+		// to "fix" this call by wiring them back in, silently reviving defect 1.
 		ID: id, TenantID: rc.TenantID, Name: in.Name, Description: in.Description,
 		Transport: in.Transport, EndpointOrCommand: in.EndpointOrCommand,
-		Version: in.Version, ProtocolVersion: in.ProtocolVersion,
-		SecretRef: in.SecretRef, TLSCARef: in.TLSCARef, Status: in.Status,
+		Version: in.Version, ProtocolVersion: in.ProtocolVersion, Status: in.Status,
 		// RowVersion carries the CLIENT's expected version (from If-Match) into
 		// UpdateMCPServer's `... AND row_version=$n` guard. The CTE (§6.2)
 		// distinguishes "doesn't exist" from "exists but stale" in one
@@ -406,13 +527,15 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 	var updated store.MCPServer
 	err = s.auditedTx(r.Context(), func(tx *store.Store) (store.AuditEvent, error) {
 		var e error
-		updated, e = tx.UpdateMCPServer(r.Context(), m)
+		updated, e = tx.UpdateMCPServer(r.Context(), m, in.SecretRef, in.TLSCARef)
 		if e != nil {
 			return store.AuditEvent{}, e
 		}
 		return store.AuditEvent{
 			TenantID: rc.TenantID, Actor: p.Subject, Action: "server.update",
-			Target: updated.ID, Decision: "allow", Metadata: map[string]any{"name": updated.Name},
+			Target: updated.ID, Decision: "allow",
+			Metadata: serverWriteAuditMetadata(updated.Name, updated.EndpointOrCommand,
+				updated.SecretRef, updated.TLSCARef),
 		}, nil
 	})
 	if err != nil {
@@ -425,10 +548,21 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 		// (missing/refused If-Match) is a client bug, not a security event,
 		// and is deliberately NOT audited (spec §9).
 		if errors.Is(err, store.ErrVersionMismatch) {
+			// The ATTEMPTED values, not the stored ones: nothing was written.
+			// A refused write is the row an investigator most wants to see for
+			// an exfiltration attempt (audit A4), and "which endpoint and which
+			// ref did they try to point this server at" is the whole content of
+			// that answer; "name + version_mismatch" alone cannot distinguish
+			// it from a benign concurrent edit. derefRefOrUnchanged renders a
+			// nil ref (the request never mentioned it) as "(unchanged)" rather
+			// than "" — the two are different attempts (see its own comment).
+			denyMeta := serverWriteAuditMetadata(in.Name, in.EndpointOrCommand,
+				derefRefOrUnchanged(in.SecretRef), derefRefOrUnchanged(in.TLSCARef))
+			denyMeta["reason"] = "version_mismatch"
 			if aerr := s.appendDenyAudit(r.Context(), store.AuditEvent{
 				TenantID: rc.TenantID, Actor: p.Subject, Action: "server.update",
 				Target: id, Decision: "deny",
-				Metadata: map[string]any{"name": in.Name, "reason": "version_mismatch"},
+				Metadata: denyMeta,
 			}); aerr != nil {
 				fail(w, aerr)
 				return

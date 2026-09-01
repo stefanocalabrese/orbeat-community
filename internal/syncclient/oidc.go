@@ -2,7 +2,6 @@ package syncclient
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,6 +11,12 @@ import (
 type Metadata struct {
 	DeviceAuthorizationEndpoint string `json:"device_authorization_endpoint"`
 	TokenEndpoint               string `json:"token_endpoint"`
+	// AuthorizationEndpoint is used only by the loopback + PKCE login
+	// (`orbeat-sync login --browser`). It is deliberately NOT required by
+	// Discover: the device flow is the supported path everywhere, and failing
+	// discovery over a field only one optional flow reads would break login
+	// against a provider that simply does not advertise it.
+	AuthorizationEndpoint string `json:"authorization_endpoint"`
 }
 
 // Discover fetches {base}/.well-known/openid-configuration and returns the device
@@ -31,8 +36,8 @@ func Discover(ctx context.Context, hc *http.Client, base string) (Metadata, erro
 		return Metadata{}, fmt.Errorf("oidc discovery: status %d", resp.StatusCode)
 	}
 	var m Metadata
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return Metadata{}, fmt.Errorf("oidc discovery: decode: %w", err)
+	if err := decodeJSONCapped(resp.Body, maxJSONBodyBytes, &m); err != nil {
+		return Metadata{}, fmt.Errorf("oidc discovery: %w", err)
 	}
 	if m.DeviceAuthorizationEndpoint == "" || m.TokenEndpoint == "" {
 		return Metadata{}, fmt.Errorf("oidc discovery: missing device_authorization_endpoint or token_endpoint")

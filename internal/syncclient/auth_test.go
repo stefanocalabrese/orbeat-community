@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,6 +111,51 @@ func TestRefresh(t *testing.T) {
 	}
 	if tok.AccessToken != "AT2" || tok.RefreshToken != "RT2" {
 		t.Fatalf("bad refreshed token: %+v", tok)
+	}
+}
+
+// B26: the device-authorization response comes from the OIDC token endpoint,
+// client config this client does not fully control — a bare
+// json.NewDecoder(resp.Body).Decode had no upper bound.
+//
+// Exercises requestDeviceCode DIRECTLY rather than through Login: an earlier
+// version of this test drove it through Login and passed even on the
+// unfixed code, but for the WRONG reason — Login's meta.TokenEndpoint was
+// never served by the fake server, so the very next step (the token poll)
+// 404'd, failed to decode a non-JSON body, and Login gave up after
+// maxConsecutivePollErrors, an error that has nothing to do with the device-
+// auth response's size. Calling requestDeviceCode directly removes that
+// confound.
+func TestRequestDeviceCodeRefusesAnOversizedResponseBody(t *testing.T) {
+	huge := strings.Repeat("A", int(maxJSONBodyBytes)+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"device_code":"`))
+		_, _ = w.Write([]byte(huge))
+		_, _ = w.Write([]byte(`","user_code":"U","verification_uri":"https://kc/d","expires_in":600,"interval":1}`))
+	}))
+	defer srv.Close()
+	a := &Authenticator{HTTPClient: srv.Client(), ClientID: "orbeat-cli"}
+	if _, err := a.requestDeviceCode(context.Background(), srv.URL); err == nil {
+		t.Fatal("an oversized device-authorization response must be refused")
+	}
+}
+
+// Same defect on the token-endpoint poll response (requestDeviceCode's
+// sibling decode), exercised through Refresh: an access/refresh token pair is
+// ordinarily small, but nothing bounded it before this fix.
+func TestRefreshRefusesAnOversizedTokenResponse(t *testing.T) {
+	huge := strings.Repeat("A", int(maxJSONBodyBytes)+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"`))
+		_, _ = w.Write([]byte(huge))
+		_, _ = w.Write([]byte(`","refresh_token":"RT2","expires_in":300}`))
+	}))
+	defer srv.Close()
+	a := &Authenticator{HTTPClient: srv.Client(), ClientID: "orbeat-cli", Sleep: func(context.Context, time.Duration) error { return nil }}
+	if _, err := a.Refresh(context.Background(), srv.URL+"/token", "RT"); err == nil {
+		t.Fatal("an oversized token-endpoint response must be refused")
 	}
 }
 

@@ -1,27 +1,41 @@
 import { useState, type ChangeEvent } from "react";
 import {
+  useAcknowledgeFindings,
   useAdminArtifact,
   useAdminArtifacts,
+  useArtifactPinningEnabled,
   useArtifactRevisions,
   useCreateArtifact,
   useDeleteArtifact,
   useMarketplacePublish,
   useMarketplaceStatus,
   useRollbackArtifact,
+  useSetArtifactMinRevision,
   useUpdateArtifact,
   useSubmitArtifact,
   useWithdrawArtifact,
 } from "../../api/queries";
-import type { AdminArtifact, ArtifactInput, ArtifactRevision, ArtifactRoleGrants } from "../../api/types";
+import type { AdminArtifact, ArtifactInput, ArtifactRevision, ArtifactRoleGrants, ScanFinding } from "../../api/types";
 import { errMsg } from "../../api/client";
+import { useAuth } from "../../auth/useAuth";
 import { FormField, inputCls } from "../../components/FormField";
 import { QueryGate } from "../../components/QueryGate";
 import { Button } from "../../components/ui/Button";
 import { StateBadge, Pill, Chip } from "../../components/ui/Badge";
 import { Card, Panel } from "../../components/ui/Card";
 import { Diff } from "../../components/ui/Diff";
+import { ListSearchBox, SortableTh } from "../../components/ui/AdminListControls";
 import { ConflictNotice } from "./ConflictNotice";
 import { isConflict } from "./conflict";
+import { SEARCH_DEBOUNCE_MS, useDebouncedValue } from "../../hooks/useDebouncedValue";
+import {
+  distributedIdentity,
+  distributedSummary,
+  pendingIdentity,
+  rollbackConfirmMessage,
+  type IdentityChange,
+  type IdentityField,
+} from "./identity";
 
 const EMPTY: ArtifactInput = {
   type: "skill",
@@ -48,6 +62,12 @@ interface ArtifactFormProps {
    * only: a create has no grants yet, so it passes nothing.
    */
   roleGrants?: ArtifactRoleGrants;
+  /**
+   * The identity fields this artifact has saved but not yet distributed
+   * (pendingIdentity). Edit form only: a create has nothing distributed yet,
+   * so it passes nothing and the note never renders.
+   */
+  identityGap?: IdentityChange[];
 }
 
 /**
@@ -73,12 +93,35 @@ function ReviveWarning({ grants }: { grants: ArtifactRoleGrants }) {
       Saving revives {grants.count} dormant {grants.count === 1 ? "grant" : "grants"} on this artifact:{" "}
       <span className="font-medium">{grants.roles.join(", ")}</span>
       {grants.truncated && <> and more</>}. They were kept when it was switched to org visibility and take effect again
-      immediately. Remove them on the Artifact entitlements page first if that is not what you want.
+      when this change reaches distribution. Remove them on the Artifact entitlements page first if that is not what you
+      want.
     </p>
   );
 }
 
-function ArtifactForm({ initial, onSubmit, pending, error, conflict = false, onReload, submitLabel, roleGrants }: ArtifactFormProps) {
+/**
+ * What developers receive while a saved identity edit waits to be distributed.
+ *
+ * Deliberately phrased around the reader's disk rather than around approval
+ * state. The portal cannot tell which edition it is talking to, and the
+ * sentence has to stay true in both: in Community the update and its
+ * auto-approval commit together, so there is never a gap and this never
+ * renders; in Enterprise it is the only thing on screen that explains why the
+ * file on a developer's machine still has the old name.
+ */
+function PendingIdentityNote({ changes }: { changes: IdentityChange[] }) {
+  if (changes.length === 0) {
+    return null;
+  }
+  return (
+    <p role="note" className="rounded-md border border-warn bg-warn-weak px-3 py-2 text-sm text-text">
+      Developers still receive <span className="font-medium">{distributedSummary(changes)}</span> until the saved
+      changes are distributed.
+    </p>
+  );
+}
+
+function ArtifactForm({ initial, onSubmit, pending, error, conflict = false, onReload, submitLabel, roleGrants, identityGap }: ArtifactFormProps) {
   const [v, setV] = useState(initial);
   // `initial.visibility` is the SAVED value (the form is constructed from the
   // by-id fetch and never re-primed), so this compares what is about to be
@@ -109,6 +152,7 @@ function ArtifactForm({ initial, onSubmit, pending, error, conflict = false, onR
           onSubmit(v);
         }}
       >
+        <PendingIdentityNote changes={identityGap ?? []} />
         <FormField label="Type" htmlFor="f-type">
           <select id="f-type" aria-label="Type" className={inputCls} value={v.type} onChange={set("type")}>
             <option value="skill">skill</option>
@@ -239,6 +283,11 @@ function ArtifactEditForm({
           onReload();
         }}
         roleGrants={a.roleGrants}
+        // Computed from the SAVED artifact, not from the form's in-progress
+        // state: the note reports what is being distributed right now, which
+        // no amount of typing in this form changes until it is saved and
+        // distributed.
+        identityGap={pendingIdentity(a)}
         initial={{
           type: a.type,
           name: a.name,
@@ -346,15 +395,29 @@ function RevisionItem({
   prev,
   prevPruned,
   restoredFromPruned,
-  id,
+  artifact,
   rollback,
+  floor,
+  pinningEnabled,
 }: {
   r: ArtifactRevision;
   prev: ArtifactRevision | undefined;
   prevPruned: boolean;
   restoredFromPruned: boolean;
-  id: string;
+  artifact: AdminArtifact;
   rollback: ReturnType<typeof useRollbackArtifact>;
+  // Shared with every other row in this panel, same as `rollback`: its
+  // error/conflict state is rendered once at RevisionHistory level, not
+  // per row, so this component only ever calls `.mutate` and reads
+  // `.isPending`.
+  floor: ReturnType<typeof useSetArtifactMinRevision>;
+  // open-points.md point 6: a Community server does not register PUT
+  // /v1/admin/artifacts/{id}/min-revision at all, so a row that offered
+  // "Require this or newer" there would be clickable and 404. Gates that
+  // button AND the "floor" pill below; see ArtifactsPage's own comment on
+  // the table row's floor marker for why the pill is gated too, not only
+  // the action.
+  pinningEnabled: boolean;
 }) {
   const [open, setOpen] = useState(false);
   // `r.revision === 1` is NOT subsumed by prevPruned: isPruned errs toward
@@ -370,6 +433,11 @@ function RevisionItem({
   const rollbackLabel = r.restoredFrom == null
     ? "rollback"
     : `rollback of #${r.restoredFrom}${restoredFromPruned ? " (pruned)" : ""}`;
+  // The row that IS the current floor. `> 0` matters: 0 means "no floor",
+  // never "floored at revision 0" (no revision numbered 0 exists), so
+  // without it every row would compare false against an unset floor except
+  // one that can never occur.
+  const isFloor = artifact.minRevision > 0 && r.revision === artifact.minRevision;
 
   return (
     <li className="border-border py-3 [&+li]:border-t">
@@ -384,6 +452,7 @@ function RevisionItem({
               ? <Pill variant={restoredFromPruned ? "neutral" : "info"} dot={!restoredFromPruned}>{rollbackLabel}</Pill>
               : <Chip>approval</Chip>}
             {r.isCurrent && <Pill variant="accent">current</Pill>}
+            {pinningEnabled && isFloor && <Pill variant="blue">floor</Pill>}
           </div>
           <div className="mt-0.5 text-xs text-faint">
             {r.source === "rollback" ? "restored" : "approved"} by <span className="text-muted">{r.approvedBy}</span> · <span className="font-mono">{new Date(r.approvedAt).toLocaleString()}</span>
@@ -401,15 +470,64 @@ function RevisionItem({
             </button>
           )}
         </div>
-        {!r.isCurrent && (
-          <button
-            onClick={() => { if (window.confirm(`Roll distribution back to revision #${r.revision}?`)) rollback.mutate({ id, revision: r.revision }); }}
-            disabled={rollback.isPending}
-            className="rounded-md border border-border-strong px-2.5 py-1 text-xs font-semibold text-muted hover:border-accent hover:bg-accent-weak hover:text-accent-ink disabled:opacity-50"
-          >
-            Roll back to #{r.revision}
-          </button>
-        )}
+        <div className="flex flex-col items-end gap-1.5">
+          {!r.isCurrent && (
+            <button
+              // A revision is the complete approved state, so rolling back can
+              // MOVE the artifact's file on every machine that receives it. The
+              // confirmation names that before it fires, and names its absence
+              // just as explicitly on a revision that recorded no identity: see
+              // rollbackConfirmMessage.
+              onClick={() => {
+                if (window.confirm(rollbackConfirmMessage(r, distributedIdentity(artifact)))) {
+                  rollback.mutate({ id: artifact.id, revision: r.revision });
+                }
+              }}
+              disabled={rollback.isPending}
+              className="rounded-md border border-border-strong px-2.5 py-1 text-xs font-semibold text-muted hover:border-accent hover:bg-accent-weak hover:text-accent-ink disabled:opacity-50"
+            >
+              Roll back to #{r.revision}
+            </button>
+          )}
+          {/*
+            Pre-this-slice, the isFloor branch here rendered a "Remove the
+            floor" button. It is GONE, not moved: the artifact table row's
+            own floor marker (ArtifactsPage's tableFloor control) is now the
+            ONLY clear path, because it reads artifact.minRevision directly
+            and works even when ORBEAT_ARTIFACT_REVISION_KEEP has pruned the
+            floor's own revision out of THIS list, the exact gap that
+            stranded this button (open-points.md's pinning row, point 7). A
+            row-scoped control that sometimes has no row to scope to is
+            strictly weaker than a table-scoped one that always has a row;
+            keeping both would be two paths to one action with nothing
+            distinguishing them (point 7's own framing). The floor's own row
+            still carries the read-only "floor" pill above, gated on
+            pinningEnabled the same as this button, so the panel still says
+            which revision is held even though clearing it happens
+            elsewhere.
+          */}
+          {pinningEnabled && !isFloor && (
+            <button
+              // The admin is looking at the revision she just approved, so the
+              // action reads it straight off the row rather than asking her to
+              // type a number (a free-text field is a way to typo a control on
+              // a governance surface).
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `Require revision #${r.revision} or newer for this artifact? Machines pinned below #${r.revision} will receive #${r.revision} on their next sync.`,
+                  )
+                ) {
+                  floor.mutate({ id: artifact.id, minRevision: r.revision, rowVersion: artifact.rowVersion });
+                }
+              }}
+              disabled={floor.isPending}
+              className="rounded-md border border-border-strong px-2.5 py-1 text-xs font-semibold text-muted hover:border-accent hover:bg-accent-weak hover:text-accent-ink disabled:opacity-50"
+            >
+              Require this or newer
+            </button>
+          )}
+        </div>
       </div>
       {open && canView && (
         <div id={panelId} className="mt-3">
@@ -425,9 +543,28 @@ function RevisionItem({
   );
 }
 
-function RevisionHistory({ id, onClose }: { id: string; onClose: () => void }) {
-  const revs = useArtifactRevisions(id);
+function RevisionHistory({
+  artifact,
+  onClose,
+  onReload,
+  pinningEnabled,
+}: {
+  artifact: AdminArtifact;
+  onClose: () => void;
+  // Refetches the artifacts list that `artifact` itself is drawn from
+  // (ArtifactsPage's `historyArtifact`). Only used on a 412 from `floor`:
+  // its own success already invalidates ["admin", "artifacts"], so the
+  // fresh rowVersion the next attempt needs arrives on the next render for
+  // free; a stale write needs the manual nudge, same as ReviewQueuePage's
+  // ReviewCard onReload.
+  onReload: () => void;
+  // Threaded down to every RevisionItem; see that component's own comment.
+  pinningEnabled: boolean;
+}) {
+  const revs = useArtifactRevisions(artifact.id);
   const rollback = useRollbackArtifact();
+  const floor = useSetArtifactMinRevision();
+  const floorConflict = isConflict(floor.error);
   const revisions = revs.rows;
   return (
     <div className="mt-4 max-w-2xl overflow-hidden rounded-xl border border-border bg-surface shadow-sm">
@@ -439,6 +576,18 @@ function RevisionHistory({ id, onClose }: { id: string; onClose: () => void }) {
         <button onClick={onClose} className="text-xs text-faint hover:text-text">Close</button>
       </div>
       {rollback.error && <p className="px-4 pt-3 text-sm text-danger">{errMsg(rollback.error)}</p>}
+      {floorConflict ? (
+        <div className="px-4 pt-3">
+          <ConflictNotice
+            onReload={() => {
+              floor.reset();
+              onReload();
+            }}
+          />
+        </div>
+      ) : (
+        floor.error && <p className="px-4 pt-3 text-sm text-danger">{errMsg(floor.error)}</p>
+      )}
       {revisions.length === 0 && revs.isPending && <p className="px-4 py-3 text-sm text-faint">Loading…</p>}
       {revisions.length === 0 && revs.isError && (
         <p className="px-4 py-3 text-sm text-danger">Failed to load revisions: {errMsg(revs.error)}</p>
@@ -454,8 +603,10 @@ function RevisionHistory({ id, onClose }: { id: string; onClose: () => void }) {
             prev={revisions.find((x) => x.revision === r.revision - 1)}
             prevPruned={isPruned(r.revision - 1, revisions, revs.hasNextPage)}
             restoredFromPruned={r.restoredFrom != null && isPruned(r.restoredFrom, revisions, revs.hasNextPage)}
-            id={id}
+            artifact={artifact}
             rollback={rollback}
+            floor={floor}
+            pinningEnabled={pinningEnabled}
           />
         ))}
       </ul>
@@ -488,16 +639,135 @@ function RevisionHistory({ id, onClose }: { id: string; onClose: () => void }) {
   );
 }
 
+/**
+ * The value a table cell's field is still being DISTRIBUTED under, when that
+ * differs from the live value rendered above it. Renders nothing when there is
+ * no gap, which is every row in a Community build and every unedited row in an
+ * Enterprise one.
+ */
+function DistributedAs({ value }: { value: string | undefined }) {
+  if (value === undefined) {
+    return null;
+  }
+  return (
+    <span role="note" className="mt-1 block text-xs font-normal text-warn">
+      distributing as {value}
+    </span>
+  );
+}
+
+const findingSevCls: Record<ScanFinding["severity"], string> = {
+  info: "text-muted bg-surface-2",
+  warn: "text-warn bg-warn-weak",
+  block: "text-danger bg-danger-weak",
+};
+
+/**
+ * The author's own action on a pending submission the scanner had something
+ * to say about (docs/plans/orbeat-scan-acknowledgment-2026-08-27.md). The
+ * click gates APPROVAL, not submission -- the scanner runs inside the submit
+ * transaction, so at the moment of submitting the findings do not exist yet
+ * and there is nothing to acknowledge.
+ *
+ * Renders nothing unless ALL of: the artifact carries findings
+ * (`scanFindingsDigest`, never recomputed client-side -- see
+ * `AdminArtifact.findingsAcknowledged`'s own doc comment), it is still
+ * pending, the viewer is the artifact's own submitter (POST
+ * .../acknowledge-findings is submitter-only server-side, a 403 for anyone
+ * else), and nobody has acknowledged the CURRENT digest yet.
+ */
+function FindingsAckPrompt({
+  a,
+  ack,
+  subject,
+}: {
+  a: AdminArtifact;
+  ack: ReturnType<typeof useAcknowledgeFindings>;
+  subject: string;
+}) {
+  const digest = a.scanFindingsDigest;
+  if (!digest || a.approvalState !== "pending" || a.submittedBy !== subject || a.findingsAcknowledged) {
+    return null;
+  }
+  return (
+    <div role="note" className="mt-1.5 max-w-sm rounded-md border border-warn bg-warn-weak px-2.5 py-2 text-xs text-text">
+      <p className="font-medium">The scanner flagged this submission:</p>
+      <ul className="mt-1 space-y-1">
+        {(a.scanFindings ?? []).map((f, i) => (
+          <li key={i} className={`flex flex-wrap items-center gap-1.5 rounded px-1.5 py-1 ${findingSevCls[f.severity]}`}>
+            <span className="font-semibold uppercase">{f.severity}</span>
+            <span className="font-mono">{f.rule}</span>
+            <span>{f.message}</span>
+          </li>
+        ))}
+      </ul>
+      <button
+        type="button"
+        onClick={() => ack.mutate({ id: a.id, digest })}
+        disabled={ack.isPending}
+        aria-label={`Acknowledge findings for ${a.name}`}
+        className="mt-1.5 rounded-md border border-border-strong px-2 py-1 text-xs font-semibold text-muted hover:border-accent hover:bg-accent-weak hover:text-accent-ink disabled:opacity-50"
+      >
+        Acknowledge findings
+      </button>
+    </div>
+  );
+}
+
 export default function ArtifactsPage() {
-  const artifactsQuery = useAdminArtifacts();
+  // order/q both reset paging to page one on ANY change (queries.ts's
+  // useAdminList folds them into the query key), which is the load-bearing
+  // part of Task 5: the API binds a cursor to the sort/direction it was minted under
+  // and 400s a replay under a different one. The sortable column is Type
+  // (artifactSortName = "type"), NOT Name -- the list's own second sort key
+  // -- but ?q= searches name regardless (internal/api/admin_artifacts.go's
+  // own comment on handleListArtifacts explains why the two deliberately
+  // differ here, unlike every other searchable list).
+  const [order, setOrder] = useState<"asc" | "desc">("asc");
+  // `q` is the box's instant display value; the query itself is driven by
+  // the debounced value below (B35: this used to fire one request per
+  // keystroke — ListSearchBox's onChange fed the query key directly).
+  const [q, setQ] = useState("");
+  const debouncedQ = useDebouncedValue(q, SEARCH_DEBOUNCE_MS);
+  const artifactsQuery = useAdminArtifacts({ order, q: debouncedQ });
   const { rows: artifacts } = artifactsQuery;
   const create = useCreateArtifact();
   const update = useUpdateArtifact();
   const del = useDeleteArtifact();
   const submit = useSubmitArtifact();
   const withdraw = useWithdrawArtifact();
+  // The author's own acknowledgment of scan findings on a pending submission
+  // (docs/plans/orbeat-scan-acknowledgment-2026-08-27.md). One shared
+  // instance for every row's FindingsAckPrompt, the same convention `submit`
+  // and `withdraw` above already use.
+  const ack = useAcknowledgeFindings();
+  // A digest mismatch (the artifact was re-scanned since this row was
+  // loaded) comes back as a 412, exactly like a stale row_version -- both
+  // mean "reload to see the current state", so this reuses isConflict/
+  // ConflictNotice rather than a second bespoke notice.
+  const ackConflict = isConflict(ack.error);
+  const { subject } = useAuth();
+  // open-points.md point 6: the portal's only edition signal. Fail-closed
+  // while GET /v1/me is loading or has errored; see
+  // useArtifactPinningEnabled's own comment for why that direction and not
+  // the other.
+  const pinningEnabled = useArtifactPinningEnabled();
+  // The table row's own floor-clear control (point 7). A SEPARATE
+  // useSetArtifactMinRevision instance from RevisionHistory's `floor`: the
+  // two render in different places (this one needs no revision panel open
+  // at all) and each needs its own isPending/error, the same reason every
+  // other mutation on this page (create, update, del, submit, withdraw) is
+  // its own hook call rather than a shared one threaded everywhere.
+  const tableFloor = useSetArtifactMinRevision();
+  const tableFloorConflict = isConflict(tableFloor.error);
   const [mode, setMode] = useState<"closed" | "create" | AdminArtifact>("closed");
   const [historyFor, setHistoryFor] = useState<string | null>(null);
+  // The panel needs the artifact, not just its id: the rollback confirmation
+  // has to name the identity being distributed today to say what a rollback
+  // moves. Looked up in the list on every render rather than captured in
+  // state at click time, so a rollback (which invalidates ["admin",
+  // "artifacts"]) refreshes what the NEXT confirmation claims.
+  const historyArtifact = artifacts.find((a) => a.id === historyFor);
 
   // Reset the mutation when (re)opening a form so a prior failed submit's error
   // never bleeds into a freshly opened form.
@@ -516,7 +786,7 @@ export default function ArtifactsPage() {
         <thead className="bg-inset">
           <tr>
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">Name</th>
-            <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">Type</th>
+            <SortableTh label="Type" order={order} onToggle={() => setOrder(order === "asc" ? "desc" : "asc")} />
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">State</th>
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">Visibility</th>
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">
@@ -528,17 +798,72 @@ export default function ArtifactsPage() {
           {artifacts.map((a, i) => {
             const last = i === artifacts.length - 1;
             const cellCls = `p-3 ${last ? "" : "border-b border-border"}`;
+            // Per-cell rather than one marker on the row: a single note in the
+            // Name column would silently omit a type or visibility change, and
+            // those move the file and switch the channel just as a rename
+            // does. Each marker sits under the value it contradicts.
+            const gap = pendingIdentity(a);
+            const distributedAs = (f: IdentityField) => gap.find((c) => c.field === f)?.from;
             return (
               <tr key={a.id} className={`hover:bg-inset ${historyFor === a.id ? "bg-accent-weak" : ""}`}>
-                <td className={`${cellCls} font-medium text-text`}>{a.name}</td>
+                <td className={`${cellCls} font-medium text-text`}>
+                  {a.name}
+                  <DistributedAs value={distributedAs("name")} />
+                </td>
                 <td className={cellCls}>
                   <Chip variant={a.type}>{a.type}</Chip>
+                  <DistributedAs value={distributedAs("type")} />
                 </td>
                 <td className={cellCls}>
                   <StateBadge state={a.approvalState} />
+                  {/* Visible without opening Version history: the admin
+                      override on every client-side pin is otherwise invisible
+                      from the main table. 0 means no floor and renders
+                      nothing, same convention as the "current floor" marker
+                      on the matching RevisionItem row.
+
+                      Gated on pinningEnabled, same as the panel's own floor
+                      UI: a Community server can never have set minRevision >
+                      0 in practice (the route that sets it is not registered
+                      there), but hiding the whole block rather than leaving a
+                      read-only number with no way to act on it keeps a
+                      downgraded/stale edition from showing a trace of a
+                      feature this console cannot manage.
+
+                      Clearing reads artifact.minRevision directly off this
+                      row, which is exactly why capo chose the table row over
+                      the revision panel for the clear control (open-points.md
+                      point 7): it is correct even when
+                      ORBEAT_ARTIFACT_REVISION_KEEP has pruned the floor's own
+                      revision out of the panel's list, where the OLD
+                      "Remove the floor" button had no row left to render on. */}
+                  {pinningEnabled && a.minRevision > 0 && (
+                    <span className="mt-1 flex items-center gap-1.5">
+                      <Pill variant="blue">floor #{a.minRevision}</Pill>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Clear the minimum-revision floor on ${a.name}? Machines pinned below the current revision are no longer held once they next sync.`,
+                            )
+                          ) {
+                            tableFloor.mutate({ id: a.id, minRevision: 0, rowVersion: a.rowVersion });
+                          }
+                        }}
+                        aria-label={`Clear floor for ${a.name}`}
+                        disabled={tableFloor.isPending}
+                        className="text-xs font-medium text-muted hover:text-danger disabled:opacity-50"
+                      >
+                        Clear
+                      </button>
+                    </span>
+                  )}
+                  <FindingsAckPrompt a={a} ack={ack} subject={subject} />
                 </td>
                 <td className={cellCls}>
                   <Chip>{a.visibility}</Chip>
+                  <DistributedAs value={distributedAs("visibility")} />
                 </td>
                 <td className={`${cellCls} text-right`}>
                   <div className="inline-flex items-center gap-3">
@@ -586,9 +911,12 @@ export default function ArtifactsPage() {
           <p className="text-xs font-semibold uppercase tracking-wide text-faint">Governed catalog</p>
           <h1 className="mt-1 text-2xl font-semibold text-text">Artifacts</h1>
         </div>
-        <Button variant="primary" onClick={openCreate}>
-          New artifact
-        </Button>
+        <div className="flex items-center gap-3">
+          <ListSearchBox value={q} onChange={setQ} label="Search artifacts" />
+          <Button variant="primary" onClick={openCreate}>
+            New artifact
+          </Button>
+        </div>
       </div>
 
       {(submit.error || withdraw.error) && (
@@ -596,6 +924,34 @@ export default function ArtifactsPage() {
       )}
       {del.error && (
         <p className="mt-2 text-sm text-danger">Delete failed: {errMsg(del.error)}</p>
+      )}
+      {tableFloorConflict ? (
+        <div className="mt-2">
+          <ConflictNotice
+            onReload={() => {
+              tableFloor.reset();
+              void artifactsQuery.refetch();
+            }}
+          />
+        </div>
+      ) : (
+        tableFloor.error && (
+          <p className="mt-2 text-sm text-danger">Floor change failed: {errMsg(tableFloor.error)}</p>
+        )
+      )}
+      {ackConflict ? (
+        <div className="mt-2">
+          <ConflictNotice
+            onReload={() => {
+              ack.reset();
+              void artifactsQuery.refetch();
+            }}
+          />
+        </div>
+      ) : (
+        ack.error && (
+          <p className="mt-2 text-sm text-danger">Acknowledge failed: {errMsg(ack.error)}</p>
+        )
       )}
 
       {artifacts.length === 0 ? (
@@ -662,7 +1018,15 @@ export default function ArtifactsPage() {
         />
       )}
 
-      {historyFor && <RevisionHistory key={historyFor} id={historyFor} onClose={() => setHistoryFor(null)} />}
+      {historyArtifact && (
+        <RevisionHistory
+          key={historyArtifact.id}
+          artifact={historyArtifact}
+          onClose={() => setHistoryFor(null)}
+          onReload={() => void artifactsQuery.refetch()}
+          pinningEnabled={pinningEnabled}
+        />
+      )}
     </div>
   );
 }

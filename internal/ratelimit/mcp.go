@@ -56,7 +56,13 @@ const codeRateLimited int64 = -32029
 // MCP middlewares configured for different methods, and tools/list is in
 // neither's method set).
 //
-// l may be nil (limiting disabled), mirroring the HTTP adapter's nil-safe
+// l may be nil (limiting disabled). This used to say it mirrors "the HTTP
+// adapter's nil-safe Limiter" (audit C7); the HTTP adapter is NOT nil-safe,
+// and internal/api/api.go says so outright, guarding the call itself. Deleting
+// that guard on the strength of the old sentence nil-panics every request on
+// any deployment that never calls SetRateLimiter. This adapter is nil-safe
+// on its own terms, which is the only claim being made here. Formerly worded
+// as mirroring the HTTP adapter's
 // Limiter: a Server that never configures a limiter — including every
 // existing test that constructs one directly — behaves exactly as before
 // this slice.
@@ -72,11 +78,12 @@ const codeRateLimited int64 = -32029
 // why this is pinned by a test (internal/gateway/ratelimit_test.go), not a
 // comment.
 // obs (Task 7, spec §9) reports every rejection to the ratelimit.rejected
-// counter and, at most once per key per streak, a sampled log breadcrumb.
-// reason is method itself: tools/call and initialize are metered on
-// separate limiters (spec §4.3), so the method name is exactly "which budget
-// was exceeded". Its zero value is safe, so callers that do not care about
-// this telemetry (most direct-construction tests) can pass Observability{}.
+// counter and, at most once per key per logSampleInterval, a sampled log
+// breadcrumb. reason is method itself: tools/call and initialize are metered
+// on separate limiters (spec §4.3), so the method name is exactly "which
+// budget was exceeded". Its zero value is safe, so callers that do not care
+// about this telemetry (most direct-construction tests) can pass
+// Observability{}.
 func MCP(l *Limiter, method string, keyFn KeyFunc, obs Observability) mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, m string, req mcp.Request) (mcp.Result, error) {
@@ -159,9 +166,9 @@ func MCPConcurrency(c *ConcurrencyLimiter, method string, keyFn KeyFunc, obs Obs
 			if !ok {
 				return next(ctx, m, req)
 			}
-			release, admitted := c.Acquire(key)
+			release, admitted, logRejection := c.AcquireSampled(key)
 			if !admitted {
-				reportRejected(ctx, obs, "gateway", method+" concurrency", key, true)
+				reportRejected(ctx, obs, "gateway", method+" concurrency", key, logRejection)
 				return nil, concurrencyLimitedError(c.Max(), c.InFlight(key))
 			}
 			defer release()

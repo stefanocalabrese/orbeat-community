@@ -15,6 +15,7 @@ import RolesPage from "./pages/admin/RolesPage";
 import EntitlementsPage from "./pages/admin/EntitlementsPage";
 import ArtifactEntitlementsPage from "./pages/admin/ArtifactEntitlementsPage";
 import AuditPage from "./pages/admin/AuditPage";
+import VirtualKeysPage from "./pages/admin/VirtualKeysPage";
 
 export default function App() {
   return (
@@ -49,6 +50,7 @@ export default function App() {
             <Route path="/admin/artifact-entitlements" element={<ArtifactEntitlementsPage />} />
             <Route path="/admin/roles" element={<RolesPage />} />
             <Route path="/admin/entitlements" element={<EntitlementsPage />} />
+            <Route path="/admin/virtual-keys" element={<VirtualKeysPage />} />
             <Route path="/admin/audit" element={<AuditPage />} />
           </Route>
         </Route>

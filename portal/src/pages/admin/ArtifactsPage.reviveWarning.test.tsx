@@ -112,6 +112,27 @@ test("switching an org artifact back to role warns how many grants revive, and f
   expect(warning.textContent).toContain("platform, security");
 });
 
+test("the warning ties the revival to distribution, not to the save", async () => {
+  const user = userEvent.setup();
+  renderPage(fullArtifact({ roleGrants: { count: 2, roles: ["platform", "security"], truncated: false } }));
+
+  await user.selectOptions(await openEditForm(user), "role");
+
+  // Migration 00016 snapshots visibility at approval, so in Enterprise a flip
+  // back to `role` revives nothing until a second admin approves it:
+  // ListEntitledArtifacts filters on approved_visibility. The old copy said
+  // the grants "take effect again immediately", which was true when the
+  // column the distribution query reads was the one this form writes.
+  //
+  // The replacement has to hold in BOTH editions without the portal knowing
+  // which it is talking to, and it does: in Community the update and its
+  // auto-approval commit in the same transaction, so distribution is reached
+  // at once and the sentence stays true.
+  const warning = await screen.findByRole("status");
+  expect(warning.textContent).toContain("take effect again when this change reaches distribution");
+  expect(warning.textContent).not.toContain("immediately");
+});
+
 test("the revived count is the server's, not the length of the role list it sent", async () => {
   const user = userEvent.setup();
   // A truncated response: 60 grants exist, 2 names are shown. A component

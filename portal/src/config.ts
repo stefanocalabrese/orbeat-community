@@ -23,6 +23,18 @@ const fallback: AppConfig = {
 // time (never captured at module-eval time — see AuthProvider).
 export const config: AppConfig = { ...fallback };
 
+// B16: loadConfig() degrading to the fallback used to be UNOBSERVABLE — every
+// failure mode (network error, non-JSON body, non-2xx status) landed in the
+// same silent catch, so an operator who forgot ORBEAT_PORTAL_API_BASE (or a
+// proxy returning HTML for /config.json) got an admin console silently
+// pointed at http://localhost:8080 with no signal anywhere. This flag is that
+// signal: ConfigWarningBanner reads it to show a persistent, operator-facing
+// warning in the BUILT app (never in `npm run dev`, where /config.json 404ing
+// is expected and NOT an operator error — see that component's own comment).
+// A `let`, not a `const`, because a later successful loadConfig() call must
+// be able to clear a prior failure.
+export let configLoadFailed = false;
+
 const KEYS: (keyof AppConfig)[] = [
   "apiBase",
   "gatewayUrl",
@@ -42,13 +54,21 @@ export async function loadConfig(): Promise<void> {
     // through the catch below and the app boots on the fallback. Mirrors the
     // 30s ceiling apiFetch puts on every other request.
     const res = await fetch("/config.json", { cache: "no-store", signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return;
+    if (!res.ok) {
+      configLoadFailed = true;
+      return;
+    }
     const data = (await res.json()) as Partial<Record<keyof AppConfig, unknown>>;
     for (const k of KEYS) {
       const v = data[k];
       if (typeof v === "string" && v !== "") config[k] = v;
     }
+    // A prior call's failure (e.g. a retry, or a future re-invocation) is
+    // cleared only on an actual success — never optimistically.
+    configLoadFailed = false;
   } catch {
-    // keep fallback
+    // keep fallback, but the failure must not be silent — see
+    // configLoadFailed's own comment.
+    configLoadFailed = true;
   }
 }

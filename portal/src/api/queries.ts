@@ -1,4 +1,5 @@
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useToast } from "../components/ui/toastContext";
 import { useAuth } from "../auth/useAuth";
 import { apiFetch } from "./client";
 import type {
@@ -10,12 +11,32 @@ import type {
   AuditPage,
   CatalogServer,
   Entitlement,
+  Me,
   Page,
   PublishStatus,
   Role,
   RoleDeleteResult,
   ServerInput,
+  ServerUpdateInput,
+  VirtualKey,
+  VirtualKeyInput,
 } from "./types";
+
+/**
+ * ?order and ?q for an admin list (docs/plans/orbeat-admin-search-sort-
+ * 2026-08-27.md Tasks 3-4). No ?sort field: every list allows exactly one
+ * sort column today (internal/api/paging.go's allowlist), already that
+ * list's existing default, so the only axis a client actually controls is
+ * direction. q is split into its own type, ListSearchParams, rather than
+ * living on every list's params: entitlements and artifact-entitlements
+ * REFUSE ?q= with 400 the instant the parameter is PRESENT at all
+ * (internal/api/paging.go's refuseSearch keys on Query().Has("q"), not on
+ * the value), so their hooks (useEntitlements/useArtifactEntitlements) take
+ * ListOrderParams, which has no q field: a caller for those two lists has
+ * no way to pass one, not merely a convention not to.
+ */
+export type ListOrderParams = { order?: "asc" | "desc" };
+export type ListSearchParams = ListOrderParams & { q?: string };
 
 /**
  * Cursor-paginated admin list: fetches page 1, exposes `rows` as the flat
@@ -46,34 +67,130 @@ import type {
  * from the FIRST page's own envelope (rather than left as a parsed-but-unused
  * field) so callers can render an accurate "first N" disclosure without a
  * second hardcoded copy of that number that could drift from the server's.
+ *
+ * `params` (order/q, docs/plans/orbeat-admin-search-sort-2026-08-27.md Task
+ * 5) is folded into `queryKey`, not only into the request URL. THIS is what
+ * drops an outstanding cursor on a sort or search change, which the plan
+ * calls the load-bearing part of this feature. A distinct (order, q) pair is
+ * a distinct queryKey, so react-query starts that key fresh at
+ * `initialPageParam` ("") instead of resuming the PREVIOUS key's accumulated
+ * pages and their cursor. The API binds a cursor to the sort/direction it
+ * was minted under and 400s on a mismatch (8935bb9, 8e0636c). Folding
+ * params into the URL but leaving them OUT of the queryKey is the mutant
+ * this slice's own test (queries.sortsearch.test.tsx) proves against: the
+ * list would still render correctly on first render, but changing order or
+ * q would leave the OLD key's cached pages in place, and the next "Load
+ * more" would replay a cursor minted under the old sort against the new
+ * one's URL, the exact 400 this whole slice exists to prevent.
  */
 function useAdminList<K extends string, Row>(
   queryKey: readonly unknown[],
   path: string,
   rowsKey: K,
   enabled = true,
+  params: ListSearchParams = {},
 ) {
   const { token } = useAuth();
+  const extra = new URLSearchParams();
+  if (params.order === "desc") extra.set("order", "desc");
+  if (params.q) extra.set("q", params.q);
+  const extraQS = extra.toString();
+  const basePath = extraQS ? `${path}${path.includes("?") ? "&" : "?"}${extraQS}` : path;
   const query = useInfiniteQuery({
-    queryKey,
+    queryKey: [...queryKey, params.order ?? "asc", params.q ?? ""],
     queryFn: ({ pageParam, signal }) =>
       apiFetch<Page<K, Row>>(
-        // `path` may already carry its own query string (e.g. the review
-        // queue's `?state=pending&include=content`), so the cursor param
-        // must join with `&` in that case rather than a second `?`.
+        // `basePath` may already carry its own query string (e.g. the review
+        // queue's `?state=pending&include=content`, or order/q above), so the
+        // cursor param must join with `&` in that case rather than a second
+        // `?`.
         pageParam
-          ? `${path}${path.includes("?") ? "&" : "?"}cursor=${encodeURIComponent(pageParam)}`
-          : path,
+          ? `${basePath}${basePath.includes("?") ? "&" : "?"}cursor=${encodeURIComponent(pageParam)}`
+          : basePath,
         token,
         { signal },
       ),
     initialPageParam: "",
     getNextPageParam: (last) => last.nextCursor || undefined,
     enabled,
+    // B35: without this, changing order/q (both folded into queryKey above)
+    // makes `query.data` briefly go back to undefined while the new key's
+    // first page is in flight — `rows` collapses to `[]` for that window.
+    // ArtifactsPage derives its Version-history panel's target artifact by
+    // looking it up in `rows` (`artifacts.find(a => a.id === historyFor)`),
+    // so that collapse silently unmounted an open panel on every sort or
+    // search change, even when the artifact it was showing is still in the
+    // page that is about to arrive. keepPreviousData keeps the PRIOR key's
+    // rows on screen until the new key's data actually lands, so a page
+    // that still contains the same row never has a reason to unmount
+    // anything depending on it.
+    placeholderData: keepPreviousData,
   });
   const rows = query.data?.pages.flatMap((p) => p[rowsKey]) ?? [];
   const limit = query.data?.pages[0]?.limit;
   return { ...query, rows, limit };
+}
+
+/** GET /v1/me: the caller's identity plus edition-dependent `features`. */
+export function useMe() {
+  const { token } = useAuth();
+  return useQuery({
+    queryKey: ["me"],
+    queryFn: ({ signal }) => apiFetch<Me>("/v1/me", token, { signal }),
+  });
+}
+
+/**
+ * Whether the artifact minimum-revision floor controls (the table row's
+ * clear affordance and the revision panel's "Require this or newer") should
+ * render at all.
+ *
+ * Fail-closed by construction: `=== true` is the only path to a true
+ * result, so a still-loading query, a failed one, and an explicit `false`
+ * all resolve to hidden. That is a deliberate choice between two loading
+ * states, not an accident of how the boolean happens to read. The
+ * alternative, showing the controls optimistically and removing them once
+ * Community is confirmed, flashes a paid control into a Community admin's
+ * screen, momentarily clickable, on every page load. Hiding a control an
+ * Enterprise admin is entitled to for the same brief window is the smaller
+ * failure, and it is the SAME shape every other loading state on this page
+ * already uses (e.g. ArtifactEditForm's "Loading artifact…", QueryGate's
+ * default of rendering nothing until data arrives) rather than a new pattern
+ * introduced just for this control.
+ *
+ * `features?.pinning` (not `features.pinning`): the same forward-compat
+ * degradation GET /v1/sync/config's own `pinning` field documents applies
+ * here too. A server predating this field returns a body with no
+ * `features` key at all, decodes as `undefined`, and must resolve to
+ * hidden rather than throw.
+ */
+export function useArtifactPinningEnabled(): boolean {
+  return useMe().data?.features?.pinning === true;
+}
+
+/**
+ * Whether VirtualKeysPage should render at all.
+ *
+ * `useArtifactPinningEnabled` above answers the same question for a
+ * HANDFUL OF CONTROLS inside an existing page, its still-loading and
+ * explicit-`false` cases both collapse to hidden, and this hook collapses
+ * them the same way, for the same fail-closed reason (see that hook's own
+ * comment). What differs here is the blast radius of getting it wrong: the
+ * whole console page a Community admin would otherwise briefly see is one
+ * whose every action, list, create, revoke, hits a route
+ * (POST/GET/DELETE /v1/admin/virtual-keys) that does not exist on that
+ * server at all, not a handful of buttons on an otherwise-working page.
+ * `=== true` is still the only path to a true result, so a still-loading
+ * `useMe()` query, a failed one, and an explicit `false` all resolve to
+ * "render nothing".
+ *
+ * `features?.virtualKeys` (not `features.virtualKeys`): the same
+ * forward-compat degradation `features?.pinning` documents applies here.
+ * A server predating this field returns a body with no `features` key at
+ * all, decodes as `undefined`, and must resolve to hidden rather than throw.
+ */
+export function useVirtualKeysEnabled(): boolean {
+  return useMe().data?.features?.virtualKeys === true;
 }
 
 export function useCatalog() {
@@ -85,32 +202,51 @@ export function useCatalog() {
   });
 }
 
-export function useAdminServers() {
-  return useAdminList<"servers", AdminServer>(["admin", "servers"], "/v1/admin/servers", "servers");
+export function useAdminServers(params: ListSearchParams = {}) {
+  return useAdminList<"servers", AdminServer>(["admin", "servers"], "/v1/admin/servers", "servers", true, params);
 }
 
-export function useRoles() {
-  return useAdminList<"roles", Role>(["admin", "roles"], "/v1/admin/roles", "roles");
+export function useRoles(params: ListSearchParams = {}) {
+  return useAdminList<"roles", Role>(["admin", "roles"], "/v1/admin/roles", "roles", true, params);
 }
 
-export function useEntitlements() {
+/**
+ * order-only (ListOrderParams, not ListSearchParams): entitlements REFUSE
+ * ?q= with 400 (see ListOrderParams's own comment above), so this hook's
+ * params type has no q field for a caller to pass in the first place.
+ */
+export function useEntitlements(params: ListOrderParams = {}) {
   return useAdminList<"entitlements", Entitlement>(
     ["admin", "entitlements"],
     "/v1/admin/entitlements",
     "entitlements",
+    true,
+    params,
   );
 }
 
-export function useAuditPage(cursor: string) {
+/**
+ * AuditFilters narrows the audit list server-side. An empty string means "no
+ * narrowing", matching the API, where an absent and an empty parameter are the
+ * same thing.
+ */
+export type AuditFilters = { actor: string; action: string; decision: string };
+
+export const emptyAuditFilters: AuditFilters = { actor: "", action: "", decision: "" };
+
+export function useAuditPage(cursor: string, filters: AuditFilters = emptyAuditFilters) {
   const { token } = useAuth();
+  const params = new URLSearchParams({ limit: "50" });
+  if (cursor) params.set("cursor", cursor);
+  // Ordered actor, action, decision so the query string is stable for a given
+  // filter set: the queryKey below is what react-query caches on, and a URL
+  // that varied by insertion order would fetch the same page twice.
+  if (filters.actor) params.set("actor", filters.actor);
+  if (filters.action) params.set("action", filters.action);
+  if (filters.decision) params.set("decision", filters.decision);
   return useQuery({
-    queryKey: ["admin", "audit", cursor],
-    queryFn: ({ signal }) =>
-      apiFetch<AuditPage>(
-        `/v1/admin/audit?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
-        token,
-        { signal },
-      ),
+    queryKey: ["admin", "audit", cursor, filters.actor, filters.action, filters.decision],
+    queryFn: ({ signal }) => apiFetch<AuditPage>(`/v1/admin/audit?${params.toString()}`, token, { signal }),
   });
 }
 
@@ -122,13 +258,28 @@ export function useAuditPage(cursor: string) {
 function useInvalidating<TArgs, TResult = unknown>(
   fn: (token: string, a: TArgs) => Promise<TResult>,
   keys: string[][],
+  /**
+   * What to tell the user when this mutation succeeds. Required rather than
+   * defaulted to something like "Saved": a uniform message on twenty different
+   * actions is noise a user learns to ignore, and the point of the toast is
+   * that the thing they just did is the thing that happened.
+   *
+   * FAILURE is deliberately not toasted here. Every admin page already renders
+   * its own inline error, several of them with an action attached (a 412 tells
+   * you to reload, a 402 opens the cap dialog), and a message that
+   * auto-dismisses is the wrong place for something you have to act on.
+   */
+  successMessage: string,
 ) {
   const { token } = useAuth();
   const qc = useQueryClient();
+  const { push } = useToast();
   return useMutation({
     mutationFn: (a: TArgs) => fn(token, a),
-    onSuccess: () =>
-      keys.forEach((k) => void qc.invalidateQueries({ queryKey: k })),
+    onSuccess: () => {
+      keys.forEach((k) => void qc.invalidateQueries({ queryKey: k }));
+      push(successMessage);
+    },
   });
 }
 
@@ -137,6 +288,7 @@ export const useCreateServer = () =>
     (t, input: ServerInput) =>
       apiFetch("/v1/admin/servers", t, { method: "POST", body: input }),
     [["admin", "servers"], ["catalog"]],
+    "MCP server created.",
   );
 
 export const useUpdateServer = () =>
@@ -145,13 +297,42 @@ export const useUpdateServer = () =>
     // its form from that row, and the list carries a real, non-zero version —
     // see AdminServer.rowVersion). Quoted to match the server's strong ETag;
     // an unquoted If-Match is a 400.
-    (t, a: { id: string; input: ServerInput; rowVersion: number }) =>
+    //
+    // input is ServerUpdateInput, not ServerInput (defect 1, 2026-09-01,
+    // BREAKING): secretRef/tlsCaRef are `?: string` there, so ServersPage's
+    // toServerUpdateInput can leave one `undefined` to omit it from the PUT
+    // body entirely — see that type's own doc comment for the wire contract.
+    (t, a: { id: string; input: ServerUpdateInput; rowVersion: number }) =>
       apiFetch(`/v1/admin/servers/${a.id}`, t, {
         method: "PUT",
         body: a.input,
         ifMatch: `"${a.rowVersion}"`,
       }),
     [["admin", "servers"], ["catalog"]],
+    "MCP server updated.",
+  );
+
+/**
+ * Editing a grant's allowed tools, which before this needed delete-and-recreate.
+ *
+ * rowVersion comes from the list row being edited, like useUpdateServer: the
+ * entitlement list carries a real, non-zero version. Quoted to match the
+ * server's strong ETag; an unquoted If-Match is a 400.
+ *
+ * roleId and mcpServerId are deliberately NOT sent. The server ignores them,
+ * and sending them would suggest to the next reader that a grant can be
+ * repointed by an edit, which is precisely what the API refuses to do.
+ */
+export const useUpdateEntitlement = () =>
+  useInvalidating(
+    (t, a: { id: string; allowedTools: string[] | null; permissions: string[]; rowVersion: number }) =>
+      apiFetch(`/v1/admin/entitlements/${a.id}`, t, {
+        method: "PUT",
+        body: { allowedTools: a.allowedTools, permissions: a.permissions },
+        ifMatch: `"${a.rowVersion}"`,
+      }),
+    [["admin", "entitlements"], ["catalog"]],
+    "Allowed tools updated.",
   );
 
 export const useDeleteServer = () =>
@@ -159,6 +340,7 @@ export const useDeleteServer = () =>
     (t, id: string) =>
       apiFetch(`/v1/admin/servers/${id}`, t, { method: "DELETE" }),
     [["admin", "servers"], ["catalog"]],
+    "MCP server deleted.",
   );
 
 /**
@@ -173,10 +355,17 @@ export const useDeleteRole = () =>
     (t, id: string) =>
       apiFetch<RoleDeleteResult>(`/v1/admin/roles/${id}`, t, { method: "DELETE" }),
     [["admin", "roles"], ["admin", "entitlements"], ["admin", "artifactEntitlements"]],
+    "Role deleted.",
   );
 
-export function useAdminArtifacts() {
-  return useAdminList<"artifacts", AdminArtifact>(["admin", "artifacts"], "/v1/admin/artifacts", "artifacts");
+export function useAdminArtifacts(params: ListSearchParams = {}) {
+  return useAdminList<"artifacts", AdminArtifact>(
+    ["admin", "artifacts"],
+    "/v1/admin/artifacts",
+    "artifacts",
+    true,
+    params,
+  );
 }
 
 /**
@@ -226,6 +415,7 @@ export const useCreateArtifact = () =>
     (t, input: ArtifactInput) =>
       apiFetch("/v1/admin/artifacts", t, { method: "POST", body: input }),
     [["admin", "artifacts"], ["catalog"]],
+    "Artifact created.",
   );
 
 export const useUpdateArtifact = () =>
@@ -243,6 +433,7 @@ export const useUpdateArtifact = () =>
         ifMatch: `"${a.rowVersion}"`,
       }),
     [["admin", "artifacts"], ["catalog"]],
+    "Artifact updated.",
   );
 
 export const useDeleteArtifact = () =>
@@ -250,6 +441,7 @@ export const useDeleteArtifact = () =>
     (t, id: string) =>
       apiFetch(`/v1/admin/artifacts/${id}`, t, { method: "DELETE" }),
     [["admin", "artifacts"], ["catalog"]],
+    "Artifact deleted.",
   );
 
 export function useReviewQueue() {
@@ -284,6 +476,7 @@ export const useSubmitArtifact = () =>
     (t, id: string) =>
       apiFetch(`/v1/admin/artifacts/${id}/submit`, t, { method: "POST" }),
     reviewKeys,
+    "Submitted for review.",
   );
 
 export const useWithdrawArtifact = () =>
@@ -291,6 +484,7 @@ export const useWithdrawArtifact = () =>
     (t, id: string) =>
       apiFetch(`/v1/admin/artifacts/${id}/withdraw`, t, { method: "POST" }),
     reviewKeys,
+    "Withdrawn from review.",
   );
 
 export function useArtifactRevisions(id: string) {
@@ -310,6 +504,51 @@ export const useRollbackArtifact = () =>
         body: { revision: a.revision },
       }),
     reviewKeys,
+    "Rolled back.",
+  );
+
+/**
+ * Sets (or, at 0, clears) the artifact's admin minimum-revision floor
+ * (PUT /v1/admin/artifacts/{id}/min-revision, internal/api/admin_artifact_min_revision.ee.go).
+ * rowVersion comes from the artifact object the caller already holds: in
+ * ArtifactsPage that is `historyArtifact`, looked up fresh from the artifacts
+ * list on every render (see its own comment: a prior mutation that
+ * invalidates ["admin", "artifacts"] refreshes what the NEXT call here
+ * carries). Quoted to match the server's strong ETag; an unquoted If-Match
+ * is a 400.
+ *
+ * Not folded into reviewKeys: a floor changes no approval state and nothing
+ * the review queue or catalog render, only ["admin", "artifacts"].
+ */
+export const useSetArtifactMinRevision = () =>
+  useInvalidating(
+    (t, a: { id: string; minRevision: number; rowVersion: number }) =>
+      apiFetch(`/v1/admin/artifacts/${a.id}/min-revision`, t, {
+        method: "PUT",
+        body: { minRevision: a.minRevision },
+        ifMatch: `"${a.rowVersion}"`,
+      }),
+    [["admin", "artifacts"]],
+    "Minimum revision updated.",
+  );
+
+/**
+ * The AUTHOR's own acknowledgment of the CURRENT scan findings on their own
+ * pending submission (POST .../acknowledge-findings, docs/plans/orbeat-scan-
+ * acknowledgment-2026-08-27.md). Submitter-only server-side (403 otherwise)
+ * and refused with 412 when `digest` does not match the artifact's current
+ * `scanFindingsDigest` -- a re-scan (withdraw/edit/resubmit) superseded it.
+ * No If-Match: the digest itself IS this endpoint's precondition.
+ */
+export const useAcknowledgeFindings = () =>
+  useInvalidating(
+    (t, a: { id: string; digest: string }) =>
+      apiFetch(`/v1/admin/artifacts/${a.id}/acknowledge-findings`, t, {
+        method: "POST",
+        body: { digest: a.digest },
+      }),
+    reviewKeys,
+    "Findings acknowledged.",
   );
 
 export const useApproveArtifact = () =>
@@ -318,12 +557,26 @@ export const useApproveArtifact = () =>
     // ?include=content, so the reviewer's diff and this precondition are
     // both drawn from the same read). Quoted to match the server's strong
     // ETag; an unquoted If-Match is a 400.
-    (t, a: { id: string; rowVersion: number }) =>
+    //
+    // acknowledgedFindingsDigest is the APPROVER's own acknowledgment of the
+    // artifact's current findings digest (docs/plans/orbeat-scan-
+    // acknowledgment-2026-08-27.md), sent ONLY when the caller supplies one
+    // -- ReviewQueuePage sends it exactly when the artifact carries findings
+    // AND the approver has ticked their own checkbox. Omitted entirely
+    // otherwise (never an empty-string placeholder), which is what keeps a
+    // clean artifact's approve request byte-identical to before this
+    // feature: handleApproveArtifact's decodeOptionalJSON treats an absent
+    // body as "no findings to acknowledge", not as a malformed one.
+    (t, a: { id: string; rowVersion: number; acknowledgedFindingsDigest?: string }) =>
       apiFetch(`/v1/admin/artifacts/${a.id}/approve`, t, {
         method: "POST",
         ifMatch: `"${a.rowVersion}"`,
+        ...(a.acknowledgedFindingsDigest !== undefined
+          ? { body: { acknowledgedFindingsDigest: a.acknowledgedFindingsDigest } }
+          : {}),
       }),
     reviewKeys,
+    "Approved and distributed.",
   );
 
 export const useRejectArtifact = () =>
@@ -334,6 +587,7 @@ export const useRejectArtifact = () =>
         body: { reason: a.reason },
       }),
     reviewKeys,
+    "Rejected.",
   );
 
 export function useMarketplaceStatus() {
@@ -361,6 +615,39 @@ export const useCreateRole = () =>
     (t, name: string) =>
       apiFetch("/v1/admin/roles", t, { method: "POST", body: { name } }),
     [["admin", "roles"]],
+    "Role created.",
+  );
+
+/**
+ * Renames a role (PUT /v1/admin/roles/{id},
+ * docs/plans/orbeat-role-rename-2026-08-27.md).
+ *
+ * rowVersion comes from the list row being edited, like useUpdateServer --
+ * the roles list carries a real, non-zero version and there is no
+ * GET /v1/admin/roles/{id}. Quoted to match the server's strong ETag; an
+ * unquoted If-Match is a 400.
+ *
+ * idpRenamed is sent EXACTLY as the caller passes it -- never defaulted to
+ * true here. RolesPage starts every edit session at `false` and only flips
+ * it once the operator ticks the confirmation checkbox that appears after
+ * the API asks for it (idpAssertionRequiredCode), so the first submit of any
+ * rename always carries `idpRenamed: false`. Handing that decision to this
+ * hook instead of the caller's own state would risk exactly the
+ * pre-emptive assertion the design forbids: the API's `verifyIdpRename`
+ * (internal/api/admin_roles.go) treats `idpRenamed` as authoritative only
+ * when no realm-role lookup is configured, and a client that always sent
+ * `true` would silently disable the one guard this feature exists to keep.
+ */
+export const useUpdateRole = () =>
+  useInvalidating(
+    (t, a: { id: string; name: string; idpRenamed: boolean; rowVersion: number }) =>
+      apiFetch<Role>(`/v1/admin/roles/${a.id}`, t, {
+        method: "PUT",
+        body: { name: a.name, idpRenamed: a.idpRenamed },
+        ifMatch: `"${a.rowVersion}"`,
+      }),
+    [["admin", "roles"]],
+    "Role renamed.",
   );
 
 export const useCreateEntitlement = () =>
@@ -375,6 +662,7 @@ export const useCreateEntitlement = () =>
     ) =>
       apiFetch("/v1/admin/entitlements", t, { method: "POST", body: e }),
     [["admin", "entitlements"], ["catalog"]],
+    "Entitlement granted.",
   );
 
 export const useDeleteEntitlement = () =>
@@ -382,13 +670,21 @@ export const useDeleteEntitlement = () =>
     (t, id: string) =>
       apiFetch(`/v1/admin/entitlements/${id}`, t, { method: "DELETE" }),
     [["admin", "entitlements"], ["catalog"]],
+    "Entitlement revoked.",
   );
 
-export function useArtifactEntitlements() {
+/**
+ * order-only (ListOrderParams, not ListSearchParams): artifact-entitlements
+ * REFUSE ?q= with 400 exactly like entitlements above, for the same reason
+ * (see ListOrderParams's own comment): its params type carries no q field.
+ */
+export function useArtifactEntitlements(params: ListOrderParams = {}) {
   return useAdminList<"artifactEntitlements", ArtifactEntitlement>(
     ["admin", "artifactEntitlements"],
     "/v1/admin/artifact-entitlements",
     "artifactEntitlements",
+    true,
+    params,
   );
 }
 
@@ -397,6 +693,7 @@ export const useCreateArtifactEntitlement = () =>
     (t, e: { roleId: string; artifactId: string }) =>
       apiFetch("/v1/admin/artifact-entitlements", t, { method: "POST", body: e }),
     [["admin", "artifactEntitlements"]],
+    "Artifact entitlement granted.",
   );
 
 export const useDeleteArtifactEntitlement = () =>
@@ -404,4 +701,47 @@ export const useDeleteArtifactEntitlement = () =>
     (t, id: string) =>
       apiFetch(`/v1/admin/artifact-entitlements/${id}`, t, { method: "DELETE" }),
     [["admin", "artifactEntitlements"]],
+    "Artifact entitlement revoked.",
+  );
+
+/**
+ * Virtual keys (Enterprise only, docs/specs/2026-08-25-orbeat-virtual-keys-
+ * design.md sec 11): robot credentials owned by a role, narrowable to
+ * specific tools, revocable instantly. Only ever reachable from
+ * VirtualKeysPage, which itself renders nothing unless useVirtualKeysEnabled
+ * (above) is true; see that hook's comment for why a Community caller must
+ * never get far enough to invoke any of the three below.
+ */
+export function useVirtualKeys(params: ListSearchParams = {}) {
+  return useAdminList<"virtualKeys", VirtualKey>(
+    ["admin", "virtualKeys"],
+    "/v1/admin/virtual-keys",
+    "virtualKeys",
+    true,
+    params,
+  );
+}
+
+export const useCreateVirtualKey = () =>
+  useInvalidating(
+    (t, input: VirtualKeyInput) =>
+      apiFetch("/v1/admin/virtual-keys", t, { method: "POST", body: input }),
+    [["admin", "virtualKeys"]],
+    "Virtual key created.",
+  );
+
+/**
+ * rowVersion comes from the list row being revoked (VirtualKeysPage has no
+ * by-id fetch; the list row IS the only read this page ever does).
+ * Quoted to match the server's strong ETag; an unquoted If-Match is a 400.
+ */
+export const useRevokeVirtualKey = () =>
+  useInvalidating(
+    (t, a: { id: string; rowVersion: number }) =>
+      apiFetch(`/v1/admin/virtual-keys/${a.id}`, t, {
+        method: "DELETE",
+        ifMatch: `"${a.rowVersion}"`,
+      }),
+    [["admin", "virtualKeys"]],
+    "Virtual key revoked.",
   );

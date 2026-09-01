@@ -54,7 +54,7 @@ in it, so parts of it lead nowhere.
   **Export JSON** and **Export CSV** on the Audit page. All four call endpoints
   this edition does not register, so they answer 404.
 
-`openapi.yaml` still lists the 7 Enterprise-only endpoints this edition does not
+`openapi.yaml` still lists the 27 Enterprise-only endpoints this edition does not
 register. No documentation ships in this tree.
 
 ## Licence

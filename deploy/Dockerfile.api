@@ -19,7 +19,7 @@ COPY . .
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -ldflags "-X github.com/stefanocalabrese/orbeat/internal/version.Version=${VERSION}" -o /out/orbeat-api ./cmd/api
+    CGO_ENABLED=0 go build -ldflags "-X github.com/stefanocalabrese/orbeat-community/internal/version.Version=${VERSION}" -o /out/orbeat-api ./cmd/api
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/orbeat-api /orbeat-api

@@ -16,7 +16,7 @@ func TestListAuditEventsPageKeyset(t *testing.T) {
 			t.Fatalf("append: %v", err)
 		}
 	}
-	page1, err := s.ListAuditEventsPage(ctx, tn.ID, nil, 2)
+	page1, err := s.ListAuditEventsPage(ctx, tn.ID, AuditFilter{}, nil, 2)
 	if err != nil {
 		t.Fatalf("page1: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestListAuditEventsPageKeyset(t *testing.T) {
 		t.Fatalf("page1 len = %d, want 2", len(page1))
 	}
 	last := page1[len(page1)-1]
-	page2, err := s.ListAuditEventsPage(ctx, tn.ID, &AuditCursor{TS: last.TS, ID: last.ID}, 2)
+	page2, err := s.ListAuditEventsPage(ctx, tn.ID, AuditFilter{}, &AuditCursor{TS: last.TS, ID: last.ID}, 2)
 	if err != nil {
 		t.Fatalf("page2: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestListAuditEventsPageEqualTimestamps(t *testing.T) {
 
 	// Sanity: confirm the rows really do share a timestamp (otherwise this test
 	// would not exercise the (ts=, id<) tiebreak it exists to cover).
-	all, err := s.ListAuditEventsPage(ctx, tn.ID, nil, 10)
+	all, err := s.ListAuditEventsPage(ctx, tn.ID, AuditFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("list all: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestListAuditEventsPageEqualTimestamps(t *testing.T) {
 	seen := map[string]int{}
 	var cursor *AuditCursor
 	for {
-		page, err := s.ListAuditEventsPage(ctx, tn.ID, cursor, 2)
+		page, err := s.ListAuditEventsPage(ctx, tn.ID, AuditFilter{}, cursor, 2)
 		if err != nil {
 			t.Fatalf("page: %v", err)
 		}
@@ -374,18 +374,18 @@ func TestAuditPageUsesKeysetIndex(t *testing.T) {
 	// "deep" only relative to a single 100-row page, not to the keyset's
 	// full history — deep enough that a plan serving page 1 alone couldn't
 	// be mistaken for one serving this page too.
-	first, err := s.ListAuditEventsPage(ctx, tn.ID, nil, 100)
+	first, err := s.ListAuditEventsPage(ctx, tn.ID, AuditFilter{}, nil, 100)
 	if err != nil || len(first) != 100 {
 		t.Fatalf("seed page: %d rows, err=%v", len(first), err)
 	}
 	cursor := &AuditCursor{TS: first[len(first)-1].TS, ID: first[len(first)-1].ID}
-	cursorSQL, cursorArgs := auditPageSQL(tn.ID, cursor, 100)
+	cursorSQL, cursorArgs := auditPageSQL(tn.ID, AuditFilter{}, cursor, 100)
 	auditExp := planExpectation{wantIndex: "audit_event_tenant_ts_id_idx", noSortKey: true}
 	assertPaginationPlan(t, explain(t, s, cursorSQL, cursorArgs...), "cursor page (ListAuditEventsPage, cursor != nil)", auditExp)
 
 	// Site 2: cursor == nil branch — every first page a client ever sees,
 	// and the one a prior version of this test never EXPLAINed at all.
-	nilSQL, nilArgs := auditPageSQL(tn.ID, nil, 100)
+	nilSQL, nilArgs := auditPageSQL(tn.ID, AuditFilter{}, nil, 100)
 	assertPaginationPlan(t, explain(t, s, nilSQL, nilArgs...), "first page (ListAuditEventsPage, cursor == nil)", auditExp)
 
 	// Site 3: auditRangeSelect — the audit export path

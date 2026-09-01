@@ -87,3 +87,71 @@ test("expired session on an admin page re-initiates login or shows the error pan
     "an expired session must re-initiate login or show the error panel — never render as an empty table",
   ).not.toBe("empty-table-lie");
 });
+
+// The MUTATION half of the same seam, and the reason it is a separate test:
+// the one above reloads the page, which issues GETs only, so it passed for
+// months while MutationCache.onError carried no 401 arm at all (audit A17).
+// An admin whose Keycloak session died while a form was open got an inline
+// "HTTP 401" under the Create button and nothing else, and Roles, Servers,
+// Entitlements and Virtual keys run no polling query, so nothing on screen
+// ever contradicted a console that looked healthy.
+//
+// Only NON-GET admin calls are intercepted here. That is deliberate: leaving
+// the reads working reproduces exactly that shape, a page rendering its table
+// normally while every write is refused. Routing everything to 401, the way
+// the test above does, would let a query fire the handler and the assertion
+// would pass with the mutation arm deleted.
+//
+// NOT YET EXECUTED, as of the commit that added it: written with no compose
+// stack available, so it has passed typecheck and lint and nothing more. An
+// unrun spec is not coverage (the v1.14.1 lesson), which is why the same
+// mechanism is also pinned by src/api/client.unauthorized.test.tsx, a unit
+// gate that was red-proven.
+
+test("an expired session on an admin WRITE re-initiates login, not just an inline error", async ({
+  page,
+}) => {
+  await login(page, "boss", "boss");
+
+  await page.getByRole("link", { name: "Admin" }).click();
+  await page.getByRole("link", { name: "Roles" }).click();
+  await expect(page.getByRole("heading", { name: /^roles$/i })).toBeVisible({
+    timeout: 15_000,
+  });
+
+  const cors = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "authorization, content-type",
+    "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
+  };
+  await page.route("**/v1/admin/**", (route) => {
+    const method = route.request().method();
+    if (method === "OPTIONS") {
+      return route.fulfill({ status: 204, headers: cors });
+    }
+    if (method === "GET") {
+      return route.continue(); // reads keep working: the page stays healthy
+    }
+    return route.fulfill({
+      status: 401,
+      headers: { ...cors, "content-type": "application/json" },
+      body: JSON.stringify({ error: { message: "session expired" } }),
+    });
+  });
+
+  // Armed before the click so a fast redirect cannot slip past the listener.
+  const reLogin = page
+    .waitForRequest((r) => r.url().includes("/protocol/openid-connect/auth"), {
+      timeout: 20_000,
+    })
+    .then(() => "re-login" as const)
+    .catch(() => "inline-error-only" as const);
+
+  await page.getByLabel("Role name").fill(`e2e401${Date.now()}`);
+  await page.getByRole("button", { name: /^create$/i }).click();
+
+  expect(
+    await reLogin,
+    "a 401 on a write must re-initiate login; rendering only an inline message leaves the admin on a console where every write silently fails",
+  ).toBe("re-login");
+});

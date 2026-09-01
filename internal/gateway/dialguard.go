@@ -3,8 +3,10 @@ package gateway
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"syscall"
 	"time"
 )
@@ -18,16 +20,59 @@ var errMetadataBlocked = errors.New("gateway: dial guard: refusing to dial cloud
 // init instead of on every dial attempt.
 var awsIPv6MetadataAddr = net.ParseIP("fd00:ec2::254")
 
+// alibabaMetadataAddr is Alibaba Cloud's instance-metadata address (fable-
+// audit B38(d)) -- a single ordinary IPv4 address, not link-local, so
+// net.IP.IsLinkLocalUnicast cannot cover it the way it covers AWS/GCP/Azure/
+// DigitalOcean's shared 169.254.169.254. Blocked the same way
+// awsIPv6MetadataAddr is: a specific address, not a wider block, for the
+// same reason that one is (see its own note in blockMetadataDial's doc
+// comment) -- it is ordinary address space Alibaba happens to route its
+// metadata service on, not a class this guard has any other reason to deny.
+var alibabaMetadataAddr = net.ParseIP("100.100.100.200")
+
 // dialGuardTransport is a clone of http.DefaultTransport (the global is never
 // mutated — see connectUpstream's use of it in broker.go) whose outbound
-// connections additionally refuse cloud-provider instance-metadata
-// endpoints. It is package-level and shared across every upstream dial, same
-// as the DefaultTransport it wraps.
+// connections additionally refuse cloud-provider instance-metadata endpoints
+// and never go through a proxy. It is package-level and shared across every
+// upstream dial, same as the DefaultTransport it wraps.
 var dialGuardTransport *http.Transport = newDialGuardTransport()
+
+// proxyEnvVars are the variables http.ProxyFromEnvironment consults, and so the
+// ones whose presence used to disable this guard. Names taken from
+// golang.org/x/net/http/httpproxy's Config, which net/http delegates to:
+// HTTP_PROXY and HTTPS_PROXY, each also honoured lowercase. NO_PROXY is not
+// listed because it only ever removes proxying.
+var proxyEnvVars = []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"}
 
 // newDialGuardTransport clones http.DefaultTransport and swaps in a dialer
 // whose Control hook blocks metadata destinations. See blockMetadataDial for
 // what is blocked, and why private ranges deliberately are not.
+//
+// It also CLEARS Proxy, and that line is a security control, not tidiness
+// (audit A16). http.DefaultTransport carries Proxy: http.ProxyFromEnvironment,
+// and Clone copies it. blockMetadataDial is a net.Dialer Control hook, so it
+// only ever sees the address this process dials: with a proxy configured that
+// address is the PROXY's, the proxy performs the DNS lookup and the connection
+// to the real destination, and 169.254.169.254 never passes under the hook at
+// all. Setting a single environment variable therefore turned the whole guard
+// off, with nothing in the logs and every one of its tests still green (they
+// dial with no proxy env set, so no mutant could fail them).
+//
+// Validating post-proxy was the alternative and was rejected as unbuildable
+// rather than as merely worse. Once a hostname is handed to a proxy, this
+// process never resolves it and never sees the address chosen; net/http exposes
+// no hook on the proxy's own onward connection. Any check we could still run
+// would be on the URL STRING before the request leaves, which is exactly the
+// write-time validation blockMetadataDial's doc comment explains is defeated by
+// DNS and by rebinding. A guard that cannot observe the address being connected
+// to is not a guard.
+//
+// The cost is real and is accepted: an operator who needs an egress proxy to
+// reach upstream MCP servers cannot get one from the environment any more.
+// That is a supported deployment shape, so it is announced rather than silently
+// dropped, and an explicit orbeat-owned proxy setting (with the documented
+// consequence that the SSRF guard cannot cover it) is the way to give it back
+// if anyone asks for it.
 func newDialGuardTransport() *http.Transport {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -38,6 +83,19 @@ func newDialGuardTransport() *http.Transport {
 		base = &http.Transport{}
 	}
 	t := base.Clone()
+	t.Proxy = nil
+	// Announced, never silent: a proxy env var that used to take effect now
+	// does nothing, so an operator debugging "the gateway cannot reach my
+	// upstream" is told why here instead of inferring it. Emitted at package
+	// init, before cmd/gateway configures slog, so this line arrives in the
+	// default text format rather than the JSON the rest of the process emits.
+	// That is the trade for a warning that cannot be left un-wired: there is no
+	// call site to forget.
+	if set := proxyEnvSet(); len(set) > 0 {
+		slog.Warn("gateway: proxy environment ignored for upstream dials; the SSRF dial guard "+
+			"cannot inspect a destination it never resolves (audit A16)",
+			"vars", set)
+	}
 	// Timeout/KeepAlive match the net.Dialer http.DefaultTransport itself
 	// builds internally (both 30s) — the guard changes what is dialed, not
 	// how long dialling is allowed to take.
@@ -47,6 +105,18 @@ func newDialGuardTransport() *http.Transport {
 		Control:   blockMetadataDial,
 	}).DialContext
 	return t
+}
+
+// proxyEnvSet returns the names of the proxy environment variables that are
+// set and non-empty. Names only: the values routinely carry credentials.
+func proxyEnvSet() []string {
+	var set []string
+	for _, name := range proxyEnvVars {
+		if os.Getenv(name) != "" {
+			set = append(set, name)
+		}
+	}
+	return set
 }
 
 // blockMetadataDial is a net.Dialer Control hook. The standard library
@@ -70,10 +140,21 @@ func newDialGuardTransport() *http.Transport {
 //   - AWS's IPv6 metadata address, fd00:ec2::254 — a single address, not a
 //     wider block: it lives in Unique Local Address space, and ULA is
 //     ordinary private IPv6 addressing (see the no-private-block note below)
+//   - Alibaba Cloud's metadata address, 100.100.100.200 — also a single
+//     address rather than a wider block, for the identical reason: it lives
+//     in RFC 6598 Shared Address Space (100.64.0.0/10), which is ordinary
+//     non-globally-routable IPv4 addressing an admin's own network could
+//     otherwise be using
 //
 // net.IP.IsLinkLocalUnicast covers both link-local ranges in one call (it is
 // the same predicate the standard library itself defines for "169.254/16 or
 // fe80::/10"), so only the AWS IPv6 address needs an explicit check.
+//
+// The hook sees only the address THIS process dials. Anything that puts a
+// middlebox between the process and the destination therefore takes the
+// destination out of its view entirely, which is why newDialGuardTransport
+// clears Proxy, and why that line belongs to this control rather than to
+// transport configuration (audit A16).
 //
 // Deliberately does NOT block RFC 1918 private ranges (10.0.0.0/8,
 // 172.16.0.0/12, 192.168.0.0/16) or loopback. orbeat is a self-hosted
@@ -101,7 +182,7 @@ func blockMetadataDial(_, address string, _ syscall.RawConn) error {
 		// point. Fail closed on anything else.
 		return fmt.Errorf("gateway: dial guard: non-IP host %q", host)
 	}
-	if ip.IsLinkLocalUnicast() || ip.Equal(awsIPv6MetadataAddr) {
+	if ip.IsLinkLocalUnicast() || ip.Equal(awsIPv6MetadataAddr) || ip.Equal(alibabaMetadataAddr) {
 		return fmt.Errorf("%w: %s", errMetadataBlocked, ip)
 	}
 	return nil

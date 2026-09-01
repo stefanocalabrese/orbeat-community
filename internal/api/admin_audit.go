@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,36 @@ func decodeCursor(s string) (*store.AuditCursor, error) {
 	return &store.AuditCursor{TS: time.Unix(0, n).UTC(), ID: id}, nil
 }
 
+// auditFilterFromQuery reads the actor/action/decision narrowing parameters.
+// An absent or empty parameter filters nothing, which is why a caller cannot
+// ask for the empty-string actor; nothing in this repo writes such a row.
+//
+// actor and action are passed through verbatim. They are bound as query
+// parameters, so there is nothing to sanitize, and there is deliberately no
+// length cap: an over-long value costs one index probe that matches nothing,
+// and refusing it would be a rule with no resource behind it.
+//
+// decision is different, and is the one value validated here: the column is
+// CHECK-constrained (store.AuditDecisions), so a value outside that set cannot
+// exist in any row. Returning an empty 200 for it would report "nothing
+// happened" for a question that was never askable, so it is a 400 instead. The
+// set comes from the store rather than from a literal here, and a test pins it
+// against the live constraint.
+func auditFilterFromQuery(r *http.Request) (store.AuditFilter, error) {
+	q := r.URL.Query()
+	f := store.AuditFilter{
+		Actor:    q.Get("actor"),
+		Action:   q.Get("action"),
+		Decision: q.Get("decision"),
+	}
+	if f.Decision != "" && !slices.Contains(store.AuditDecisions(), f.Decision) {
+		return store.AuditFilter{}, validationError{
+			"decision must be one of " + strings.Join(store.AuditDecisions(), ", "),
+		}
+	}
+	return f, nil
+}
+
 func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 	rc, _, ok := s.resolved(w, r)
 	if !ok {
@@ -84,6 +115,11 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 	if limit > maxAuditLimit {
 		limit = maxAuditLimit
 	}
+	filter, err := auditFilterFromQuery(r)
+	if err != nil {
+		fail(w, err)
+		return
+	}
 	var cursor *store.AuditCursor
 	if c := r.URL.Query().Get("cursor"); c != "" {
 		parsed, err := decodeCursor(c)
@@ -93,7 +129,7 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 		}
 		cursor = parsed
 	}
-	events, err := s.store.ListAuditEventsPage(r.Context(), rc.TenantID, cursor, limit)
+	events, err := s.store.ListAuditEventsPage(r.Context(), rc.TenantID, filter, cursor, limit)
 	if err != nil {
 		fail(w, err)
 		return

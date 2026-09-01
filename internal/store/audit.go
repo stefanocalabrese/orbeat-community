@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -48,7 +49,72 @@ func (s *Store) AppendAuditEvent(ctx context.Context, e AuditEvent) (AuditEvent,
 // ListAuditEventsByTenant returns up to limit events, newest first. It is the
 // unpaginated convenience over ListAuditEventsPage (nil cursor → newest page).
 func (s *Store) ListAuditEventsByTenant(ctx context.Context, tenantID string, limit int) ([]AuditEvent, error) {
-	return s.ListAuditEventsPage(ctx, tenantID, nil, limit)
+	return s.ListAuditEventsPage(ctx, tenantID, AuditFilter{}, nil, limit)
+}
+
+// AuditDecisions returns the closed set of values audit_event.decision accepts,
+// in the order migration 00001's CHECK constraint lists them. It exists so the
+// API can refuse a decision filter no row could ever carry without keeping its
+// own copy of the domain: a hand-maintained list in the handler is the exact
+// shape that broke the portal's server-status dropdown in v1.16.0, where the
+// client kept offering a value the database had stopped accepting.
+//
+// TestAuditDecisionsMatchTheSchemaCheck reads the live constraint and fails if
+// this list and the database ever disagree, in either direction.
+func AuditDecisions() []string {
+	return []string{"allow", "deny", "error"}
+}
+
+// AuditFilter narrows an audit query to rows matching every non-empty field,
+// combined with AND. The zero value filters nothing, which is what keeps
+// ListAuditEventsByTenant and every existing caller unchanged in behaviour.
+//
+// Matching is exact equality on all three, never a prefix or a pattern. That
+// is a deliberate limit rather than a first cut left half-done: `action`
+// values are dotted (`role.delete`, `artifact.approve`), so a prefix filter
+// reads as an obvious next step, but a prefix has to decide what `role.` means
+// against `role.delete` and `roles.import` alike, and a pattern filter over
+// user-supplied text on the largest table in the system is a different feature
+// with a different cost profile. Exact match answers the questions this filter
+// exists for ("everything alice did", "every deny", "every role deletion")
+// with a predicate an index can serve.
+//
+// An empty field means "no filter", so a row whose actor is genuinely the
+// empty string cannot be selected for. Nothing in this repo writes such a row.
+type AuditFilter struct {
+	Actor    string
+	Action   string
+	Decision string
+}
+
+// isZero reports whether f narrows nothing, so callers can skip work that only
+// matters for a filtered query.
+func (f AuditFilter) isZero() bool {
+	return f.Actor == "" && f.Action == "" && f.Decision == ""
+}
+
+// predicates returns f's non-empty fields as (column, value) pairs in a fixed
+// order. The column names are literals from this slice and never reach SQL
+// from user input; only the values are bound.
+func (f AuditFilter) predicates() []struct {
+	col string
+	val string
+} {
+	all := []struct {
+		col string
+		val string
+	}{
+		{"actor", f.Actor},
+		{"action", f.Action},
+		{"decision", f.Decision},
+	}
+	out := all[:0:0]
+	for _, p := range all {
+		if p.val != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // AuditCursor is a keyset position into a tenant's audit log, ordered (ts, id)
@@ -117,27 +183,38 @@ type AuditCursor struct {
 //
 // WHERE is unaffected (output labels are not visible there), so the (ts, id)
 // cursor predicate below is fine unqualified.
-func auditPageSQL(tenantID string, cursor *AuditCursor, limit int) (string, []any) {
-	const base = `
+func auditPageSQL(tenantID string, f AuditFilter, cursor *AuditCursor, limit int) (string, []any) {
+	var b strings.Builder
+	b.WriteString(`
 		SELECT id::text, tenant_id::text, ts, actor, action, target, decision, metadata
 		FROM audit_event
-		WHERE tenant_id = $1`
-	if cursor == nil {
-		return base + `
-			ORDER BY audit_event.ts DESC, audit_event.id DESC
-			LIMIT $2`, []any{tenantID, limit}
+		WHERE tenant_id = $1`)
+	args := []any{tenantID}
+	// Each present filter becomes a real equality predicate rather than the
+	// `$n IS NULL OR col = $n` shape auditRangeSelect uses for its date bounds.
+	// That shape is convenient because the SQL is constant, and it is exactly
+	// what stops the planner from using an index on the filtered column: the
+	// predicate is only knowable at execution time, so a generic plan cannot
+	// turn it into an index condition. Building the text costs a strings.Builder
+	// and buys an index-eligible predicate.
+	for _, p := range f.predicates() {
+		args = append(args, p.val)
+		fmt.Fprintf(&b, "\n\t\tAND %s = $%d", p.col, len(args))
 	}
-	return base + `
-		AND (ts, id) < ($2, $3)
-		ORDER BY audit_event.ts DESC, audit_event.id DESC
-		LIMIT $4`, []any{tenantID, cursor.TS, cursor.ID, limit}
+	if cursor != nil {
+		args = append(args, cursor.TS, cursor.ID)
+		fmt.Fprintf(&b, "\n\t\tAND (ts, id) < ($%d, $%d)", len(args)-1, len(args))
+	}
+	args = append(args, limit)
+	fmt.Fprintf(&b, "\n\t\tORDER BY audit_event.ts DESC, audit_event.id DESC\n\t\tLIMIT $%d", len(args))
+	return b.String(), args
 }
 
 // ListAuditEventsPage returns up to limit events for a tenant, newest first,
 // strictly older than cursor (by (ts, id)) when cursor is non-nil. The (ts, id)
 // tiebreak gives a stable total order even when timestamps collide.
-func (s *Store) ListAuditEventsPage(ctx context.Context, tenantID string, cursor *AuditCursor, limit int) ([]AuditEvent, error) {
-	sql, args := auditPageSQL(tenantID, cursor, limit)
+func (s *Store) ListAuditEventsPage(ctx context.Context, tenantID string, f AuditFilter, cursor *AuditCursor, limit int) ([]AuditEvent, error) {
+	sql, args := auditPageSQL(tenantID, f, cursor, limit)
 	rows, err := s.db.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list audit events page: %w", err)

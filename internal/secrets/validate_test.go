@@ -47,9 +47,11 @@ func assertProviderValidateLocatorCases(t *testing.T, cases []providerValidateLo
 }
 
 func TestProviderValidateLocator(t *testing.T) {
-	// env: non-empty name only.
+	// env: a non-empty name carrying one of ORBEAT_SECRET_ENV_ALLOW's
+	// prefixes (default ORBEAT_UPSTREAM_). The allowlist itself is covered in
+	// depth by env_allow_test.go; these two rows only keep the shared shape.
 	assertProviderValidateLocatorCases(t, []providerValidateLocatorCase{
-		{"env", "TOKEN", false},
+		{"env", "ORBEAT_UPSTREAM_TOKEN", false},
 		{"env", "", true},
 	})
 }
@@ -101,7 +103,7 @@ func assertValidateRefCases(t *testing.T, cases []validateRefCase) {
 func TestValidateRef(t *testing.T) {
 	assertValidateRefCases(t, []validateRefCase{
 		{"", false}, // empty == "no credential", matching Resolve
-		{"env:TOKEN", false},
+		{"env:ORBEAT_UPSTREAM_TOKEN", false},
 
 		{"TOKEN", true},              // no scheme prefix
 		{"valut:kv/mcp#token", true}, // unregistered scheme (a typo of "vault", never registered in either tier)
@@ -110,8 +112,8 @@ func TestValidateRef(t *testing.T) {
 		// Control characters are never legitimate in a ref: a NUL byte reaches
 		// Postgres, which rejects NUL in a text column, so an unchecked ref turns
 		// malformed input into a 500 at the DB layer instead of a 400 at the edge.
-		{"env:A\x00B", true},
-		{"env:A\nB", true},
+		{"env:ORBEAT_UPSTREAM_A\x00B", true},
+		{"env:ORBEAT_UPSTREAM_A\nB", true},
 	})
 }
 
@@ -119,7 +121,7 @@ func TestValidateRef(t *testing.T) {
 // does not exist must still validate. If this ever fails, ValidateRef has
 // started doing I/O.
 func TestValidateRefDoesNotResolve(t *testing.T) {
-	if err := NewResolver().ValidateRef("env:ORBEAT_DEFINITELY_NOT_SET_12345"); err != nil {
+	if err := NewResolver().ValidateRef("env:ORBEAT_UPSTREAM_DEFINITELY_NOT_SET_12345"); err != nil {
 		t.Errorf("ValidateRef on a well-formed ref to a missing target = %v, want nil", err)
 	}
 }

@@ -20,11 +20,23 @@ export class ApiRequestError extends Error {
    */
   limit?: LimitInfo;
 
-  constructor(status: number, message: string, limit?: LimitInfo) {
+  /**
+   * The machine-readable `code` field some 4xx bodies carry alongside their
+   * prose `message` (e.g. `idp_rename_assertion_required` from
+   * PUT /v1/admin/roles/{id} -- internal/api/respond.go's
+   * idpAssertionRequiredCode), so a caller can recognise a specific refusal
+   * programmatically instead of matching on `message` text. Unlike `limit`,
+   * this is not gated to one status: any error body may carry it, and it is
+   * undefined whenever the body does not.
+   */
+  code?: string;
+
+  constructor(status: number, message: string, limit?: LimitInfo, code?: string) {
     super(message);
     this.name = "ApiRequestError";
     this.status = status;
     this.limit = limit;
+    this.code = code;
   }
 }
 
@@ -131,10 +143,41 @@ export function errMsg(e: unknown): string {
 }
 
 /**
+ * The app-wide reaction to a failed request, whichever cache saw it.
+ *
+ * ONE function wired into both caches, rather than a body per cache, because
+ * the two bodies drifting is not hypothetical: the 401 arm shipped on the
+ * query cache alone, so an admin whose Keycloak session died mid-form got an
+ * inline "HTTP 401" on Create with no overlay and no redirect, and on Roles,
+ * Servers, Entitlements and Virtual keys (none of which poll) the console
+ * stayed visually healthy while every write failed. A shared body makes that
+ * asymmetry unrepresentable instead of merely fixed.
+ *
+ * Neither arm is read-only or write-only in nature. A 401 means the token is
+ * dead, and a dead token fails the next GET as surely as the POST that
+ * revealed it. notifyUnauthorized's own latch (see above) is what keeps a
+ * burst across both caches to exactly one redirect.
+ */
+/**
+ * B15: exported (not just wired into the two caches below) so a plain
+ * imperative fetch outside TanStack Query — the audit export's blob
+ * download, which cannot be a query/mutation because the browser needs to
+ * see a `<a download>` click, not a hook return value — can run the SAME
+ * policy rather than a second, drift-prone copy of "401 → re-login, 402 →
+ * cap dialog" living beside this one. The original rationale for keeping
+ * this as ONE function (see createAppQueryClient's own comment) applies
+ * doubly once there is a THIRD call site.
+ */
+export function reportApiError(err: unknown): void {
+  if (err instanceof ApiRequestError && err.status === 401) notifyUnauthorized();
+  notifyIfLimitReached(err);
+}
+
+/**
  * The app-wide QueryClient: 4xx errors (auth/validation) are never retried —
  * retrying can't fix them and only delays surfacing the failure — while
- * 5xx/network errors get a bounded retry. Any query erroring with a 401 kicks
- * off the unauthorized flow (single-fire, see above).
+ * 5xx/network errors get a bounded retry. Any query OR mutation erroring with
+ * a 401 kicks off the unauthorized flow (single-fire, see above).
  *
  * A 402 is wired on BOTH caches, and the mutation half is not the important
  * one. The seat cap (spec §3.2) is enforced in authz.Resolver.Middleware
@@ -149,15 +192,8 @@ export function errMsg(e: unknown): string {
  */
 export function createAppQueryClient(): QueryClient {
   return new QueryClient({
-    queryCache: new QueryCache({
-      onError: (err) => {
-        if (err instanceof ApiRequestError && err.status === 401) notifyUnauthorized();
-        notifyIfLimitReached(err);
-      },
-    }),
-    mutationCache: new MutationCache({
-      onError: (err) => notifyIfLimitReached(err),
-    }),
+    queryCache: new QueryCache({ onError: reportApiError }),
+    mutationCache: new MutationCache({ onError: reportApiError }),
     defaultOptions: {
       queries: {
         retry: (count, err) =>
@@ -190,11 +226,20 @@ interface Options {
 // whichever fires first aborts the fetch.
 const REQUEST_TIMEOUT_MS = 30_000;
 
-export async function apiFetch<T>(
+/**
+ * The shared request plumbing under BOTH apiFetch (JSON) and apiFetchRaw
+ * (raw Response, for the audit export's blob download): builds the request
+ * with the bearer token + hard timeout, and on a non-2xx response parses the
+ * error body into an ApiRequestError. Not exported — apiFetch and
+ * apiFetchRaw are the two shapes callers actually need; this is what they
+ * share so those shapes can never drift apart on the parts that must not
+ * (the timeout ceiling, the error-body parse).
+ */
+async function apiFetchResponse(
   path: string,
   token: string,
   opts: Options = {},
-): Promise<T> {
+): Promise<Response> {
   const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
   const res = await fetch(`${config.apiBase}${path}`, {
@@ -208,27 +253,59 @@ export async function apiFetch<T>(
     signal,
   });
 
-  if (res.status === 204) return undefined as T;
-
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
     let limit: LimitInfo | undefined;
+    let code: string | undefined;
     try {
       // ONE read. A Response body is a stream that can be consumed exactly
-      // once, so the message and the 402 cap payload both come out of this
-      // single parse; a second res.json() anywhere below would throw on the
-      // unusable body and be swallowed by the catch.
-      const e = (await res.json()) as { error?: { message?: string }; limit?: unknown };
+      // once, so the message, the 402 cap payload and any `code` all come
+      // out of this single parse; a second res.json() anywhere below would
+      // throw on the unusable body and be swallowed by the catch.
+      const e = (await res.json()) as { error?: { message?: string }; limit?: unknown; code?: unknown };
       if (e.error?.message) msg = e.error.message;
       // The portal's single copy of the cap status code (see
       // ApiRequestError.limit and limitInfo). Every other status leaves
       // `limit` undefined even if the body carries one.
       if (res.status === 402) limit = parseLimit(e.limit);
+      if (typeof e.code === "string") code = e.code;
     } catch {
       // non-json error body — keep the default message
     }
-    throw new ApiRequestError(res.status, msg, limit);
+    throw new ApiRequestError(res.status, msg, limit, code);
   }
 
+  return res;
+}
+
+export async function apiFetch<T>(
+  path: string,
+  token: string,
+  opts: Options = {},
+): Promise<T> {
+  const res = await apiFetchResponse(path, token, opts);
+  if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+/**
+ * Like apiFetch, but for a response the caller needs as a raw Response
+ * rather than parsed JSON — currently only the audit export
+ * (AuditPage.tsx), which reads the `X-Orbeat-Export-Truncated` header and
+ * then streams the body into a downloadable Blob rather than JSON.parse-ing
+ * it. B15: before this, the export ran its own hand-rolled `fetch` with a
+ * bespoke Authorization header and NONE of apiFetch's protections — no hard
+ * timeout, no ApiRequestError body parse, no 401/402 hook (see
+ * reportApiError above, which the caller is expected to invoke on a caught
+ * error the same way createAppQueryClient's caches do). apiFetchRaw shares
+ * every one of those with apiFetch via apiFetchResponse; only the final
+ * `res.json()` step is what genuinely differs, so that is the only thing
+ * left out here.
+ */
+export async function apiFetchRaw(
+  path: string,
+  token: string,
+  opts: Options = {},
+): Promise<Response> {
+  return apiFetchResponse(path, token, opts);
 }

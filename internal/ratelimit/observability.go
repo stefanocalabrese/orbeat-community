@@ -40,11 +40,16 @@ type Observability struct {
 //
 // The counter increments UNCONDITIONALLY on every rejection — it is the
 // durable instrument (spec §9). The log line is written only when
-// logRejection is true (Limiter.AllowAtSampled/AllowSampled's third return:
-// at most once per key per streak/window) — a warn per 429 would double log
-// volume during exactly the incident this feature exists for: spec §9's own
-// arithmetic is a client at 5k rps against a 50 rps limit producing ~10k
-// lines/second.
+// logRejection is true, at most once per key per logSampleInterval, decided
+// by Limiter.AllowAtSampled/AllowSampled and by
+// ConcurrencyLimiter.AcquireAtSampled/AcquireSampled, which are the only
+// things allowed to compute it. A caller passing a literal true here has
+// silently opted out of the sampler, which is what MCPConcurrency did.
+//
+// A warn per rejection would dominate log volume during exactly the incident
+// this feature exists for: spec §9's own arithmetic is a client at 5k rps
+// against a 50 rps limit producing ~10k lines/second, and the sampler's whole
+// job is to turn that into one line a minute per key.
 //
 // service distinguishes the API's HTTP adapter ("api") from the gateway's
 // MCP adapter ("gateway"). reason further distinguishes WHICH budget was

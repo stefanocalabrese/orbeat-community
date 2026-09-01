@@ -47,14 +47,14 @@ func TestRowVersionBumpsOnEveryArtifactUpdatePath(t *testing.T) {
 		return s.UpdateArtifact(ctx, a, prev)
 	})
 	step("SetArtifactSubmitted", func() (Artifact, error) {
-		return s.SetArtifactSubmitted(ctx, tn.ID, a.ID, "sub@example.com", []byte("[]"))
+		return s.SetArtifactSubmitted(ctx, tn.ID, a.ID, "sub@example.com", []byte("[]"), "")
 	})
 	step("SetArtifactApproved", func() (Artifact, error) {
 		out, _, err := s.SetArtifactApproved(ctx, tn.ID, a.ID, "app@example.com", 0)
 		return out, err
 	})
 	step("SetArtifactSubmitted (2nd)", func() (Artifact, error) {
-		return s.SetArtifactSubmitted(ctx, tn.ID, a.ID, "sub@example.com", []byte("[]"))
+		return s.SetArtifactSubmitted(ctx, tn.ID, a.ID, "sub@example.com", []byte("[]"), "")
 	})
 	step("SetArtifactRejected", func() (Artifact, error) {
 		return s.SetArtifactRejected(ctx, tn.ID, a.ID, "no")
@@ -130,6 +130,85 @@ func TestNoOpUpdateStillBumpsRowVersion(t *testing.T) {
 	}
 }
 
+// TestFreshRoleRowVersionStartsAtOne pins CreateRole's RETURNING projection:
+// a freshly inserted role starts at row_version 1, the column's DEFAULT
+// (migration 00027), not the zero value a missed Scan would silently produce.
+func TestFreshRoleRowVersionStartsAtOne(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tn := mustTenant(t, s)
+
+	r, err := s.CreateRole(ctx, tn.ID, "rv-fresh-role")
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if r.RowVersion != 1 {
+		t.Fatalf("fresh role row_version = %d, want 1", r.RowVersion)
+	}
+}
+
+// TestRoleRowVersionTriggerIgnoresClientSuppliedValue is role's counterpart to
+// TestRowVersionIgnoresClientSuppliedValue above (migration 00027, mirroring
+// 00026's entitlement trigger): the trigger, not the caller, owns the column.
+// This is the highest-risk behaviour of the slice, per 00026's own comment —
+// a future UpdateRoleName that let a client pin row_version would defeat every
+// If-Match precondition built on top of it.
+func TestRoleRowVersionTriggerIgnoresClientSuppliedValue(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tn := mustTenant(t, s)
+
+	r, err := s.CreateRole(ctx, tn.ID, "rv-client-role")
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := s.db.Exec(ctx,
+		`UPDATE role SET name=name, row_version=999 WHERE id=$1`, r.ID); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, err := s.GetRolesByNames(ctx, tn.ID, []string{"rv-client-role"})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("GetRolesByNames = %+v, want exactly one role", got)
+	}
+	if got[0].RowVersion != r.RowVersion+1 {
+		t.Errorf("row_version = %d, want %d — the trigger must override a "+
+			"client-supplied value, not defer to it", got[0].RowVersion, r.RowVersion+1)
+	}
+}
+
+// TestRoleRowVersionReturningObservesBumpedValue pins that an UPDATE's
+// RETURNING clause observes the trigger's NEW.row_version, not the
+// pre-update value. This is the property a future store.UpdateRoleName
+// depends on to hand the caller a fresh ETag without a second round trip.
+func TestRoleRowVersionReturningObservesBumpedValue(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tn := mustTenant(t, s)
+
+	r, err := s.CreateRole(ctx, tn.ID, "rv-returning-role")
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+
+	var returned int64
+	if err := s.db.QueryRow(ctx,
+		`UPDATE role SET name=name WHERE id=$1 RETURNING row_version`, r.ID,
+	).Scan(&returned); err != nil {
+		t.Fatalf("update returning: %v", err)
+	}
+	if returned == r.RowVersion {
+		t.Fatalf("RETURNING row_version = %d, same as the pre-update value %d: "+
+			"the trigger did not fire before RETURNING evaluated", returned, r.RowVersion)
+	}
+	if returned != r.RowVersion+1 {
+		t.Errorf("RETURNING row_version = %d, want %d, the bumped value", returned, r.RowVersion+1)
+	}
+}
+
 // TestUpdateArtifactRejectsStaleVersion is the decisive lost-update case:
 // UpdateArtifact's own row_version predicate is the ONLY place that can ever
 // be pinned, because its only production caller (handleUpdateArtifact) holds
@@ -201,7 +280,7 @@ func TestUpdateMCPServerRejectsStaleVersion(t *testing.T) {
 
 	m.EndpointOrCommand = "https://example.invalid/v2"
 	m.RowVersion = staleVersion
-	first, err := s.UpdateMCPServer(ctx, m)
+	first, err := s.UpdateMCPServer(ctx, m, nil, nil)
 	if err != nil {
 		t.Fatalf("first update: %v", err)
 	}
@@ -209,7 +288,7 @@ func TestUpdateMCPServerRejectsStaleVersion(t *testing.T) {
 	// Retry with the version read BEFORE the first update landed.
 	first.EndpointOrCommand = "https://example.invalid/v3-SHOULD-NOT-LAND"
 	first.RowVersion = staleVersion
-	if _, err := s.UpdateMCPServer(ctx, first); !errors.Is(err, ErrVersionMismatch) {
+	if _, err := s.UpdateMCPServer(ctx, first, nil, nil); !errors.Is(err, ErrVersionMismatch) {
 		t.Fatalf("stale UpdateMCPServer: want ErrVersionMismatch, got %v", err)
 	}
 

@@ -36,8 +36,23 @@ async function gotoAdmin(page: Page, section: string) {
 const API_BASE = "http://localhost:8080";
 const KC_TOKEN_URL = "http://localhost:8088/realms/orbeat/protocol/openid-connect/token";
 
+/**
+ * This spec's own Keycloak identity. It seeds a role, a server, an artifact
+ * and their grants, so it is not what loads the bucket, but it moves anyway:
+ * the gate in internal/deploy derives its subject set from source (every spec
+ * defining adminToken), and carving out the cheap specs would mean a
+ * hand-maintained exemption list, which is the defect one level up.
+ *
+ * internal/ratelimit keys its token bucket on subject + azp, so every spec
+ * that stays on `boss` shares one bucket with all the others. One constant
+ * feeds both the browser login and the API token so the two can never drift
+ * apart, which would silently put half this spec's traffic back on the
+ * shared bucket.
+ */
+const E2E_USER = "e2e-roles";
+
 /** Verbatim from concurrency.spec.ts / pagination.spec.ts. */
-async function adminToken(request: APIRequestContext, user = "boss", pass = "boss"): Promise<string> {
+async function adminToken(request: APIRequestContext, user = E2E_USER, pass = E2E_USER): Promise<string> {
   const res = await request.post(KC_TOKEN_URL, {
     form: { grant_type: "password", client_id: "orbeat-cli", username: user, password: pass },
   });
@@ -161,7 +176,7 @@ test.describe("role deletion cascades to its grants (real API + real browser)", 
     artifactEntitlementId = ((await artEntRes.json()) as { id: string }).id;
 
     // --- Delete the role through the real browser. ---
-    await login(page, "boss", "boss");
+    await login(page, E2E_USER, E2E_USER);
     await gotoAdmin(page, "Roles");
 
     const row = page.locator("li", { hasText: ROLE_NAME });
@@ -218,5 +233,118 @@ test.describe("role deletion cascades to its grants (real API + real browser)", 
       { headers },
     );
     expect(artEntGone.status(), "the artifact entitlement survived the role deletion").toBe(404);
+  });
+});
+
+// Role rename (docs/plans/orbeat-role-rename-2026-08-27.md Task 6).
+//
+// deploy/docker-compose.yml -- the stack this suite runs against -- sets no
+// ORBEAT_DCR_CLIENT_ID on the api service (grep confirmed before writing
+// this: only deploy/docker-compose.prod.yml references that variable, and
+// there it defaults to empty too), so Server.roleExists is nil and
+// handleUpdateRole (internal/api/admin_roles.go) takes the ASSERTION path,
+// never the realm-role lookup -- exactly TestUpdateRoleAssertionPathRenames
+// WhenNoLookupConfigured's server-side baseline. That is what this spec
+// exercises: Save with no assertion must 400 with idpAssertionRequiredCode,
+// the portal must render the checkbox in response to THAT wire event (not a
+// mock), and ticking it and resubmitting must actually rename the role in
+// the real database -- verified by a follow-up real API call, independent of
+// whatever the browser now shows, for the same reason the deletion spec
+// above re-checks via the API rather than trusting the DOM.
+const RENAME_ROLE_NAME = `${RUN}-rename`;
+const RENAMED_ROLE_NAME = `${RUN}-renamed`;
+
+test.describe("role rename requires the operator's IdP assertion (real API + real browser)", () => {
+  let renameRoleId = "";
+
+  test.afterEach(async ({ request }) => {
+    if (!renameRoleId) return;
+    const token = await adminToken(request);
+    await request.delete(`${API_BASE}/v1/admin/roles/${renameRoleId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    renameRoleId = "";
+  });
+
+  test("renaming through the portal 400s without the assertion, then succeeds once the operator confirms it", async ({
+    page,
+    request,
+  }) => {
+    const token = await adminToken(request);
+    const headers = { Authorization: `Bearer ${token}` };
+
+    const roleRes = await request.post(`${API_BASE}/v1/admin/roles`, {
+      headers,
+      data: { name: RENAME_ROLE_NAME },
+    });
+    expect(roleRes.ok(), `create role: ${roleRes.status()} ${await roleRes.text()}`).toBeTruthy();
+    renameRoleId = ((await roleRes.json()) as { id: string }).id;
+
+    await login(page, E2E_USER, E2E_USER);
+    await gotoAdmin(page, "Roles");
+
+    const row = page.locator("li", { hasText: RENAME_ROLE_NAME });
+    await expect(row).toBeVisible();
+
+    // exact:true, scoped to the row: the same substring-collision guard the
+    // deletion spec above documents (Playwright's getByRole name match is
+    // substring by default, and RENAME_ROLE_NAME/RENAMED_ROLE_NAME share a
+    // prefix by construction).
+    await row.getByRole("button", { name: `Rename ${RENAME_ROLE_NAME}`, exact: true }).click();
+
+    // From here on, locators are PAGE-scoped, not row-scoped: `hasText`
+    // filters on textContent, which never includes an <input>'s value -- the
+    // instant the row switches into its edit <form>, the role's name lives
+    // only in the input's value/aria-label, not in any text node, so a
+    // `row` locator built on `hasText: RENAME_ROLE_NAME` stops resolving to
+    // anything at all (reproduced live: `nameInput.fill()` timed out for
+    // exactly this reason). Page-scoped is safe here because this test
+    // seeds exactly one role, so exactly one edit form ever exists at a
+    // time -- unlike the deletion spec above, there is no sibling row to
+    // disambiguate against.
+    const nameInput = page.getByRole("textbox", { name: `New name for ${RENAME_ROLE_NAME}`, exact: true });
+    await nameInput.fill(RENAMED_ROLE_NAME);
+
+    // First Save: no assertion has been made yet (the checkbox does not even
+    // exist), so the real API must refuse with the machine-readable code --
+    // this is the wire round trip no mocked-fetch unit test can prove.
+    const firstPut = page.waitForResponse(
+      (r) => r.request().method() === "PUT" && r.url() === `${API_BASE}/v1/admin/roles/${renameRoleId}`,
+    );
+    await page.getByRole("button", { name: /^save$/i }).click();
+    const firstRes = await firstPut;
+    expect(firstRes.status(), "the first submit must be refused without an assertion").toBe(400);
+    const firstBody = (await firstRes.json()) as { code?: string };
+    expect(firstBody.code).toBe("idp_rename_assertion_required");
+
+    const checkbox = page.getByRole("checkbox");
+    await expect(checkbox).toBeVisible();
+    await expect(checkbox).not.toBeChecked();
+    await expect(page.getByText(/orbeat matches roles to the identity provider by name/i)).toBeVisible();
+
+    // The role must NOT have been renamed by the refused attempt.
+    const stillOldName = await request.get(`${API_BASE}/v1/admin/roles`, { headers });
+    const stillOldBody = (await stillOldName.json()) as { roles: { id: string; name: string }[] };
+    expect(stillOldBody.roles.find((r) => r.id === renameRoleId)?.name).toBe(RENAME_ROLE_NAME);
+
+    await checkbox.check();
+    await expect(checkbox).toBeChecked();
+
+    const secondPut = page.waitForResponse(
+      (r) => r.request().method() === "PUT" && r.url() === `${API_BASE}/v1/admin/roles/${renameRoleId}`,
+    );
+    await page.getByRole("button", { name: /^save$/i }).click();
+    const secondRes = await secondPut;
+    expect(secondRes.status(), "the confirmed resubmit must succeed").toBe(200);
+
+    // The edit form closes and the row shows the new name. Back to a plain
+    // display row, `hasText` is valid again (the name is real text once more).
+    await expect(page.locator("li", { hasText: RENAMED_ROLE_NAME })).toBeVisible();
+    await expect(page.getByRole("textbox", { name: /new name for/i })).toHaveCount(0);
+
+    // Decisive assertion via the real API, independent of the browser.
+    const finalGet = await request.get(`${API_BASE}/v1/admin/roles`, { headers });
+    const finalBody = (await finalGet.json()) as { roles: { id: string; name: string }[] };
+    expect(finalBody.roles.find((r) => r.id === renameRoleId)?.name).toBe(RENAMED_ROLE_NAME);
   });
 });

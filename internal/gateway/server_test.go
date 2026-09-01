@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +56,20 @@ import (
 // the same constant our own session cache uses for its max-age eviction —
 // not merely "some nonzero value" that could independently drift from it
 // (design §3).
+//
+// It also pins THE OTHER HALF of that coupling, which two comments cited this
+// test for while it did not actually assert it (found in review, 2026-08-29).
+// sessionCache.tombstoneHorizon is computed from the CACHE's maxAge, not from
+// the Server field above, and the A1 argument is that a tombstoned
+// Mcp-Session-Id should not be forgotten while the SDK may still be holding
+// the transport session behind it -- a DIAGNOSTIC bound since 2026-08-30, not
+// a safety one: withSession refuses an id it holds no binding for, so
+// forgetting a tombstone costs the 404's stated cause and nothing else.
+// Changing New()'s newSessionCache call to
+// newSessionCache(sessionTTL, sessionMaxAge/4, metrics) left the entire
+// internal/gateway package green while quartering that horizon. The reap
+// interval matters for the same argument (the sweep runs up to one ttl/2 tick
+// late), so ttl is pinned here too.
 func TestServerSessionTransportTimeoutFieldMatchesSessionMaxAge(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.New(ctx, gwDSN)
@@ -68,12 +84,18 @@ func TestServerSessionTransportTimeoutFieldMatchesSessionMaxAge(t *testing.T) {
 	if srv.sessionTransportTimeout != sessionMaxAge {
 		t.Fatalf("sessionTransportTimeout = %v, want sessionMaxAge (%v)", srv.sessionTransportTimeout, sessionMaxAge)
 	}
+	if srv.sessions.maxAge != sessionMaxAge {
+		t.Fatalf("sessions.maxAge = %v, want sessionMaxAge (%v): tombstoneHorizon reads THIS value, not sessionTransportTimeout, so how long a 404 can still name its cause depends on it", srv.sessions.maxAge, sessionMaxAge)
+	}
+	if srv.sessions.ttl != sessionTTL {
+		t.Fatalf("sessions.ttl = %v, want sessionTTL (%v): the reap interval is ttl/2, and the sweep-runs-one-tick-late slack in tombstoneHorizon's argument is bounded by it", srv.sessions.ttl, sessionTTL)
+	}
 }
 
 // TestHandlerActuallyReclaimsIdleTransportSessions drives a REAL MCP session
 // end to end through Handler() and proves the SDK's own transport session
 // (go-sdk@v1.7.0 mcp/streamable.go's h.sessions, keyed by MCP session id —
-// distinct from our own subject-keyed sessionCache) is torn down once it
+// distinct from our own per-principal sessionCache) is torn down once it
 // sits idle past sessionTransportTimeout. This is the actual mechanism that
 // closes design §2's leak: before this slice, idle SDK transport sessions
 // were resident until process restart, unconditionally.
@@ -139,5 +161,43 @@ func TestHandlerActuallyReclaimsIdleTransportSessions(t *testing.T) {
 	}
 	if !errors.Is(err, mcp.ErrSessionMissing) {
 		t.Fatalf("second ListTools err = %v, want it to wrap mcp.ErrSessionMissing (go-sdk's §2.5.3 404-on-terminated-session signal)", err)
+	}
+
+	// AND PROVE THAT 404 CAME FROM THE SDK RATHER THAN FROM US. Since the A1
+	// binding fix, withSession writes its OWN 404 for a transport session whose
+	// gateway session was reclaimed, and the SDK client maps both 404s to
+	// mcp.ErrSessionMissing -- so the assertion above, alone, would pass
+	// whether or not the SDK ever reclaimed anything. (It genuinely does today:
+	// this Server's cache carries the full sessionMaxAge while the test runs
+	// for under a second, so no gateway session is ever evicted. The gate
+	// closes the false green before it can open, it does not fix a live one.)
+	//
+	// The two are told apart by sessionRebuiltHeader: the gateway's 404 always
+	// carries it, the SDK's own "session not found" never does. Replaying the
+	// id by hand is the only vantage point -- the SDK client surfaces the
+	// error, never the response headers.
+	sid := cs.ID()
+	if sid == "" {
+		t.Fatal("client session reported no Mcp-Session-Id, so the replay below cannot address the reclaimed transport session")
+	}
+	replay, err := http.NewRequestWithContext(ctx, http.MethodPost, httpSrv.URL+"/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatalf("build replay request: %v", err)
+	}
+	replay.Header.Set("Authorization", "Bearer dana-tok")
+	replay.Header.Set("Content-Type", "application/json")
+	replay.Header.Set("Accept", "application/json, text/event-stream")
+	replay.Header.Set(mcpSessionIDHeader, sid)
+	resp, err := http.DefaultClient.Do(replay)
+	if err != nil {
+		t.Fatalf("replay the reclaimed Mcp-Session-Id: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("replayed Mcp-Session-Id got status %d, want 404", resp.StatusCode)
+	}
+	if marker := resp.Header.Get(sessionRebuiltHeader); marker != "" {
+		t.Fatalf("replayed Mcp-Session-Id got a 404 carrying %s: %q -- that 404 was written by withSession's binding check, so this test proves nothing about the SDK reclaiming an idle transport session", sessionRebuiltHeader, marker)
 	}
 }

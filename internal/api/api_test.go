@@ -18,15 +18,15 @@ import (
 	"github.com/stefanocalabrese/orbeat-community/internal/store"
 )
 
-// TestMaxBytesMiddlewareCapsPostAndPutBodies proves maxBytesMiddleware ITSELF
-// (called directly, not through Handler()) caps a POST/PUT body at
+// TestMaxBytesMiddlewareCapsPostPutPatchBodies proves maxBytesMiddleware ITSELF
+// (called directly, not through Handler()) caps a POST/PUT/PATCH body at
 // maxRequestBodyBytes: reading past the cap surfaces *http.MaxBytesError to
 // the downstream handler (which decodeJSONOrFail maps to 413). It says
 // nothing about whether Handler() actually wires this middleware into its
 // chain — that is TestMaxBytesMiddlewareWiredIntoHandlerCapsAdminPost below,
 // which drives the real router end-to-end.
-func TestMaxBytesMiddlewareCapsPostAndPutBodies(t *testing.T) {
-	for _, method := range []string{http.MethodPost, http.MethodPut} {
+func TestMaxBytesMiddlewareCapsPostPutPatchBodies(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
 		t.Run(method, func(t *testing.T) {
 			var gotErr error
 			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +48,7 @@ func TestMaxBytesMiddlewareCapsPostAndPutBodies(t *testing.T) {
 }
 
 // TestMaxBytesMiddlewareLeavesGETBodyUnbounded proves the cap is scoped to
-// mutating methods (per the audit's B3 fix description): a GET body larger
+// mutating methods (per the audit's B4 fix description): a GET body larger
 // than the cap still reads in full, unaffected.
 func TestMaxBytesMiddlewareLeavesGETBodyUnbounded(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +72,7 @@ func TestMaxBytesMiddlewareLeavesGETBodyUnbounded(t *testing.T) {
 // maxBytesMiddleware -> mux, api.go:262) end-to-end: a real RS256 admin
 // token through RequireAuth -> RequireRole -> resolver.Middleware into
 // handleCreateServer, whose decodeJSONOrFail maps *http.MaxBytesError to 413
-// (admin_servers.go:85-96). Unlike TestMaxBytesMiddlewareCapsPostAndPutBodies
+// (admin_servers.go:85-96). Unlike TestMaxBytesMiddlewareCapsPostPutPatchBodies
 // above (which calls maxBytesMiddleware directly and proves nothing about
 // Handler()'s wiring), this is the test in the package that fails if
 // maxBytesMiddleware(mux) is ever dropped from that chain.
@@ -111,5 +111,26 @@ func TestMaxBytesMiddlewareWiredIntoHandlerCapsAdminPost(t *testing.T) {
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized POST through the real Handler() = %d, want 413, body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestMaxBytesMiddlewareCapsPatchBodies proves maxBytesMiddleware caps a PATCH body at
+// maxRequestBodyBytes, returning *http.MaxBytesError when read past the cap. This is the
+// audit B4 fix: PATCH /scim/v2/Users/{id} must be bounded the same way POST/PUT are.
+func TestMaxBytesMiddlewareCapsPatchBodies(t *testing.T) {
+	var gotErr error
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, gotErr = io.ReadAll(r.Body)
+	})
+	h := maxBytesMiddleware(next)
+
+	big := bytes.Repeat([]byte("a"), maxRequestBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPatch, "/x", bytes.NewReader(big))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	var maxErr *http.MaxBytesError
+	if !errors.As(gotErr, &maxErr) {
+		t.Fatalf("want *http.MaxBytesError reading an oversized PATCH body, got %v", gotErr)
 	}
 }

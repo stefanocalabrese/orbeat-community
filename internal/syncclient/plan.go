@@ -50,7 +50,7 @@ func (p *Plan) recordRemove(path string) {
 // "this section never ran" (the real, non-planning path). A non-nil Plan
 // always yields a non-nil slice, even with zero recorded changes, so callers
 // can distinguish "did not run" from "ran and changed nothing" — the same
-// nil-vs-empty convention strs() applies in cmd/sync/outcome.go.
+// nil-vs-empty convention strs() applies in cmd/orbeat-sync/outcome.go.
 func (p *Plan) Changes() []Change {
 	if p == nil {
 		return nil

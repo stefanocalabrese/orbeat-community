@@ -9,9 +9,21 @@
 # <resource>/.well-known/oauth-protected-resource and serves /mcp + the
 # well-known at its origin ROOT — under a /mcp path prefix the discovery URL
 # would 404 and MCP OAuth could not complete).
+# The api serves THREE path spaces, not one, and every one of them needs its own
+# matcher here: a path that matches none of them falls through to the portal's
+# SPA fallback, which answers 200 with index.html for any path containing no dot
+# (cmd/portal/main.go), so a missing route reads as a working endpoint serving
+# HTML, not as a 404. /healthz is deliberately NOT routed to the api: the portal
+# serves its own, each container is probed on its own port inside the compose
+# network, and a public /healthz answering for the api rather than for the thing
+# the browser talks to would be the misleading one. Derived and gated by
+# internal/deploy.TestApexRoutesEveryAPIPathToTheAPI, which reads the route table
+# out of internal/api's own source (audit A11).
 {$ORBEAT_DOMAIN} {
-	reverse_proxy /v1/*  api:8080
-	reverse_proxy *      portal:8081
+	reverse_proxy /v1/*         api:8080
+	reverse_proxy /scim/v2/*    api:8080
+	reverse_proxy /openapi.yaml api:8080
+	reverse_proxy *             portal:8081
 }
 
 auth.{$ORBEAT_DOMAIN} {

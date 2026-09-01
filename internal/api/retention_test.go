@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-func TestPruneAuditOnce(t *testing.T) {
+// TestPruneOnceComputesTheCutoff covers the cutoff arithmetic both retention
+// loops share (runRetention is the only caller of pruneOnce, for either
+// subject), which is why the helper is no longer named for audit alone.
+func TestPruneOnceComputesTheCutoff(t *testing.T) {
 	var gotCutoff time.Time
 	var gotBatch int
 	prune := func(ctx context.Context, cutoff time.Time, batch int) (int64, error) {
@@ -16,7 +19,7 @@ func TestPruneAuditOnce(t *testing.T) {
 		return 3, nil
 	}
 	before := time.Now().Add(-30 * 24 * time.Hour)
-	n, err := pruneAuditOnce(context.Background(), prune, 30, 500)
+	n, err := pruneOnce(context.Background(), prune, 30, 500)
 	after := time.Now().Add(-30 * 24 * time.Hour)
 	if err != nil || n != 3 {
 		t.Fatalf("n=%d err=%v, want 3,nil", n, err)

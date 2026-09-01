@@ -28,6 +28,57 @@ func TestFailMapsConstraintViolations(t *testing.T) {
 	}
 }
 
+// TestFailSeparatesTheApprovedIdentityDuplicate pins fail()'s floor arm for a
+// 23505 against store.ApprovedIdentityUniqueIndex, and the control that keeps
+// it a SPLIT rather than a rename of the generic one.
+//
+// Both cases are 409, so the status can prove nothing here; the sentences are
+// the whole assertion. And the two must stay different: "already exists" is
+// true of a live-namespace duplicate and false of this one, where the name IS
+// free everywhere the admin can see it.
+//
+// This lives in an ordinary _test.go, unlike the handler gates, because the
+// arm itself is shared code. respond.go compiles into a generated Community
+// tree, where a Community admin can reach SetArtifactApproved through
+// auto-approve with no handler arm in front of it.
+func TestFailSeparatesTheApprovedIdentityDuplicate(t *testing.T) {
+	body := func(err error) (int, string) {
+		rec := httptest.NewRecorder()
+		fail(rec, err)
+		var b struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if e := json.Unmarshal(rec.Body.Bytes(), &b); e != nil {
+			t.Fatalf("decode %q: %v", rec.Body.String(), e)
+		}
+		return rec.Code, b.Error.Message
+	}
+
+	code, msg := body(&pgconn.PgError{Code: "23505", ConstraintName: store.ApprovedIdentityUniqueIndex})
+	if code != http.StatusConflict {
+		t.Fatalf("approved-identity duplicate = %d, want 409", code)
+	}
+	if msg != approvedIdentityTaken {
+		t.Fatalf("approved-identity duplicate says %q, want %q", msg, approvedIdentityTaken)
+	}
+
+	// The control. A duplicate on any other constraint (the live
+	// UNIQUE (tenant_id, type, name) from 00003, a role name, a server name)
+	// must keep the generic sentence.
+	if code, msg = body(&pgconn.PgError{Code: "23505", ConstraintName: "artifact_tenant_id_type_name_key"}); code != http.StatusConflict || msg != "already exists" {
+		t.Fatalf("a duplicate on another constraint = %d %q, want 409 \"already exists\"", code, msg)
+	}
+
+	// A handler that knows which pair collided wins over the floor: fail()
+	// matches conflictError before it ever reaches the pg arms, which is what
+	// lets denyApprovedIdentityConflict name the holder.
+	if code, msg = body(conflictError{"artifact \"bar\" already distributes as skill/foo"}); code != http.StatusConflict || msg != "artifact \"bar\" already distributes as skill/foo" {
+		t.Fatalf("conflictError = %d %q, want the handler's own sentence", code, msg)
+	}
+}
+
 // TestFailMapsPreconditionErrors pins that fail()'s two new arms
 // (preconditionRequiredError, versionMismatchError) — plus the pre-existing
 // store.ErrVersionMismatch sentinel — land on the right status, and that

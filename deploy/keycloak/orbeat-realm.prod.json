@@ -1,7 +1,7 @@
 {
   "realm": "orbeat",
   "enabled": true,
-  "displayName": "orbeat (production template — pre-provision clients per docs/runbooks/phase1-acceptance.md)",
+  "displayName": "orbeat (production template \u2014 pre-provision clients per docs/runbooks/phase1-acceptance.md)",
   "bruteForceProtected": true,
   "accessTokenLifespan": 300,
   "ssoSessionIdleTimeout": 1800,
@@ -13,9 +13,30 @@
       },
       {
         "name": "orbeat-user"
+      },
+      {
+        "name": "orbeat-artifact-manager",
+        "description": "May create, submit, approve and distribute artifacts without being an orbeat-admin. Separation of duties still applies: an approver may not be the submitter."
+      },
+      {
+        "name": "orbeat-artifact-autoapprove",
+        "description": "Trusted author: this person's artifact submissions are approved on submit, with no second reviewer. A deliberate per-person exemption from separation of duties; the scanner still blocks unsafe content."
       }
     ]
   },
+  "users": [
+    {
+      "username": "service-account-orbeat-dcr",
+      "enabled": true,
+      "serviceAccountClientId": "orbeat-dcr",
+      "clientRoles": {
+        "realm-management": [
+          "create-client",
+          "view-realm"
+        ]
+      }
+    }
+  ],
   "clients": [
     {
       "clientId": "orbeat-api",
@@ -38,7 +59,7 @@
       "clientId": "orbeat-cli",
       "enabled": true,
       "publicClient": true,
-      "directAccessGrantsEnabled": true,
+      "directAccessGrantsEnabled": false,
       "attributes": {
         "oauth2.device.authorization.grant.enabled": "true"
       },
@@ -63,7 +84,13 @@
             "id.token.claim": "false"
           }
         }
-      ]
+      ],
+      "standardFlowEnabled": true,
+      "redirectUris": [
+        "http://127.0.0.1/orbeat/callback",
+        "http://127.0.0.1:*/orbeat/callback"
+      ],
+      "webOrigins": []
     },
     {
       "clientId": "orbeat-portal",
@@ -71,13 +98,21 @@
       "publicClient": true,
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
+      "defaultClientScopes": [
+        "role_list",
+        "saml_organization",
+        "profile",
+        "email",
+        "roles",
+        "web-origins",
+        "acr",
+        "basic"
+      ],
       "redirectUris": [
-        "http://localhost:8081/*",
-        "http://localhost:5173/*"
+        "https://${ORBEAT_DOMAIN}/*"
       ],
       "webOrigins": [
-        "http://localhost:8081",
-        "http://localhost:5173"
+        "https://${ORBEAT_DOMAIN}"
       ],
       "attributes": {
         "pkce.code.challenge.method": "S256"
@@ -94,6 +129,16 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "orbeat-dcr",
+      "description": "Service account orbeat-api uses for virtual-key DCR and for the role-rename realm-role check. Holds create-client and view-realm. Secret generated on import: see docs/runbooks/production-deployment.md.",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "bearerOnly": false
     }
   ],
   "clientScopes": [

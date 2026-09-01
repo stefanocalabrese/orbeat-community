@@ -3,6 +3,7 @@ package syncclient
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,12 +32,18 @@ func renderSeedBlock(name, body string) string {
 }
 
 // seedBlockRe matches the whole managed block for name, capturing the hash
-// from the BEGIN marker in group 1. The trailing space after BEGIN <name> and
-// the " -->" after END <name> prevent prefix collisions (a block for "rev"
-// never matches a merge for "rev-two").
+// from the BEGIN marker in group 1 and the block BODY the hash attests in
+// group 2. The trailing space after BEGIN <name> and the " -->" after
+// END <name> prevent prefix collisions (a block for "rev" never matches a
+// merge for "rev-two").
+//
+// Group 2 exists so mergeSeed can re-hash what is actually on disk. Group 2
+// runs to the END marker and therefore includes the newline renderSeedBlock
+// puts between the body and that marker; seedHash trims trailing newlines, so
+// seedHash(group 2) equals seedHash(the body that was written).
 func seedBlockRe(name string) *regexp.Regexp {
 	q := regexp.QuoteMeta(name)
-	return regexp.MustCompile(`(?s)<!-- ORBEAT-SEED:BEGIN ` + q + ` sha=([0-9a-f]{12}) [^\n]*\n.*?<!-- ORBEAT-SEED:END ` + q + ` -->\n?`)
+	return regexp.MustCompile(`(?s)<!-- ORBEAT-SEED:BEGIN ` + q + ` sha=([0-9a-f]{12}) [^\n]*\n(.*?)<!-- ORBEAT-SEED:END ` + q + ` -->\n?`)
 }
 
 // seedBeginRe/seedEndRe are the per-name marker-only patterns backing
@@ -67,20 +74,42 @@ func seedMarkersHealthy(existing, name string) bool {
 
 // mergeSeed returns content with the governed block for name set to body.
 // changed=false means the existing block's BEGIN marker already carries the
-// exact hash of body (it is then left exactly where it sits — a no-op stays a
-// no-op; the comparison is against the captured hash group, not a substring
-// search, so a body that happens to contain a matching " sha=<hash> " token
-// cannot be mistaken for the real marker). On change, any existing block is
-// removed and the new one is hoisted to the top so it lands within Claude
-// Code's first-200-lines auto-load window (spec §7.2). Dropping the old block
-// can leave a blank-line run at the removal seam; that run collapses via the
+// exact hash of body AND the body under that marker still hashes to it (the
+// block is then left exactly where it sits, a no-op stays a no-op; the
+// comparison is against the captured hash group, not a substring search, so a
+// body that happens to contain a matching " sha=<hash> " token cannot be
+// mistaken for the real marker). On change, any existing block is removed and
+// the new one is hoisted to the top so it lands within Claude Code's
+// first-200-lines auto-load window (spec §7.2). Dropping the old block can
+// leave a blank-line run at the removal seam; that run collapses via the
 // TrimLeft below when the new block is re-hoisted (intentional — it's what
 // keeps the re-hoist tests byte-exact).
-func mergeSeed(existing, name, body string) (string, bool) {
+//
+// restored reports that the block found on disk did NOT hash to the sha
+// written into its own BEGIN marker, so this merge overwrote an edited
+// governed body. It is A8: until this check existed, "unchanged" was decided
+// by comparing the marker's claim about the body against the hash of the
+// desired body, and nothing ever re-hashed the body itself. A developer who
+// edited "NEVER force-push" to "force-push is fine" inside the block and left
+// the marker line alone kept that edit through every subsequent sync, which
+// reported unchanged=1 and no warning. A hash written into the file it
+// attests and never checked is not tamper evidence.
+//
+// restored is a property of the FILE, not of the desired content: it is true
+// whenever body-under-marker and marker disagree, whatever the server is
+// serving this run. That is deliberate, because the two live cases the
+// developer needs to hear about are exactly (a) the desired body is unchanged
+// and the on-disk one was edited, which used to be silent, and (b) both moved,
+// where the edit is discarded by an ordinary update that would otherwise say
+// nothing either. restored always implies changed: a body disagreeing with its
+// marker cannot be left alone, since leaving it would leave the lie in place.
+func mergeSeed(existing, name, body string) (merged string, changed bool, restored bool) {
 	block := renderSeedBlock(name, body)
 	if loc := seedBlockRe(name).FindStringSubmatchIndex(existing); loc != nil {
-		if existing[loc[2]:loc[3]] == seedHash(body) {
-			return existing, false
+		markerHash := existing[loc[2]:loc[3]]
+		restored = seedHash(existing[loc[4]:loc[5]]) != markerHash
+		if !restored && markerHash == seedHash(body) {
+			return existing, false, false
 		}
 		// Drop the block plus any leading blank-line gap it leaves behind in
 		// the suffix, so a mid-file block doesn't leave the prefix's own
@@ -89,9 +118,9 @@ func mergeSeed(existing, name, body string) (string, bool) {
 	}
 	rest := strings.TrimLeft(existing, "\n")
 	if rest == "" {
-		return block, true
+		return block, true, restored
 	}
-	return block + "\n" + rest, true
+	return block + "\n" + rest, true, restored
 }
 
 // stripSeed removes the governed block for name (de-entitlement); the agent's
@@ -120,6 +149,17 @@ func seedNamesIn(content string) []string {
 }
 
 // SeedResult summarizes the seed pass of a sync run.
+//
+// There is deliberately no Applied slice here, unlike ReconcileResult and
+// RulesResult. A seed rides its subagent artifact rather than being one: this
+// pass only ever looks at artifacts with Type "subagent" and a non-empty
+// MemorySeed, and "subagent" is in fileBackedTypes, so every seed-carrying
+// artifact is already judged applied-or-not by Reconcile. A second source for
+// the same artifact id could only make the union LESS truthful, because the
+// two disagree on a live path: a subagent whose agent file hit an
+// unmanaged-name collision was not applied, yet its MEMORY.md still merges
+// here, so a seed-sourced entry would claim a revision whose agent body never
+// reached the disk.
 type SeedResult struct {
 	Written, Unchanged, Stripped int
 	Warnings                     []string
@@ -285,7 +325,7 @@ func ReconcileSeeds(claudeDir string, projects []string, artifacts []Artifact, p
 			newSeeds[tg.name] = append(newSeeds[tg.name], tg.path)
 			continue
 		}
-		merged, changed := mergeSeed(existing, tg.name, tg.body)
+		merged, changed, restored := mergeSeed(existing, tg.name, tg.body)
 		if changed {
 			if err := r.writeAtomic(tg.path, []byte(merged), r.existingPerm(tg.path, 0o644)); err != nil {
 				res.Failures = append(res.Failures, fmt.Sprintf("%s: seed: write: %v", tg.path, err))
@@ -296,19 +336,88 @@ func ReconcileSeeds(claudeDir string, projects []string, artifacts []Artifact, p
 		} else {
 			res.Unchanged++
 		}
+		// Reported AFTER the write, so a run that failed to write claims no
+		// restoration. That ordering is the ONLY thing holding the property here,
+		// since the `continue` above is what keeps a failed target out of this
+		// line, so it is gated: TestAFailedWriteClaimsNoRestoration/seed hoists
+		// this block above the write and gets the notice against a file the run
+		// never touched.
+		//
+		// A warning is owed here even though the file-backed reconciler rewrites
+		// a tampered SKILL.md in silence: a SKILL.md belongs to orbeat end to
+		// end, while MEMORY.md belongs to the developer and the marker this
+		// client writes into it says "edit BELOW this block". Losing an edit made
+		// inside the block is a real loss, and the same mismatch is the only
+		// evidence that a governed instruction was altered on this machine. It is
+		// a warning and not a failure because the desired content IS on disk now:
+		// nothing needs retrying.
+		//
+		// The wording stops at the mismatch. Body and marker are both on the
+		// developer's disk and this client re-hashes only the body, so it knows
+		// they disagree and cannot know which side moved: editing the sha in the
+		// BEGIN marker produces exactly the same signal as editing the text under
+		// it. Claiming "the body was edited" would name a culprit off a
+		// measurement that does not distinguish them.
+		if restored {
+			res.Warnings = append(res.Warnings, fmt.Sprintf(
+				"the ORBEAT-SEED block for %q in %s no longer matches the sha in its own marker, so the block was edited after orbeat-sync wrote it (the body, the marker line, or both); orbeat-sync restored the governed content", tg.name, tg.path))
+		}
 		newSeeds[tg.name] = append(newSeeds[tg.name], tg.path)
 	}
 
-	// Strip pass: candidates = ledger paths (covers unregistered projects) ∪
-	// a scan of the currently managed roots (covers hand-copied files). Each
-	// candidate carries the containment boundary its strip must route through
-	// (claudeDir for user scope, the project root otherwise — see seedBoundary).
+	// Strip pass: candidates = ledger paths ∪ a scan of the currently managed
+	// roots (covers hand-copied files). Each candidate carries the containment
+	// boundary its strip routes through, and that boundary is chosen from the
+	// roots THIS RUN was handed, never derived from the ledger path: the
+	// manifest is untrusted input (its own file is what a tamper edits), and a
+	// root derived from an untrusted path is an ancestor of it, which rooted.rel
+	// accepts by construction. See trustedSeedBoundary.
+	//
+	// A ledger path under none of those roots is therefore skipped rather than
+	// stripped. That is a deliberate narrowing: the candidate set used to reach
+	// into unregistered projects, and it no longer does. `orbeat-sync project
+	// remove` (StripProjectSeeds) is the supported way to clean a project up,
+	// and it runs against the root the user names, not against one guessed from
+	// a path.
+	cleanClaudeDir := filepath.Clean(claudeDir)
+	trusted := make([]string, 0, len(projects)+1)
+	trusted = append(trusted, cleanClaudeDir)
+	for _, proj := range projects {
+		trusted = append(trusted, filepath.Clean(proj))
+	}
 	candidates := map[string]string{} // path -> boundary
+	warnedUntrusted := map[string]bool{}
 	for _, paths := range m.Seeds {
 		for _, p := range paths {
-			if validSeedPath(p) {
-				candidates[p] = seedBoundary(claudeDir, p)
+			if !validSeedPath(p) {
+				continue
 			}
+			boundary, ok := trustedSeedBoundary(trusted, p)
+			if !ok {
+				// PRESERVED in the ledger, not dropped, and the argument is
+				// the v1.15.0 cost asymmetry rather than symmetry with the
+				// other skips. This run did not verify the block is gone, and
+				// the fs-scan below is not a substitute for the entry: it
+				// walks <claudeDir>/agent-memory and <proj>/.claude/agent-memory
+				// only, while validSeedPath accepts an agent-memory tree
+				// ANYWHERE under a root, so for those paths the ledger is the
+				// only route back. Over-recording costs one stale line that
+				// drops out by itself on the first run whose roots contain the
+				// path (the strip runs, nothing marks it failed, the
+				// preservation loop below does not re-add it); under-recording
+				// leaves a governed block on a developer's disk permanently.
+				// Preserving re-arms nothing either: the trusted-root match is
+				// re-decided every run, so the entry stays inert until a root
+				// the user registered contains it.
+				if !warnedUntrusted[p] {
+					warnedUntrusted[p] = true
+					res.Warnings = append(res.Warnings, fmt.Sprintf(
+						"sync ledger entry %s is under neither the sync root nor any registered project; skipped, orbeat-sync will not touch it", p))
+				}
+				failedPaths[p] = true
+				continue
+			}
+			candidates[p] = boundary
 		}
 	}
 	for _, p := range scanSeedFiles(filepath.Join(claudeDir, "agent-memory")) {
@@ -319,7 +428,6 @@ func ReconcileSeeds(claudeDir string, projects []string, artifacts []Artifact, p
 			candidates[p] = filepath.Clean(proj)
 		}
 	}
-	cleanClaudeDir := filepath.Clean(claudeDir)
 	warnedUnreachable := map[string]bool{}
 	for p, boundary := range candidates {
 		if failedPaths[p] {
@@ -495,6 +603,17 @@ func StripProjectSeeds(claudeDir, proj string) (int, error) {
 	// may still be on disk; a later run after manual repair must retry it),
 	// unlike a healthy path's entry, which "project remove" always forgets.
 	malformed := map[string]bool{}
+	// failed tracks paths a plain I/O error blocked from stripping (B24: "one
+	// unreadable MEMORY.md during project remove"). Its ledger entry must
+	// survive the removal below for the identical reason `malformed`'s does —
+	// the block may still be on disk, so a later run must retry it — but it is
+	// tracked separately because the two causes get different treatment
+	// upstream: a caller sees this via the returned error (a malformed marker
+	// never errors StripProjectSeeds; a per-candidate I/O failure does, via
+	// errors.Join below), which is what RemoveProject's own caller (B24) relies
+	// on to decide it must NOT de-register the project yet.
+	failed := map[string]bool{}
+	var errs []error
 	// S2 containment: strip through a root opened at proj. A gone project dir
 	// (openRootedOptional → !ok) means nothing to strip — the ledger cleanup
 	// below then drops every proj-prefixed entry, exactly as before.
@@ -504,10 +623,19 @@ func StripProjectSeeds(claudeDir, proj string) (int, error) {
 	}
 	if ok {
 		defer r.Close()
+		// ISOLATED PER CANDIDATE (B24): a genuinely unreadable MEMORY.md must
+		// not stop the strip for every OTHER candidate under this project, nor
+		// abandon the ledger/manifest save for the ones that DID succeed. The
+		// old code `return`ed on the FIRST candidate error, before ever
+		// reaching the ledger-cleanup + saveManifest below — so even a
+		// candidate whose block was already rewritten on disk kept a stale
+		// ledger entry, because the save that would have dropped it never ran.
 		for p := range candidates {
 			n, warnings, err := stripUndesired(r, p, nothingDesired)
 			if err != nil {
-				return stripped, err
+				errs = append(errs, fmt.Errorf("%s: %w", p, err))
+				failed[p] = true
+				continue
 			}
 			if len(warnings) > 0 {
 				malformed[p] = true
@@ -520,7 +648,7 @@ func StripProjectSeeds(claudeDir, proj string) (int, error) {
 		kept := make([]string, 0, len(paths))
 		for _, p := range paths {
 			if strings.HasPrefix(p, prefix) {
-				if malformed[p] {
+				if malformed[p] || failed[p] {
 					kept = append(kept, p)
 				}
 				continue
@@ -538,9 +666,9 @@ func StripProjectSeeds(claudeDir, proj string) (int, error) {
 		m.Seeds = nil
 	}
 	if err := saveManifest(claudeDir, m, nil); err != nil {
-		return stripped, err
+		errs = append(errs, err)
 	}
-	return stripped, nil
+	return stripped, errors.Join(errs...)
 }
 
 // stripUndesired removes every ORBEAT-SEED block at path whose (name, path) is
@@ -586,16 +714,54 @@ func stripUndesired(r *rooted, path string, desired map[string]bool) (stripped i
 	return stripped, warnings, nil
 }
 
-// seedBoundary returns the containment root a seed MEMORY.md path lives under.
-// User-scope seeds sit at <claudeDir>/agent-memory/<name>/MEMORY.md (under
-// claudeDir); project-scope at <proj>/.claude/agent-memory/<name>/MEMORY.md, so
-// the project root is four directories up (…/<name> → …/agent-memory → …/.claude
-// → <proj>). Called only for validSeedPath-shaped inputs. This assumes a real
-// project layout; a tampered manifest entry with a different shape yields a
-// mismatched boundary, which os.Root then rejects on the rel() check — the
-// boundary can only be narrower than the path, never wider, so a wrong guess
-// fails the operation rather than widening containment.
-func seedBoundary(claudeDir, p string) string {
+// trustedSeedBoundary picks the containment root for a seed MEMORY.md path out
+// of trusted: the cleaned roots THIS RUN was handed, claudeDir plus every
+// registered project root. ok=false means the path lies under none of them, and
+// the caller must then leave the file alone.
+//
+// The root can never be derived from the path itself, and that is the whole
+// point of this function. Any root computed by walking a path upwards is by
+// construction an ANCESTOR of that path, so rooted.rel, which refuses only a
+// relative result of ".." or "../...", accepts every such pairing: containment
+// becomes a check the untrusted input always passes. See seedProjectGuess for
+// the derivation that used to be used here and what it actually returns.
+//
+// The longest match wins, so a project registered underneath claudeDir strips
+// through its own root rather than through the wider one, which is also the
+// boundary the write pass already uses for that same target.
+func trustedSeedBoundary(trusted []string, p string) (string, bool) {
+	best := ""
+	for _, root := range trusted {
+		if p != root && !strings.HasPrefix(p, root+string(os.PathSeparator)) {
+			continue
+		}
+		if len(root) > len(best) {
+			best = root
+		}
+	}
+	return best, best != ""
+}
+
+// seedProjectGuess guesses, by shape alone, which project root a seed
+// MEMORY.md path belongs to. User-scope seeds sit at
+// <claudeDir>/agent-memory/<name>/MEMORY.md (under claudeDir); project-scope at
+// <proj>/.claude/agent-memory/<name>/MEMORY.md, so the project root is four
+// directories up (…/<name> → …/agent-memory → …/.claude → <proj>). Called only
+// for validSeedPath-shaped inputs.
+//
+// It is a guess, and it is NOT a containment root. It is derived from the path
+// it describes, so for any layout other than the two above it returns an
+// ANCESTOR of that path: /Users/bob/agent-memory/x/MEMORY.md yields /Users, and
+// /etc/agent-memory/x/MEMORY.md yields /. An os.Root opened there contains the
+// path by construction, so rooted.rel can never refuse the operation. An
+// earlier version of this comment claimed the reverse, that the boundary "can
+// only be narrower than the path, never wider", and ReconcileSeeds' strip pass
+// used the result as its containment root: a tampered manifest could then make
+// a sync strip an ORBEAT-SEED block out of a file under no registered project
+// at all. Containment roots come from trustedSeedBoundary. The only callers
+// left are doctor's reachability probes, which os.Stat the result and never
+// open, read or write through it.
+func seedProjectGuess(claudeDir, p string) string {
 	cd := filepath.Clean(claudeDir)
 	if p == cd || strings.HasPrefix(p, cd+string(os.PathSeparator)) {
 		return cd

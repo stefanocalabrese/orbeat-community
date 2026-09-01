@@ -155,7 +155,7 @@ func TestReconcileRulesLeafSymlinkRefused(t *testing.T) {
 	evil := filepath.Join(outside, "evil-agents.md")
 	mustSymlink(t, evil, filepath.Join(proj, "AGENTS.md")) // absolute → os.Root refuses it
 
-	res, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{
+	res, err := ReconcileRules(claudeDir, projs(proj), []Artifact{
 		{Type: "rule", Name: "std", Content: "RULE BODY"},
 	}, nil)
 

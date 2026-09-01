@@ -276,3 +276,98 @@ func TestSyncServesApprovedSnapshotOnly(t *testing.T) {
 		t.Fatalf("content must be approved snapshot: %q", got)
 	}
 }
+
+// TestSyncArtifactsCarryIDAndRevisionUnconditionally pins the prerequisite for
+// any deployment registry: a machine cannot report a version it was never
+// told. Until this slice, GET /v1/sync/artifacts handed a developer bytes, a
+// type and a name and nothing that identifies WHICH artifact or WHICH version
+// those bytes are, so the only handle the client held on what it had written
+// was the file path.
+//
+// Two properties, and the store-level parity gate
+// (store.TestBothDistributionQueriesShareOneScannedProjection) proves neither
+// of them:
+//
+//   - The values survive the store -> DTO -> JSON hop. handleSyncArtifacts
+//     builds syncArtifactDTO field by field, so a correct projection reaches a
+//     response missing both fields if that literal forgets them, and no store
+//     test can see it.
+//   - The keys are actually in the wire body. revision carries omitempty, so a
+//     projection that quietly reported 0 would produce a response with no
+//     revision key at all rather than a wrong number, which is why the
+//     assertion is on presence AND value.
+//
+// UNCONDITIONAL is what the file this test lives in proves: an ordinary
+// _test.go, copied verbatim into a generated Community tree by
+// internal/communitygen, where TestGenerateProducesTestableTree runs it on
+// every `go test ./...`. There is no edition in which these fields are absent.
+//
+// Approved THREE times on purpose. A fixture with one revision cannot tell
+// MAX(revision_num) from a literal 1, and the store gate already uses 2, so a
+// projection that had been mutated to satisfy that one still fails here.
+func TestSyncArtifactsCarryIDAndRevisionUnconditionally(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.New(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(s.Close)
+	tn, _ := s.GetOrCreateTenantByName(ctx, fmt.Sprintf("sync-ident-%d", time.Now().UnixNano()))
+	role, _ := s.CreateRole(ctx, tn.ID, "sec")
+
+	art, err := s.CreateArtifact(ctx, store.Artifact{
+		TenantID: tn.ID, Type: "skill", Name: "ident-skill",
+		Content: "---\nname: ident-skill\ndescription: d\n---\nBODY", Visibility: "role",
+	})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	if _, err := s.CreateArtifactEntitlement(ctx, store.ArtifactEntitlement{
+		TenantID: tn.ID, RoleID: role.ID, ArtifactID: art.ID,
+	}); err != nil {
+		t.Fatalf("entitle: %v", err)
+	}
+	const wantRevision = 3 // one revision appended per approval
+	for i := 0; i < wantRevision; i++ {
+		approveArtifact(t, s, tn.ID, art.ID)
+	}
+
+	srv := New(s, authz.NewResolver(s, tn.Name), nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/sync/artifacts", nil)
+	rc := authz.ResolvedContext{TenantID: tn.ID, UserID: "u1", RoleIDs: []string{role.ID}}
+	req = req.WithContext(authz.WithResolved(injectPrincipal(req.Context()), rc))
+	rec := httptest.NewRecorder()
+	srv.handleSyncArtifacts(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Artifacts []map[string]any `json:"artifacts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Artifacts) != 1 {
+		t.Fatalf("want exactly the entitled artifact, got %+v", body.Artifacts)
+	}
+	got := body.Artifacts[0]
+
+	rawID, ok := got["id"]
+	if !ok {
+		t.Fatalf("the response carries no id key at all: %+v", got)
+	}
+	if rawID != art.ID {
+		t.Errorf("id = %v, want the artifact's own id %q (an entitlement id or a name would pass a presence-only check)", rawID, art.ID)
+	}
+
+	rawRev, ok := got["revision"]
+	if !ok {
+		t.Fatalf("the response carries no revision key at all (omitempty drops a 0, so this is what a projection reporting nothing looks like on the wire): %+v", got)
+	}
+	// encoding/json decodes every JSON number into float64 through any.
+	if rev, isNum := rawRev.(float64); !isNum || int(rev) != wantRevision {
+		t.Errorf("revision = %v (%T), want %d: the DTO must carry MAX(revision_num) for the artifact, not a constant and not a count of anything else",
+			rawRev, rawRev, wantRevision)
+	}
+}

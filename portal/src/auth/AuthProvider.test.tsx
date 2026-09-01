@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { vi, test, expect, beforeEach } from "vitest";
 
 // `react-oidc-context`'s real `AuthProvider` performs a redirect/discovery
@@ -231,4 +231,114 @@ test("logout() calls oidc.signoutRedirect", () => {
   );
   fireEvent.click(screen.getByRole("button", { name: "logout" }));
   expect(signoutRedirect).toHaveBeenCalledOnce();
+});
+
+test("an expired session explains itself before the redirect, instead of vanishing", async () => {
+  const signinRedirect = vi.fn().mockResolvedValue(undefined);
+  state.current = { isLoading: false, isAuthenticated: true, user: undefined, signinRedirect, signoutRedirect: vi.fn() };
+  render(
+    <AppAuthProvider>
+      <div>app content</div>
+    </AppAuthProvider>,
+  );
+  expect(screen.getByText("app content")).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+  // What a 401 anywhere in the app does.
+  act(() => {
+    notifyUnauthorized();
+  });
+
+  const banner = await screen.findByRole("alert");
+  expect(banner).toHaveTextContent(/session expired/i);
+  expect(banner).toHaveTextContent(/signing you back in/i);
+  // The redirect still happens: the banner explains the recovery, it does not
+  // replace it. Asserting only the text would pass on a banner that says a
+  // sign-in is underway while nothing is.
+  expect(signinRedirect).toHaveBeenCalledTimes(1);
+});
+
+// B17: `void oidc.signinRedirect()` used to discard the rejection outright,
+// leaving the "Signing you back in" overlay up FOREVER with no retry and no
+// dismiss — a redirect that fails (network blip, discovery unreachable) had
+// no recovery path at all, and the module-level 401 latch (api/client.ts's
+// `unauthorizedFired`) is spent after the first fire for the rest of the
+// session, so nothing else could re-trigger it either.
+test("a failed re-login redirect offers Retry instead of a permanent, actionless overlay", async () => {
+  // A manually-settled first attempt (rather than mockRejectedValueOnce,
+  // which settles on the next microtask and races findByRole's own polling)
+  // lets this test observe BOTH the in-flight state and the failed state
+  // deterministically instead of risking the assertion below landing after
+  // React has already moved past it.
+  let rejectFirst: (e: unknown) => void = () => {};
+  const firstAttempt = new Promise<void>((_resolve, reject) => {
+    rejectFirst = reject;
+  });
+  const signinRedirect = vi.fn().mockReturnValueOnce(firstAttempt).mockResolvedValueOnce(undefined);
+  state.current = {
+    isLoading: false,
+    isAuthenticated: true,
+    user: undefined,
+    signinRedirect,
+    signoutRedirect: vi.fn(),
+  };
+  render(
+    <AppAuthProvider>
+      <div>app content</div>
+    </AppAuthProvider>,
+  );
+
+  act(() => {
+    notifyUnauthorized();
+  });
+
+  // In flight: the ordinary "signing you back in" copy.
+  expect(await screen.findByRole("alert")).toHaveTextContent(/session expired/i);
+
+  // The redirect rejects — the overlay must not stay stuck on "signing you
+  // back in" with nothing on screen the user can act on.
+  await act(async () => {
+    rejectFirst(new Error("network error"));
+    await firstAttempt.catch(() => {});
+  });
+  expect(screen.getByText(/sign-in failed/i)).toBeInTheDocument();
+  const retry = screen.getByRole("button", { name: /retry/i });
+
+  await act(async () => {
+    fireEvent.click(retry);
+  });
+
+  // A genuine second attempt, not a dead button.
+  expect(signinRedirect).toHaveBeenCalledTimes(2);
+  // This attempt resolves — back to the ordinary in-flight message, not
+  // stuck showing "failed" for an attempt that is succeeding.
+  expect(screen.queryByText(/sign-in failed/i)).not.toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent(/session expired/i);
+});
+
+test("the failed overlay's dismiss control sends the user to a clean sign-in page rather than leaving them stuck", async () => {
+  const signinRedirect = vi.fn().mockRejectedValue(new Error("network error"));
+  state.current = {
+    isLoading: false,
+    isAuthenticated: true,
+    user: undefined,
+    signinRedirect,
+    signoutRedirect: vi.fn(),
+  };
+  const assign = vi.fn();
+  vi.stubGlobal("location", { ...window.location, assign });
+  render(
+    <AppAuthProvider>
+      <div>app content</div>
+    </AppAuthProvider>,
+  );
+
+  act(() => {
+    notifyUnauthorized();
+  });
+
+  const dismiss = await screen.findByRole("button", { name: /go to sign-in/i });
+  fireEvent.click(dismiss);
+  expect(assign).toHaveBeenCalledWith("/login");
+  vi.unstubAllGlobals();
 });

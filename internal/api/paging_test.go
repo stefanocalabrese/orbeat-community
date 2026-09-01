@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -145,6 +146,64 @@ func TestCursorRejectsNULByteInTextKey(t *testing.T) {
 	r := httptest.NewRequest("GET", "/v1/admin/roles?cursor="+enc, nil)
 	if _, _, err := pageParams(r, defaultListLimit, maxListLimit, cursorShape{cursorText}); err == nil {
 		t.Fatalf("cursor with a NUL byte in a text key was accepted; it must be a 400 validationError, not a Postgres 22021 surfacing as a 500")
+	}
+}
+
+// TestCursorFromBeforeSortBindingIsRejected simulates a cursor a client
+// obtained before this task shipped: the OLD encoding was
+// base64url(JSON [key1,...,keyN,id]), one element SHORTER than today's
+// base64url(JSON [sort,key1,...,keyN,id]) (encodeListCursor's doc comment,
+// this package's paging.go). Decoding it must be a clean 400, never a crash,
+// and never silently treated as though it carries the current sort (the
+// specific silent-accept failure mode store.ListCursor's doc comment rules
+// out; a cursor built with an explicit empty Sort, the same VALUE this old
+// shape would decode to if it were merely one element short of what it is,
+// is covered separately by TestCursorSortMismatchIsHTTP400 below).
+func TestCursorFromBeforeSortBindingIsRejected(t *testing.T) {
+	oldShaped, err := json.Marshal([]string{"role-b", "11111111-2222-3333-4444-555555555555"})
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	enc := base64.RawURLEncoding.EncodeToString(oldShaped)
+
+	r := httptest.NewRequest("GET", "/v1/admin/roles?cursor="+enc, nil)
+	if _, _, err := pageParams(r, defaultListLimit, maxListLimit, cursorShape{cursorText}); err == nil {
+		t.Fatal("a pre-sort-binding cursor (one element shorter, missing the sort identity) was accepted; " +
+			"it must 400 via the length check in decodeListCursor, not be treated as matching whatever sort is requested")
+	}
+}
+
+// TestCursorSortMismatchIsHTTP400 proves a syntactically well-formed cursor
+// carrying the WRONG sort identity for the list it is replayed against --
+// the live-HTTP-reachable shape of the hazard proven at the mechanism level
+// by internal/store/paging_test.go's TestCursorSortMismatchIsRefused --
+// surfaces as 400, not 500. This is malformed CLIENT input in exactly the
+// sense TestCursorRejectsMalformed/TestCursorRejectsNULByteInTextKey already
+// cover for the other cursor fields, so it gets the same fail() treatment
+// (store.ErrCursorSortMismatch mapped in respond.go) instead of falling into
+// "everything else -> 500". A cursor's Sort cannot be checked at decode time
+// the way key-count/uuid/NUL-byte shape can (decodeListCursor has no way to
+// know, from length or kind alone, which sort was requested, that only
+// exists once Task 2/3's ?sort lands), the mismatch is only detectable once
+// the request reaches the list's own keysetTail call, so this test drives the
+// real router rather than pageParams directly.
+func TestCursorSortMismatchIsHTTP400(t *testing.T) {
+	ctx := context.Background()
+	srv, st, tn, tok := newPagingServer(t)
+	if _, err := st.CreateRole(ctx, tn.ID, "role-a"); err != nil {
+		t.Fatalf("seed role: %v", err)
+	}
+
+	bogus := store.ListCursor{
+		Keys: []string{"role-a"},
+		ID:   "11111111-2222-3333-4444-555555555555",
+		Sort: "not-the-real-sort-identity",
+	}
+	enc := encodeListCursor(bogus)
+
+	rec := pagingGET(t, srv, tok, "/v1/admin/roles?cursor="+enc)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("cursor with a mismatched sort identity = %d, want 400, body=%s", rec.Code, rec.Body)
 	}
 }
 
@@ -688,7 +747,7 @@ func TestArtifactListSlimByDefault(t *testing.T) {
 	// workflow, and SetArtifactSubmitted/SetArtifactApproved are the shared
 	// store primitives Community's own future auto-approve path will also
 	// call (docs/specs/2026-08-19-orbeat-community-repo-generation-design.md §4).
-	if _, err := st.SetArtifactSubmitted(ctx, tn.ID, a.ID, "alice", []byte("[]")); err != nil {
+	if _, err := st.SetArtifactSubmitted(ctx, tn.ID, a.ID, "alice", []byte("[]"), ""); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	if _, _, err := st.SetArtifactApproved(ctx, tn.ID, a.ID, "bob", 0); err != nil {
@@ -814,7 +873,7 @@ func TestArtifactListStateFilterFullPage(t *testing.T) {
 	// comment on why: this test is about the ?state filter, not the approval
 	// workflow's HTTP surface.
 	for _, name := range []string{"b-pending", "d-pending", "f-pending"} {
-		if _, err := st.SetArtifactSubmitted(ctx, tn.ID, ids[name], "alice", []byte("[]")); err != nil {
+		if _, err := st.SetArtifactSubmitted(ctx, tn.ID, ids[name], "alice", []byte("[]"), ""); err != nil {
 			t.Fatalf("submit %s: %v", name, err)
 		}
 	}

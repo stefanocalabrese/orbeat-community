@@ -8,9 +8,16 @@ import (
 // slot tracks one key's in-flight count. idleSince is set when the count
 // reaches zero and is the only thing the sweeper may evict on: an entry with
 // n > 0 must NEVER be dropped (see sweep).
+//
+// lastLogged is the concurrency cap's half of the shared log sampler (see
+// sample.go), zero if this key has never produced a line. It is safe to hang
+// off the slot for the same reason the rate limiter hangs its own off the
+// bucket, and safer here: a rejection means n >= max > 0, so the entry the
+// value lives on is one the sweeper is forbidden to evict.
 type slot struct {
-	n         int
-	idleSince time.Time
+	n          int
+	idleSince  time.Time
+	lastLogged time.Time
 }
 
 // ConcurrencyLimiter caps how many operations a key may have IN FLIGHT at once.
@@ -77,9 +84,56 @@ func (c *ConcurrencyLimiter) Close() error {
 //
 // When ok is false no slot was taken and release is a no-op, so a caller that
 // defers unconditionally is still correct.
+//
+// It does not participate in sampling at all, and that is the point rather
+// than an omission. Every production call site takes a rejection log line, so
+// they all use AcquireSampled; this one remains for tests and for any caller
+// that reports nothing.
+//
+// It used to delegate to AcquireSampled and throw the third return away, which
+// is not the same thing: the sampler stamps lastLogged when it DECIDES to log,
+// so a caller that discarded the decision was silently spending the budget.
+// One Acquire on a capped key would then keep the next real AcquireSampled
+// quiet for a whole logSampleInterval, and the line that went missing is a
+// rejection nobody would ever learn about. A non-reporting caller must be
+// invisible to a reporting one.
 func (c *ConcurrencyLimiter) Acquire(key string) (release func(), ok bool) {
+	release, ok, _ = c.acquireAt(key, time.Now(), false)
+	return release, ok
+}
+
+// AcquireSampled is AcquireAtSampled(key, time.Now()).
+func (c *ConcurrencyLimiter) AcquireSampled(key string) (func(), bool, bool) {
+	return c.AcquireAtSampled(key, time.Now())
+}
+
+// AcquireAtSampled is Acquire plus a third return, logRejection: true only for
+// the first rejection for key within logSampleInterval of the last one that
+// logged. It is the concurrency cap's counterpart to
+// Limiter.AllowAtSampled, and it exists because MCPConcurrency used to pass a
+// literal true, so every capped call warned while the doc beside it said the
+// line was sampled.
+//
+// The cap needs this at least as much as the token bucket does: it sits behind
+// the tools/call rate limiter in the gateway's middleware chain, so a single
+// principal can drive it at the full admitted rate, 20/s on the shipped
+// defaults, or 1200 warn lines a minute from one key.
+//
+// now is a parameter for the same reason it is on AllowAt: it is the only way
+// to test interval behaviour without sleeping.
+func (c *ConcurrencyLimiter) AcquireAtSampled(key string, now time.Time) (release func(), ok bool, logRejection bool) {
+	return c.acquireAt(key, now, true)
+}
+
+// acquireAt is the single locked decision both Acquire and AcquireAtSampled
+// delegate to, so their admit/reject outcomes can never drift apart.
+//
+// sample is what separates them. When it is false the sampler is neither read
+// nor stamped, so a caller that will not log costs a later caller nothing; see
+// Acquire's comment for the line that used to go missing.
+func (c *ConcurrencyLimiter) acquireAt(key string, now time.Time, sample bool) (release func(), ok bool, logRejection bool) {
 	if c.max <= 0 {
-		return func() {}, true
+		return func() {}, true, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -90,11 +144,16 @@ func (c *ConcurrencyLimiter) Acquire(key string) (release func(), ok bool) {
 		c.slots[key] = s
 	}
 	if s.n >= c.max {
-		return func() {}, false
+		log := sample && sampleLog(s.lastLogged, now)
+		if log {
+			// Stamped only when a line is written; see sampleLog's contract.
+			s.lastLogged = now
+		}
+		return func() {}, false, log
 	}
 	s.n++
 	var once sync.Once
-	return func() { once.Do(func() { c.release(key) }) }, true
+	return func() { once.Do(func() { c.release(key) }) }, true, false
 }
 
 func (c *ConcurrencyLimiter) release(key string) {

@@ -80,9 +80,20 @@ func TestReconcileSeedsPreservesLedgerForUnreachableDeregisteredProject(t *testi
 	}
 }
 
-// A reachable de-registered project with the managed file genuinely absent must
+// A reachable, REGISTERED project with the managed file genuinely absent must
 // STILL strip cleanly (entry drops) — the S5 fix must not preserve entries for
 // reachable roots, only unreachable ones.
+//
+// The project is REGISTERED here, and that changed with the trustedProjects
+// fix (B23): this test used to pass projects=nil, because the strip pass
+// reached into unregistered projects by trusting any path that shape-checked
+// and existed on disk. It no longer does — a project must be one this run was
+// actually handed, or the entry is preserved and skipped rather than dropped
+// (TestReconcileRulesRefusesToStripAnUnregisteredProjectLedgerEntry owns that
+// case now). Registering the project keeps this test pinning what it was
+// built to pin — mirroring TestReconcileSeedsDropsLedgerForReachableAbsentProject,
+// whose own comment records the identical update when trustedSeedBoundary
+// landed for seeds.
 func TestReconcileRulesDropsLedgerForReachableAbsentProject(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -91,7 +102,7 @@ func TestReconcileRulesDropsLedgerForReachableAbsentProject(t *testing.T) {
 	reachable := t.TempDir() // exists, but carries no ORBEAT-RULES block
 	must(t, saveManifest(claudeDir, manifest{Rules: []string{reachable}}, nil))
 
-	if _, err := ReconcileRules(claudeDir, nil, nil, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(reachable), nil, nil); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	got, err := loadManifest(claudeDir)
@@ -104,9 +115,21 @@ func TestReconcileRulesDropsLedgerForReachableAbsentProject(t *testing.T) {
 }
 
 // Seed mirror of TestReconcileRulesDropsLedgerForReachableAbsentProject: a
-// de-registered project that is REACHABLE but carries no seed block must STILL
-// drop its ledger entry — the S5 preservation must key off unreachability, not
-// merely de-registration, or every stripped seed would be preserved forever.
+// project that is REACHABLE but carries no seed block must STILL drop its
+// ledger entry, because the S5 preservation must key off unreachability and
+// not merely the absence of a block, or every stripped seed would be
+// preserved forever.
+//
+// The project is REGISTERED here, and that changed with the seedBoundary fix.
+// This test used to pass projects=nil, because the strip pass reached into
+// unregistered projects by deriving a containment root from the ledger path
+// itself. It no longer does: a containment root now comes only from the
+// trusted set (claudeDir plus the registered projects), so a de-registered
+// project's entry is skipped and PRESERVED rather than stripped and dropped.
+// TestReconcileSeedsLeavesALedgerPathOutsideEveryTrustedRootAlone and
+// TestReconcileSeedsPreservesTheLedgerEntryItRefusedToTouch own that case
+// now. Registering the project keeps this test pinning what it was built
+// to pin: preservation must not become blanket.
 func TestReconcileSeedsDropsLedgerForReachableAbsentProject(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -116,7 +139,7 @@ func TestReconcileSeedsDropsLedgerForReachableAbsentProject(t *testing.T) {
 	seedPath := filepath.Join(reachable, ".claude", "agent-memory", "rev", "MEMORY.md")
 	must(t, saveManifest(cd, manifest{Seeds: map[string][]string{"rev": {seedPath}}}, nil))
 
-	if _, err := ReconcileSeeds(cd, nil, nil, nil); err != nil { // not registered, no artifacts
+	if _, err := ReconcileSeeds(cd, []string{reachable}, nil, nil); err != nil { // registered, no artifacts
 		t.Fatalf("reconcile: %v", err)
 	}
 	got, err := loadManifest(cd)
@@ -124,7 +147,7 @@ func TestReconcileSeedsDropsLedgerForReachableAbsentProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got.Seeds) != 0 {
-		t.Fatalf("a reachable de-registered project with no block must drop from the ledger, got %+v", got.Seeds)
+		t.Fatalf("a reachable registered project with no block must drop from the ledger, got %+v", got.Seeds)
 	}
 }
 

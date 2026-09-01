@@ -39,6 +39,26 @@ tags:
     description: Admin read + export of the audit log.
   - name: marketplace
     description: Admin control of the Channel-1 (native marketplace) publish pipeline.
+  - name: virtual-keys
+    description: >-
+      Admin issuance and revocation of robot credentials (Keycloak clients registered by
+      Dynamic Client Registration, authenticating by signed assertion; no secret is ever
+      generated, returned, or stored. Enterprise only.
+  - name: usage
+    description: >-
+      Admin read of per-role, per-server call totals, and admin CRUD over per-role
+      monthly call quotas. Enterprise only: Community already caps seats, servers and
+      roles, which is its own throttle.
+  - name: scim
+    description: >-
+      SCIM 2.0 user provisioning (RFC 7643/7644), Enterprise only. A distinct protocol
+      from the rest of this document on purpose: every /scim/v2 response uses the SCIM
+      error object shape (`schemas`/`status`/`detail`), never this document's own Error
+      schema, and SCIM clients discover capabilities via SCIM's own
+      ServiceProviderConfig/ResourceTypes/Schemas endpoints, not via this OpenAPI
+      document. Documented here anyway so every HTTP route this server answers has one
+      place an operator can find it (TestOpenAPICoversAllRoutes derives its route set
+      from source, with no carve-out for a different wire protocol).
 security:
   - bearerAuth: []
 paths:
@@ -106,6 +126,26 @@ paths:
       description: >-
         Content is ready-to-write (e.g. subagent memory frontmatter already injected).
         Org-visibility artifacts are never returned here — they ship via the Channel-1 plugin.
+      parameters:
+        - name: pin
+          in: query
+          required: false
+          description: >-
+            Serve an older approved revision of one artifact to this caller alone, as
+            `<artifactId>:<revisionNum>`. Repeatable, at most 100 per request. Enterprise
+            only: check `pinning` on GET /v1/sync/config first, because a server without it
+            IGNORES this parameter and serves the latest revision with no error, which is
+            indistinguishable from a pin that was honoured. The pin is CLAMPED, not obeyed:
+            it is raised to the artifact's admin floor and to the oldest surviving revision,
+            and lowered to the newest that exists, with `pinOverride` naming which bound
+            bit. A pin naming an artifact outside the caller's entitled set is dropped
+            silently. Malformed pairs, a non-uuid id, a revision below 1, a repeated
+            artifact id, or more than 100 pins are 400.
+          schema:
+            type: string
+          style: form
+          explode: true
+          example: "3f2a1c8e-0000-4000-8000-0000000000ab:3"
       responses:
         "200":
           description: The caller's entitled artifacts.
@@ -113,6 +153,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SyncArtifactsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -121,7 +163,7 @@ paths:
   /v1/sync/config:
     get:
       tags: [sync]
-      summary: Advertise client bootstrap config (currently just the gateway resource URL).
+      summary: Advertise client bootstrap config (the gateway resource URL, whether deployment reports are accepted, and whether pins are honoured).
       responses:
         "200":
           description: Sync client bootstrap config.
@@ -131,6 +173,41 @@ paths:
                 $ref: "#/components/schemas/SyncConfigResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/sync/deployments:
+    post:
+      tags: [sync]
+      summary: Report what this install applied.
+      description: >-
+        Enterprise only, and served only when ORBEAT_DEPLOYMENT_REGISTRY is set; check
+        deploymentRegistry on GET /v1/sync/config first, because a server that does not
+        support it returns 404 here and a 404 is indistinguishable from a wrong base URL.
+        The reporter is the authenticated caller: there is no user field, and a body
+        carrying one is rejected. A report REPLACES everything this install previously
+        reported, so an artifact left out has been removed and an empty list means the
+        install holds none of them. An artifactId outside the caller's entitled set is
+        dropped rather than rejected, and counted in `dropped`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeploymentReportRequest"
+      responses:
+        "200":
+          description: The report was recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentReportResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "429":
           $ref: "#/components/responses/TooManyRequests"
 
@@ -171,6 +248,20 @@ paths:
       parameters:
         - $ref: "#/components/parameters/ListLimit"
         - $ref: "#/components/parameters/ListCursor"
+        - name: sort
+          in: query
+          description: >-
+            Sort column. `name` is the only allowed value, the list's existing
+            default order, and the only column servable by an existing index
+            (`mcp_server`'s `UNIQUE(tenant_id, name)`). Any other value is
+            rejected with 400 rather than silently falling back to the default.
+          required: false
+          schema:
+            type: string
+            enum: [name]
+            default: name
+        - $ref: "#/components/parameters/ListOrder"
+        - $ref: "#/components/parameters/ListSearch"
       responses:
         "200":
           description: A page of catalog entries (admin view, includes disabled/draft).
@@ -217,7 +308,12 @@ paths:
       description: >-
         Requires If-Match (optimistic concurrency, spec §5) — obtain the
         current row_version from GET's `ETag` header or `rowVersion` body
-        field first.
+        field first. Every field except `secretRef`/`tlsCaRef` is a plain
+        full-replace: name, description, transport, endpointOrCommand,
+        version, protocolVersion and status are always taken from the body as
+        sent (there is no partial-update semantics for them). secretRef and
+        tlsCaRef are the one exception — see
+        `#/components/schemas/ServerUpdateInput`'s own description.
       parameters:
         - $ref: "#/components/parameters/IdPathParam"
         - $ref: "#/components/parameters/IfMatch"
@@ -226,7 +322,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/ServerInput"
+              $ref: "#/components/schemas/ServerUpdateInput"
       responses:
         "200":
           description: The updated server.
@@ -311,6 +407,20 @@ paths:
       parameters:
         - $ref: "#/components/parameters/ListLimit"
         - $ref: "#/components/parameters/ListCursor"
+        - name: sort
+          in: query
+          description: >-
+            Sort column. `name` is the only allowed value, the list's existing
+            default order, and the only column servable by an existing index
+            (`role`'s `UNIQUE(tenant_id, name)`). Any other value is rejected
+            with 400 rather than silently falling back to the default.
+          required: false
+          schema:
+            type: string
+            enum: [name]
+            default: name
+        - $ref: "#/components/parameters/ListOrder"
+        - $ref: "#/components/parameters/ListSearch"
       responses:
         "200":
           description: A page of roles.
@@ -328,6 +438,66 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
 
   /v1/admin/roles/{id}:
+    put:
+      tags: [roles]
+      summary: Rename a role.
+      description: >-
+        `authz.Resolver.Resolve` binds a role to the identity provider BY NAME, so
+        renaming in orbeat alone would silently detach every user holding that realm
+        role while its entitlements survive — a revoke wearing a rename's clothes.
+        This is guarded two ways depending on the deployment: when a realm-role
+        lookup is configured (Enterprise, with `ORBEAT_DCR_CLIENT_ID` set), the new
+        `name` MUST already exist as a realm role or the rename is refused with 400,
+        and the request's `idpRenamed` field is ignored — an operator cannot assert
+        past a check that is actually running, and a lookup failure (403/401/500/
+        timeout) refuses with 502 rather than silently falling back to the
+        assertion. When no lookup is configured, `idpRenamed` must be `true`
+        (confirming the role was already renamed in the identity provider) or the
+        rename is refused with 400 and a machine-readable `code:
+        "idp_rename_assertion_required"` body field the console uses to offer a
+        confirmation checkbox. Every outcome — allowed or refused — is recorded in
+        the audit log (action `role.rename`) with `idpCheck` naming which mechanism
+        decided it (`verified`, `asserted`, `verified_absent`, `lookup_error` or
+        `assertion_missing`). Requires If-Match.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoleRenameInput"
+      responses:
+        "200":
+          description: The renamed role.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Role"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "502":
+          $ref: "#/components/responses/BadGateway"
     delete:
       tags: [roles]
       summary: Delete a role.
@@ -426,9 +596,27 @@ paths:
     get:
       tags: [entitlements]
       summary: List entitlements for the tenant, keyset-paginated.
+      description: >-
+        `q` (substring search) is NOT supported on this list and is rejected
+        with 400 if passed, empty value included: role_id is a uuid with no
+        natural text column of its own to search.
       parameters:
         - $ref: "#/components/parameters/ListLimit"
         - $ref: "#/components/parameters/ListCursor"
+        - name: sort
+          in: query
+          description: >-
+            Sort column. `role_id` is the only allowed value, the list's
+            existing default order, and the only column servable by an
+            existing index (`entitlement_tenant_role_id_idx`). Any other value
+            is rejected with 400 rather than silently falling back to the
+            default.
+          required: false
+          schema:
+            type: string
+            enum: [role_id]
+            default: role_id
+        - $ref: "#/components/parameters/ListOrder"
       responses:
         "200":
           description: A page of entitlements (admin view).
@@ -446,6 +634,79 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
 
   /v1/admin/entitlements/{id}:
+    get:
+      tags: [entitlements]
+      summary: Read one entitlement, with the ETag an update must echo.
+      description: >-
+        The by-id read is where a client obtains the `ETag` it echoes back in `If-Match`
+        to update this grant. The list route carries none: an ETag on a collection would
+        describe the page rather than any row in it.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: The entitlement.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entitlement"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    put:
+      tags: [entitlements]
+      summary: Replace an entitlement's allowed tools and permissions.
+      description: >-
+        Requires If-Match (optimistic concurrency, spec §5): obtain the current
+        row_version from GET's `ETag` header first. `roleId` and `mcpServerId` in the body
+        are IGNORED and cannot be changed, because repointing a grant at a different role
+        or server is a revoke plus a grant rather than an edit, and performing it under an
+        `entitlement.update` audit action would move access between principals while the
+        trail records an edit. Delete and create instead; they leave two events that say
+        what happened.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EntitlementInput"
+      responses:
+        "200":
+          description: The updated entitlement.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entitlement"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
     delete:
       tags: [entitlements]
       summary: Revoke an entitlement.
@@ -462,6 +723,543 @@ paths:
           $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/virtual-keys:
+    post:
+      tags: [virtual-keys]
+      summary: Register a robot credential (Enterprise only).
+      description: >-
+        Registers a Keycloak client by Dynamic Client Registration for the robot's PUBLIC
+        JWKS (`private_key_jwt`; the robot's private key never leaves its own machine) and
+        stores a policy row keyed on the resulting `clientId`, owned by `roleId`. Returns
+        the `clientId` and NOTHING else secret, because nothing secret exists on the
+        orbeat side to return. `roleId` must belong to the caller's tenant; a role that
+        exists but belongs to another tenant is a 404, the same as any other cross-tenant
+        resource reference in this API.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VirtualKeyInput"
+      responses:
+        "201":
+          description: The created virtual key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VirtualKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [virtual-keys]
+      summary: List virtual keys for the tenant, keyset-paginated (Enterprise only).
+      description: >-
+        Revoked keys are included unfiltered by default: the row an admin auditing "what
+        did this credential do" most wants to find. Pass `revoked=true` to find orphaned
+        Keycloak clients (see `docs/runbooks/production-deployment.md`), since revoking a
+        key never deletes its Keycloak client automatically.
+      parameters:
+        - $ref: "#/components/parameters/ListLimit"
+        - $ref: "#/components/parameters/ListCursor"
+        - name: sort
+          in: query
+          description: >-
+            Sort column. `name` is the only allowed value, the list's
+            existing default order, and the only column servable by an
+            existing index (`virtual_key_tenant_name_id_idx`; unlike `role`/
+            `mcp_server`, `virtual_key.name` carries no uniqueness constraint
+            of its own, so this list needed a purpose-built index rather than
+            riding one). Any other value is rejected with 400 rather than
+            silently falling back to the default.
+          required: false
+          schema:
+            type: string
+            enum: [name]
+            default: name
+        - $ref: "#/components/parameters/ListOrder"
+        - name: revoked
+          in: query
+          description: >-
+            Filter to only revoked keys (`true`) or only live ones (`false`). Omit for
+            both. Filters in SQL, not after the page's LIMIT. An unrecognized value is
+            rejected with 400 -- this parameter is new, so unlike the artifact list's
+            `state`, no client can already depend on a lenient no-op.
+          required: false
+          schema:
+            type: string
+            enum: ["true", "false"]
+        - $ref: "#/components/parameters/ListSearch"
+      responses:
+        "200":
+          description: A page of virtual keys.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListVirtualKeysResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/virtual-keys/{id}:
+    delete:
+      tags: [virtual-keys]
+      summary: Revoke a virtual key (Enterprise only).
+      description: >-
+        `revoked_at` is read per call by the gateway, never from a cached session, so the
+        very next tool call using this credential fails regardless of what its session
+        remembers. Afterwards, orbeat best-effort deletes the underlying Keycloak client;
+        on any failure that step only logs a warning naming the orphaned `clientId`. The
+        orbeat row is the sole source of truth for whether the key is dead, so a Keycloak
+        failure never changes this response away from 200. Requires If-Match.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "200":
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VirtualKeyRevokeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/usage:
+    get:
+      tags: [usage]
+      summary: Per-role, per-server call totals over an optional date range (Enterprise only).
+      description: >-
+        Total ALLOWED tool calls per (role, server) pair, summed across every subject and
+        every day in [from, to]. Only calls the gateway actually forwarded count: a call
+        denied by RBAC, a revoked virtual key, or the runtime interceptor never reached the
+        upstream and did no work, so it is never counted. Paginated like every other admin
+        list (limit/nextCursor), but NOT via the shared keyset cursor those use: this report
+        GROUPs BY (role, server), which is already a unique, stable sort key on its own,
+        so there is no per-row id to append as a tiebreaker, because usage_daily itself has
+        no surrogate key.
+      parameters:
+        - name: from
+          in: query
+          description: Inclusive start of the date range (YYYY-MM-DD). Omitted means unbounded.
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          description: Inclusive end of the date range (YYYY-MM-DD). Omitted means unbounded.
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: limit
+          in: query
+          description: Page size (default 100, capped at 500). Must be a positive integer.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: cursor
+          in: query
+          description: >-
+            Opaque keyset cursor from a prior response's `nextCursor`
+            (base64url(JSON [roleId, serverId])).
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of usage totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageReportResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/roles/{id}/quota:
+    put:
+      tags: [usage]
+      summary: Set (create or replace) a role's monthly call quota (Enterprise only).
+      description: >-
+        A role with no quota row is unlimited (the default). When a role's calls in the
+        current calendar month reach its quota, further calls are denied with a JSON-RPC
+        error naming the limit; the check reads a cache refreshed on a periodic interval
+        (ORBEAT_USAGE_FLUSH_INTERVAL, default 60s), so a quota is a BUDGET, not a hard
+        boundary: it can be overshot by up to one interval's worth of calls. Requires
+        If-Match. Because a role may have no quota row yet, this is create-or-replace: on
+        the FIRST set for a role, the supplied If-Match must still be a well-formed
+        entity-tag but is not compared against anything (there is no prior representation
+        to be stale against); on every set after that it is compared against the row's
+        current version exactly like every other guarded route in this document.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoleQuotaInput"
+      responses:
+        "200":
+          description: The current quota.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleQuota"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [usage]
+      summary: Read a role's monthly call quota (Enterprise only).
+      description: >-
+        Returns the current quota row and its ETag header. A client must read this
+        (or hold an ETag from a prior PUT response) before calling PUT or DELETE,
+        because the If-Match precondition on those routes requires knowing the
+        current row_version. Without this GET, a blind client could only guess
+        If-Match: "1" (the DEFAULT row_version), which would let any admin silently
+        overwrite another's cap.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: The current quota.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleQuota"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    delete:
+      tags: [usage]
+      summary: Remove a role's monthly call quota (Enterprise only).
+      description: >-
+        The role reverts to unlimited. Requires If-Match against the quota row's current
+        version.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /scim/v2/Users:
+    post:
+      tags: [scim]
+      summary: Create a user (Enterprise only, SCIM 2.0).
+      description: >-
+        Create semantics, not upsert: a second POST of an already-existing `userName` is
+        409 (`scimType: "uniqueness"`), never silently treated as an update.
+
+
+        The body is decoded LENIENTLY. Any attribute this API does not model
+        (`externalId`, `name.*`, `locale`, `groups`, `password`, an enterprise-extension
+        URN carried as a top-level key) is accepted and discarded, and `schemas` is
+        accepted without being validated. Only `userName` is required, and its absence
+        or blankness is the one 400 a well-formed body can earn here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScimCreateUserInput"
+      responses:
+        "201":
+          description: The created user.
+          content:
+            application/scim+json:
+              schema:
+                $ref: "#/components/schemas/ScimUser"
+        "400":
+          $ref: "#/components/responses/ScimBadRequest"
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "409":
+          $ref: "#/components/responses/ScimConflict"
+        "413":
+          $ref: "#/components/responses/ScimPayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
+    get:
+      tags: [scim]
+      summary: List users, optionally filtered (Enterprise only, SCIM 2.0).
+      description: >-
+        A filter matching nobody is `totalResults: 0` inside a normal 200 ListResponse,
+        NEVER a 404: a 404 here would read to an IdP as "this endpoint does not exist"
+        and abandon provisioning.
+      parameters:
+        - $ref: "#/components/parameters/ScimFilter"
+      responses:
+        "200":
+          description: A ListResponse, possibly empty.
+          content:
+            application/scim+json:
+              schema:
+                $ref: "#/components/schemas/ScimListResponse"
+        "400":
+          $ref: "#/components/responses/ScimBadRequest"
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
+
+  /scim/v2/Users/{id}:
+    get:
+      tags: [scim]
+      summary: Fetch one user by id (Enterprise only, SCIM 2.0).
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: The user.
+          content:
+            application/scim+json:
+              schema:
+                $ref: "#/components/schemas/ScimUser"
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "404":
+          $ref: "#/components/responses/ScimNotFound"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
+    patch:
+      tags: [scim]
+      summary: Partially update a user, including deactivation (Enterprise only, SCIM 2.0).
+      description: >-
+        `active: false` clears/sets `users.deactivated_at` (migration 00021), the same
+        column `authz.Resolver.Resolve` refuses on every authenticated request, so this
+        is a real access revocation, not a decorative flag. `displayName` is also
+        applied; every other attribute (`emails`, `name.*`, ...) is silently ignored
+        rather than rejected, since real IdP PATCH payloads routinely bundle attributes
+        this API has no field for.
+
+
+        `active`'s value may be a JSON boolean or a QUOTED one (`"False"`). A default
+        Entra ID tenant sends the quoted form; its documented opt-out
+        (`?aadOptscim062020`) does not work with Provision on Demand, so refusing the
+        string would discard the deprovision. Any other string, and any number, is a
+        400 with `scimType: "invalidValue"`.
+
+
+        Each operation's `op` is honoured: `add`, `remove` and `replace` (matched
+        case-insensitively, since Entra ID capitalizes them). Three operations are
+        refused, and because RFC 7644 §3.5.2 makes PATCH atomic each refusal fails the
+        WHOLE request before anything is written: an `op` outside those three
+        (`scimType: "invalidSyntax"`), a `remove` with no `path` (`"noTarget"`, §3.5.2.2
+        verbatim), and a `remove` of `active` (`"invalidValue"`). That last one is legal
+        SCIM but unanswerable here: `users.deactivated_at` is either set or unset, so
+        removing `active` would have to be guessed as a deprovision or a reactivation.
+        Send an explicit `replace` of `active` instead.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScimPatchRequest"
+      responses:
+        "200":
+          description: The updated user.
+          content:
+            application/scim+json:
+              schema:
+                $ref: "#/components/schemas/ScimUser"
+        "400":
+          $ref: "#/components/responses/ScimBadRequest"
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "404":
+          $ref: "#/components/responses/ScimNotFound"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
+    delete:
+      tags: [scim]
+      summary: Remove a user (Enterprise only, SCIM 2.0).
+      description: >-
+        Reuses `store.DeleteUser`, the same audited outcome (`user.delete`, same
+        metadata shape) as `DELETE /v1/admin/users/{id}`. 204 with no body, per RFC 7644
+        §3.6 (unlike that admin route's own 200-plus-identity-body, which exists for an
+        admin console UI with no SCIM client to satisfy).
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "404":
+          $ref: "#/components/responses/ScimNotFound"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
+    put:
+      tags: [scim]
+      summary: Full-resource replace, NOT implemented (Enterprise only, SCIM 2.0).
+      description: >-
+        Always 501, honestly, rather than a silent partial replace: orbeat's store has
+        no way to express SCIM's full-resource PUT semantics correctly without either
+        silently dropping attributes PUT is supposed to clear, or duplicating PATCH's
+        write path under a different name. Use PATCH for every write this API supports.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
+        "501":
+          $ref: "#/components/responses/ScimNotImplemented"
+
+  /scim/v2/ServiceProviderConfig:
+    get:
+      tags: [scim]
+      summary: Discover this server's SCIM capabilities (Enterprise only, SCIM 2.0).
+      description: >-
+        RFC 7644 §4.1. One JSON object. `patch` and `filter` are true because both are
+        genuinely implemented; `bulk`, `changePassword`, `sort` and `etag` are honestly
+        false, since advertising a capability this server does not implement would let
+        an IdP send a request it then rejects at runtime.
+      responses:
+        "200":
+          description: The service provider configuration.
+          content:
+            application/scim+json:
+              schema:
+                $ref: "#/components/schemas/ScimServiceProviderConfig"
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
+
+  /scim/v2/ResourceTypes:
+    get:
+      tags: [scim]
+      summary: List supported resource types (Enterprise only, SCIM 2.0).
+      description: >-
+        RFC 7644 §4.2. A bare JSON array (never ListResponse-wrapped, RFC 7643 §8.6's
+        own example is a bare array), with exactly one entry: User. orbeat stores no
+        group membership at all (design doc §1), so a Group entry here would be a lie --
+        an IdP pushing group memberships would receive 200s while every one of them was
+        silently ignored. This is the machine-readable way a well-behaved IdP learns
+        that before it starts sending.
+      responses:
+        "200":
+          description: The list of supported resource types.
+          content:
+            application/scim+json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ScimResourceType"
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
+
+  /scim/v2/Schemas:
+    get:
+      tags: [scim]
+      summary: List supported schemas (Enterprise only, SCIM 2.0).
+      description: >-
+        RFC 7644 §4.3. A bare JSON array (never ListResponse-wrapped), carrying the User
+        core schema (RFC 7643 §4.1) and no others, matching ScimUser's own restricted
+        set of attributes.
+      responses:
+        "200":
+          description: The list of supported schemas.
+          content:
+            application/scim+json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ScimSchema"
+        "401":
+          $ref: "#/components/responses/ScimUnauthorized"
+        "403":
+          $ref: "#/components/responses/ScimForbidden"
+        "429":
+          $ref: "#/components/responses/ScimTooManyRequests"
 
   /v1/admin/audit:
     get:
@@ -483,6 +1281,34 @@ paths:
           required: false
           schema:
             type: string
+        - name: actor
+          in: query
+          description: >-
+            Return only events whose actor matches exactly. Empty or omitted means no
+            narrowing. Matching is exact equality, never a prefix or a pattern. The cursor
+            encodes a position and not a query, so a paging client must resend this
+            parameter with every request.
+          required: false
+          schema:
+            type: string
+        - name: action
+          in: query
+          description: >-
+            Return only events whose action matches exactly (for example `role.delete`).
+            Exact equality, so `role.` matches nothing. Resend it alongside `cursor`.
+          required: false
+          schema:
+            type: string
+        - name: decision
+          in: query
+          description: >-
+            Return only events carrying this decision. Unlike `actor` and `action` this is a
+            closed set, enforced by the column's CHECK constraint, so a value outside it is a
+            400 rather than an empty page.
+          required: false
+          schema:
+            type: string
+            enum: [allow, deny, error]
       responses:
         "200":
           description: A page of audit events.
@@ -592,10 +1418,30 @@ paths:
       description: >-
         Rows omit the heavy content fields (content, approvedContent, memorySeed,
         approvedMemorySeed — each present as an empty string) unless `include=content`
-        is passed.
+        is passed. `q` (below) searches name, deliberately NOT `sort`'s column
+        (`type`): type's only possible values are `skill`, `subagent` and
+        `rule`, a three-value enum a substring search over is not a useful
+        surface, where name is the free-text identifier an admin actually
+        recognizes an artifact by. It composes with `state` as a SQL-level
+        AND.
       parameters:
         - $ref: "#/components/parameters/ListLimit"
         - $ref: "#/components/parameters/ListCursor"
+        - name: sort
+          in: query
+          description: >-
+            Sort column. `type` is the only allowed value, the list's
+            existing default order (type, then name), and the only column
+            servable by an existing index (`artifact_tenant_type_name_id_idx`
+            unfiltered, `artifact_tenant_state_type_name_id_idx` when `state`
+            is also set). Any other value is rejected with 400 rather than
+            silently falling back to the default.
+          required: false
+          schema:
+            type: string
+            enum: [type]
+            default: type
+        - $ref: "#/components/parameters/ListOrder"
         - name: state
           in: query
           description: >-
@@ -621,6 +1467,7 @@ paths:
           schema:
             type: string
             enum: [content]
+        - $ref: "#/components/parameters/ListSearch"
       responses:
         "200":
           description: A page of artifacts (admin view).
@@ -726,8 +1573,12 @@ paths:
       tags: [artifacts]
       summary: Submit a draft/rejected artifact for review.
       description: >-
-        Scans the row-locked working copy inside the transition transaction. A blocking
-        governance finding aborts with 422 and no state change.
+        Scans the working copy OUTSIDE the transition transaction, so a slow scanner never
+        holds the artifact's row lock, then re-reads the row under lock and writes only if
+        the scanned surface (type, name, content, memory scope, memory seed) is still
+        byte-identical. A blocking governance finding aborts with 422 and no state change.
+        An artifact edited while it was being scanned aborts with 409 and no state change:
+        submit it again so the new content is scanned.
       parameters:
         - $ref: "#/components/parameters/IdPathParam"
       responses:
@@ -750,6 +1601,52 @@ paths:
         "429":
           $ref: "#/components/responses/TooManyRequests"
 
+  /v1/admin/artifacts/{id}/acknowledge-findings:
+    post:
+      tags: [artifacts]
+      summary: Record the submitter's acknowledgment of the scanner findings their submission produced.
+      description: >-
+        The scanner runs INSIDE the submit transaction, so at the moment of submitting the
+        findings do not exist yet: this is the separate step that comes after, against
+        whatever submit just stored. Only the artifact's submitter may acknowledge (403 for
+        anyone else, including an admin), only a PENDING artifact can be acknowledged (409
+        otherwise), and an artifact with no findings has nothing to acknowledge (400). There
+        is deliberately no If-Match: the request's `digest` field IS the precondition, checked
+        against the artifact's CURRENT `scanFindingsDigest`. A mismatch (412) is what makes a
+        stale acknowledgment left over from a prior findings set impossible after a
+        withdraw/edit/resubmit re-scans and produces a different digest.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcknowledgeFindingsInput"
+      responses:
+        "200":
+          description: The artifact, with the acknowledgment recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/FindingsDigestMismatch"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
   /v1/admin/artifacts/{id}/approve:
     post:
       tags: [artifacts]
@@ -761,9 +1658,32 @@ paths:
         since the reviewer's read — including one that also flipped approval_state away from
         pending — surfaces as 412 ("the content you're approving isn't what you reviewed"),
         never as a plain 409 ("nothing changed, but this was never approvable").
+
+
+        Mandatory acknowledgment of scan findings (docs/plans/orbeat-scan-acknowledgment-
+        2026-08-27.md): when the artifact carries findings (`scanFindingsDigest` non-empty),
+        approval additionally requires BOTH the artifact's submitter to have already
+        acknowledged that CURRENT digest (`POST .../acknowledge-findings`) AND this request
+        to carry the approver's own acknowledgment of the same digest, in
+        `acknowledgedFindingsDigest`. A clean artifact (no findings) requires neither, and
+        the request body may be omitted entirely. Checked AFTER the version, pending-state
+        and self-approve checks, so a submitter attempting to approve their own artifact
+        never learns anything about the acknowledgment state. Either missing acknowledgment
+        refuses with 409 and a machine-readable `code` body field distinguishing which one:
+        `author_findings_ack_required` (the submitter has not acknowledged the current
+        digest, including one superseded by a re-scan) or `approver_findings_ack_required`
+        (this request did not carry a matching acknowledgment). Every outcome, approved
+        or refused for either reason, is recorded in the audit log (action `artifact.approve`)
+        naming `findingsDigest` and, on a successful approval with findings, `authorAckBy`
+        and `approverAckBy`.
       parameters:
         - $ref: "#/components/parameters/IdPathParam"
         - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApproveInput"
       responses:
         "200":
           description: The artifact, now approved and re-published.
@@ -874,6 +1794,84 @@ paths:
         "429":
           $ref: "#/components/responses/TooManyRequests"
 
+  /v1/admin/artifacts/{id}/deployments:
+    get:
+      tags: [artifacts]
+      summary: How this artifact is deployed across the fleet, in aggregate.
+      description: >-
+        Enterprise only. AGGREGATES ONLY: no subject, email, display name or install id is
+        ever returned, so naming an individual requires a database credential. Registered
+        whether or not ORBEAT_DEPLOYMENT_REGISTRY is set, because a read has to be able to
+        say why it is empty: check `observable` before reading a zero as zero.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+      responses:
+        "200":
+          description: The artifact's aggregate deployment picture.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactDeploymentsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/admin/artifacts/{id}/min-revision:
+    put:
+      tags: [artifacts]
+      summary: Set the artifact's minimum-revision floor.
+      description: >-
+        Enterprise only. The floor is the oldest approved revision any developer machine
+        may keep being served for this artifact, overriding whatever it has pinned
+        locally; `0` clears it. Idempotent, which is why it is a PUT. It changes NOTHING
+        else about the artifact: in particular it does not return the working copy to
+        draft the way PUT /v1/admin/artifacts/{id} does. Requires If-Match (optimistic
+        concurrency): obtain the current row_version from GET's `ETag` header or
+        `rowVersion` body field first, because the body carries an ABSOLUTE revision
+        number and a blind write by a second admin would silently lower a floor the
+        first one just raised. `minRevision` must be between 0 and the newest approved
+        revision inclusive; anything above it is a 400, since nobody could be served it.
+      parameters:
+        - $ref: "#/components/parameters/IdPathParam"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MinRevisionInput"
+      responses:
+        "200":
+          description: The artifact, with the new floor in `minRevision`.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "428":
+          $ref: "#/components/responses/PreconditionRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
   /v1/admin/artifacts/{id}/rollback:
     post:
       tags: [artifacts]
@@ -977,9 +1975,27 @@ paths:
     get:
       tags: [artifact-entitlements]
       summary: List artifact entitlements for the tenant, keyset-paginated.
+      description: >-
+        `q` (substring search) is NOT supported on this list and is rejected
+        with 400 if passed, empty value included: role_id is a uuid with no
+        natural text column of its own to search.
       parameters:
         - $ref: "#/components/parameters/ListLimit"
         - $ref: "#/components/parameters/ListCursor"
+        - name: sort
+          in: query
+          description: >-
+            Sort column. `role_id` is the only allowed value, the list's
+            existing default order, and the only column servable by an
+            existing index (`artifact_entitlement_tenant_role_id_idx`). Any
+            other value is rejected with 400 rather than silently falling
+            back to the default.
+          required: false
+          schema:
+            type: string
+            enum: [role_id]
+            default: role_id
+        - $ref: "#/components/parameters/ListOrder"
       responses:
         "200":
           description: A page of artifact entitlements (admin view).
@@ -1049,6 +2065,43 @@ components:
         Distinct from the /v1/admin/audit cursor format.
       required: false
       schema: { type: string }
+    ListOrder:
+      name: order
+      in: query
+      description: >-
+        Sort direction. Omit or `asc` for ascending (the default, unchanged
+        from before this parameter existed); `desc` reverses every sort key
+        AND the row id tiebreaker uniformly, a Postgres row comparison
+        cannot express mixed per-key directions, so there is no way to
+        reverse one key but not another. Any other value is rejected with
+        400. A cursor from a page fetched under one direction is refused
+        (400) if replayed after switching `order`, the cursor's sort
+        identity, opaque to clients, is bound to the direction it was
+        minted under (see `cursor`'s own description and `sort` below).
+      required: false
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: asc
+    ListSearch:
+      name: q
+      in: query
+      description: >-
+        Substring search against this list's name column, case-insensitive
+        (`ILIKE`). Omit, or pass an empty value, for no filter: the two are
+        treated identically. Applied in SQL before the keyset cursor
+        predicate and `limit`, so it composes correctly with pagination
+        rather than filtering an already-fetched page. A leading wildcard
+        defeats any btree index, so this is always a sequential scan
+        regardless of table size, acceptable at this list's scale (a
+        Community tenant is capped at a handful of rows; an Enterprise
+        tenant's admin console tables are hundreds to low thousands, not the
+        audit log's millions). `%` and `_` in the search term are matched
+        LITERALLY, not as `LIKE` wildcards: a name containing either
+        character is found by an exact substring match, not treated as a
+        pattern.
+      required: false
+      schema: { type: string }
     IfMatch:
       name: If-Match
       in: header
@@ -1070,6 +2123,19 @@ components:
       schema:
         type: string
         example: '"3"'
+    ScimFilter:
+      name: filter
+      in: query
+      required: false
+      description: >-
+        A SCIM filter expression (RFC 7644 §3.4.2.2). Only `userName eq "<value>"` is
+        supported (single or double quotes, case-insensitive `eq`, extra whitespace
+        tolerated); any other form is refused with 400 rather than silently matching
+        every user (internal/scim.ParseUserNameFilter). Omitted entirely: every user in
+        the tenant.
+      schema:
+        type: string
+        example: 'userName eq "alice"'
   headers:
     ETag:
       description: >-
@@ -1150,6 +2216,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    FindingsDigestMismatch:
+      description: >-
+        POST /v1/admin/artifacts/{id}/acknowledge-findings only: the request's `digest`
+        does not match the artifact's CURRENT `scanFindingsDigest`. The request is
+        well-formed, but the findings it names have moved on, most commonly because the
+        artifact was withdrawn, edited and resubmitted since the digest was read, which
+        re-scans and produces a new one. Re-read the artifact and acknowledge the digest it
+        carries now.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     TooManyRequests:
       description: >-
         The caller's per-principal (subject + OAuth client) token bucket is
@@ -1159,6 +2237,17 @@ components:
       headers:
         Retry-After:
           $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadGateway:
+      description: >-
+        An operator-configured identity-provider check could not be evaluated
+        (403/401/500/timeout from the realm-role lookup PUT /v1/admin/roles/{id}
+        makes when one is configured). Never degrades to the assertion path — a
+        credential that is configured but refused means the check is failing, not
+        unavailable.
       content:
         application/json:
           schema:
@@ -1174,6 +2263,63 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/LimitError"
+    ScimBadRequest:
+      description: >-
+        Malformed body, or a filter this API does not support (never treated as
+        match-all; see ScimFilter).
+      content:
+        application/scim+json:
+          schema:
+            $ref: "#/components/schemas/ScimError"
+    ScimUnauthorized:
+      description: Missing, expired, or invalid bearer token.
+      content:
+        application/scim+json:
+          schema:
+            $ref: "#/components/schemas/ScimError"
+    ScimForbidden:
+      description: Caller lacks the `orbeat-admin` realm role.
+      content:
+        application/scim+json:
+          schema:
+            $ref: "#/components/schemas/ScimError"
+    ScimNotFound:
+      description: No user with this id in the caller's tenant.
+      content:
+        application/scim+json:
+          schema:
+            $ref: "#/components/schemas/ScimError"
+    ScimConflict:
+      description: >-
+        A user with this `userName` already exists in the tenant
+        (`scimType` set to "uniqueness").
+      content:
+        application/scim+json:
+          schema:
+            $ref: "#/components/schemas/ScimError"
+    ScimPayloadTooLarge:
+      description: Request body exceeds the 1 MiB cap.
+      content:
+        application/scim+json:
+          schema:
+            $ref: "#/components/schemas/ScimError"
+    ScimTooManyRequests:
+      description: The caller's per-principal token bucket is exhausted.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/scim+json:
+          schema:
+            $ref: "#/components/schemas/ScimError"
+    ScimNotImplemented:
+      description: >-
+        PUT is not implemented (spec §4); see the operation description on
+        `PUT /scim/v2/Users/{id}`.
+      content:
+        application/scim+json:
+          schema:
+            $ref: "#/components/schemas/ScimError"
   schemas:
     Error:
       type: object
@@ -1251,7 +2397,42 @@ components:
           items:
             type: string
           nullable: true
-      required: [subject, email, roles]
+        features:
+          $ref: "#/components/schemas/MeFeatures"
+      required: [subject, email, roles, features]
+
+    MeFeatures:
+      type: object
+      description: >-
+        Edition-dependent capabilities the admin console reads to decide what to
+        render, so a Community server's console never offers a control that server
+        will 404 on. `pinning` mirrors the same edition fact SyncConfigResponse
+        exposes to orbeat-sync (which serves that client's own bootstrap contract);
+        `virtualKeys` has no SyncConfigResponse counterpart at all, because the
+        virtual-keys admin console page is not something orbeat-sync, a Channel-2
+        distribution client, has any reason to know about.
+      properties:
+        pinning:
+          type: boolean
+          description: >-
+            Whether the artifact minimum-revision floor controls
+            (PUT /v1/admin/artifacts/{id}/min-revision) are served here. Mirrors
+            SyncConfigResponse's own pinning field exactly (same Server.pinning
+            value). False in every Community build: the route is not registered
+            there at all (registerEnterpriseRoutes).
+        virtualKeys:
+          type: boolean
+          description: >-
+            Whether POST/GET/DELETE /v1/admin/virtual-keys (docs/specs/2026-08-25-
+            orbeat-virtual-keys-design.md sec 11) are served here. False in every
+            Community build: the routes are not registered there at all
+            (registerEnterpriseRoutes), because a virtual key is owned by a role
+            and Community allows exactly one (spec sec 12) -- the feature has no
+            shape to gate a control on in a one-role world. The admin console's
+            VirtualKeysPage renders nothing at all when this is false, not a
+            disabled shell, the same fail-closed-while-unknown treatment
+            `pinning` gets from the artifact minimum-revision controls.
+      required: [pinning, virtualKeys]
 
     MCPServer:
       type: object
@@ -1328,9 +2509,14 @@ components:
     ServerInput:
       type: object
       description: >-
-        Admin write DTO for MCP server create/update. secretRef and tlsCaRef are both
-        scheme-prefixed provider references — "env:NAME", "vault:<mount>/<path>#<field>",
-        or "awssm:<name-or-arn>#<jsonkey>" — never a raw secret.
+        Admin write DTO for CREATE (POST /v1/admin/servers) only — see
+        ServerUpdateInput for PUT /v1/admin/servers/{id}, whose secretRef/tlsCaRef
+        contract differs. secretRef and tlsCaRef are both scheme-prefixed
+        provider references — "env:NAME", "vault:<mount>/<path>#<field>", or
+        "awssm:<name-or-arn>#<jsonkey>" — never a raw secret. On create, omitting
+        either field and sending an explicit empty string mean exactly the same
+        thing (no reference at all): a newly created server has no existing value
+        to preserve, so there is no third state to express.
       properties:
         name:
           type: string
@@ -1363,10 +2549,13 @@ components:
             empty string for an unauthenticated upstream. The scheme must be one the server
             has a provider registered for, and the locator must have that provider's shape
             ("vault:" needs <mount>/<path>#<field> with all three non-empty, "awssm:" needs
-            a non-empty secret id, "env:" a non-empty variable name). Validated at write
-            time without being resolved, so an unreachable secret backend does not block a
-            write; a malformed reference returns 400. Never echoed back — responses expose
-            only hasSecret.
+            a non-empty secret id). An "env:" locator needs a non-empty variable name that
+            also carries one of the prefixes the deployment declares in
+            ORBEAT_SECRET_ENV_ALLOW (default "ORBEAT_UPSTREAM_"); a name outside that list
+            returns 400, and an existing row naming one is skipped at dial time. Validated
+            at write time without being resolved, so an unreachable secret backend does not
+            block a write; a malformed reference returns 400. Never echoed back — responses
+            expose only hasSecret.
           example: vault:kv/orbeat/github#token
         tlsCaRef:
           type: string
@@ -1377,7 +2566,67 @@ components:
             validated structurally at write time (NOT resolved, and the bytes are not
             checked to parse as a certificate — that happens at dial time). A malformed
             reference returns 400. Never echoed back — responses expose only hasTlsCa.
-          example: env:INTERNAL_CA_PEM
+          example: env:ORBEAT_UPSTREAM_INTERNAL_CA_PEM
+        status:
+          type: string
+          enum: [active, disabled]
+      required: [name, transport, endpointOrCommand, status]
+
+    ServerUpdateInput:
+      type: object
+      description: >-
+        Admin write DTO for PUT /v1/admin/servers/{id}. Identical to ServerInput
+        except for secretRef/tlsCaRef, which carry BREAKING tri-state PUT
+        semantics as of the 2026-09-01 fix (defect 1): before this, a PUT was a
+        naive full-replace where an omitted key and an explicit "" were
+        byte-identical on the wire and BOTH silently wiped the stored reference —
+        and since GET never echoes either ref back (hasSecret/hasTlsCa booleans
+        only), no read-modify-write client could ever have resent the value it
+        was never shown. Now the presence of the key is meaningful:
+          - key absent from the JSON body: the stored reference is left
+            EXACTLY as it is. This is the new default.
+          - key present with an empty string: the stored reference is
+            CLEARED (set back to no reference at all).
+          - key present with a non-empty string: the stored reference is
+            REPLACED with the new value, validated exactly like ServerInput's.
+        Every other field (name, description, transport, endpointOrCommand,
+        version, protocolVersion, status) is an unconditional full-replace —
+        this tri-state applies to secretRef/tlsCaRef only.
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        transport:
+          type: string
+          enum: [http, sse]
+        endpointOrCommand:
+          type: string
+          example: http://upstream:8000/mcp
+        version:
+          type: string
+        protocolVersion:
+          type: string
+        secretRef:
+          type: string
+          nullable: true
+          description: >-
+            Omit this key to leave the stored secret reference unchanged; send
+            "" to clear it; send a scheme-prefixed reference
+            ("env:NAME"/"vault:<mount>/<path>#<field>"/"awssm:<name-or-arn>#<jsonkey>")
+            to replace it. Same validation rules as ServerInput.secretRef. Never
+            echoed back — responses expose only hasSecret.
+          example: vault:kv/orbeat/github#token
+        tlsCaRef:
+          type: string
+          nullable: true
+          description: >-
+            Omit this key to leave the stored TLS CA reference unchanged; send
+            "" to clear it (verification then falls back to the system trust
+            pool); send a scheme-prefixed reference to replace it. Same
+            validation rules as ServerInput.tlsCaRef. Never echoed back —
+            responses expose only hasTlsCa.
+          example: env:ORBEAT_UPSTREAM_INTERNAL_CA_PEM
         status:
           type: string
           enum: [active, disabled]
@@ -1415,13 +2664,37 @@ components:
           format: uuid
         name:
           type: string
-      required: [id, name]
+        rowVersion:
+          type: integer
+          format: int64
+          description: >-
+            Optimistic-concurrency token (migration 00027). Echo it in `If-Match`
+            (quoted, matching the strong `ETag`) to rename this role. Carried on list
+            rows and the create response too, since there is no GET
+            /v1/admin/roles/{id} — those are the only places a client obtains it.
+      required: [id, name, rowVersion]
 
     RoleInput:
       type: object
       properties:
         name:
           type: string
+      required: [name]
+
+    RoleRenameInput:
+      type: object
+      description: >-
+        The body of PUT /v1/admin/roles/{id} (see that operation's description for
+        when idpRenamed is consulted versus ignored).
+      properties:
+        name:
+          type: string
+        idpRenamed:
+          type: boolean
+          description: >-
+            The operator's assertion that the role was already renamed to `name` in
+            the identity provider. Consulted ONLY when no realm-role lookup is
+            configured; ignored (never a bypass) when one is.
       required: [name]
 
     ListRolesResponse:
@@ -1453,6 +2726,126 @@ components:
           type: integer
           description: How many artifact entitlements this role's deletion cascaded away.
       required: [entitlementsRevoked, artifactEntitlementsRevoked]
+
+    VirtualKeyInput:
+      type: object
+      description: >-
+        The robot's PUBLIC key set only: orbeat never asks for, generates, sees, or
+        stores a private key.
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        roleId:
+          type: string
+          format: uuid
+          description: The owning role; the key's effective access can never exceed this role's live entitlements.
+        jwks:
+          type: object
+          description: A JSON Web Key or JSON Web Key Set (RFC 7517) carrying the robot's public key(s) only.
+        allowedTools:
+          type: array
+          items:
+            type: string
+          description: >-
+            Namespaced `slug__tool` strings narrowing the key below the owning role's own
+            grant. Omitted or null means "everything the role allows"; an empty array
+            denies every tool. A narrowing can only ever REMOVE access the role already
+            has, never add to it.
+      required: [name, roleId, jwks]
+
+    VirtualKey:
+      type: object
+      description: >-
+        No field on this schema is ever a secret, in any state: the credential itself is
+        a Keycloak client authenticating by signed assertion, and orbeat never holds the
+        robot's private key. Returned by POST (the just-created key) and GET (every page
+        row) alike, so a client never needs a second, differently-shaped read to see what
+        it just created.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The virtual_key row's own id (distinct from clientId below).
+        clientId:
+          type: string
+          description: >-
+            The Keycloak client id this key's robot authenticates as (private_key_jwt,
+            signed with the robot's own private key). This, not id, is what the gateway
+            resolves a caller's identity from at request time.
+        roleId:
+          type: string
+          format: uuid
+          description: >-
+            The owning role, as sent on create. A key's effective access is this role's
+            live entitlements INTERSECTED with allowedTools below -- it changes as the
+            role's own grants change, with no further action on the key.
+        name:
+          type: string
+        description:
+          type: string
+        allowedTools:
+          type: array
+          items:
+            type: string
+          description: >-
+            Namespaced `slug__tool` strings narrowing the key below the owning role's own
+            grant, echoing what POST was sent. Omitted entirely (not present in the
+            response body) when the key carries no narrowing, meaning "everything the
+            role allows"; present-but-empty means every tool is denied. Never widens
+            access the role does not already grant.
+        revoked:
+          type: boolean
+          description: >-
+            Whether DELETE /v1/admin/virtual-keys/{id} has been called on this key.
+            Revoked keys are still returned by GET, unfiltered -- this is the field an
+            admin auditing "what did this credential do" reads to tell a live key from a
+            dead one.
+        createdAt:
+          type: string
+          format: date-time
+        rowVersion:
+          type: integer
+          description: >-
+            The optimistic-concurrency token DELETE's If-Match must quote (design doc
+            docs/specs/2026-08-11-orbeat-optimistic-concurrency-design.md §5, same
+            mechanism the IfMatch parameter below documents). Unlike most rows in this
+            API, a virtual key is never PUT -- the only mutation this token guards is
+            the single revoke.
+      required: [id, clientId, roleId, name, description, revoked, createdAt, rowVersion]
+
+    ListVirtualKeysResponse:
+      type: object
+      properties:
+        virtualKeys:
+          type: array
+          items:
+            $ref: "#/components/schemas/VirtualKey"
+        limit:
+          type: integer
+          description: The effective page size after clamping.
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [virtualKeys, limit, nextCursor]
+
+    VirtualKeyRevokeResponse:
+      type: object
+      description: >-
+        Always `revoked: true` on a 200 -- there is no other outcome this operation
+        returns 200 for. `clientId` is repeated here (also on VirtualKey) so a caller
+        that only ever calls DELETE can still name the Keycloak client that was, or was
+        not, cleaned up, without a separate GET.
+      properties:
+        id:
+          type: string
+          format: uuid
+        clientId:
+          type: string
+        revoked:
+          type: boolean
+      required: [id, clientId, revoked]
 
     UserDeleteResponse:
       type: object
@@ -1493,7 +2886,14 @@ components:
           type: array
           items:
             type: string
-      required: [id, roleId, mcpServerId, allowedTools, permissions]
+        rowVersion:
+          type: integer
+          format: int64
+          description: >-
+            Optimistic-concurrency token (migration 00026). Echo it in `If-Match` (quoted,
+            matching the strong `ETag`) to update this grant. Carried on list rows too, so
+            the console can edit straight from the table.
+      required: [id, roleId, mcpServerId, allowedTools, permissions, rowVersion]
 
     EntitlementInput:
       type: object
@@ -1583,6 +2983,76 @@ components:
           description: >-
             The frozen distributed seed memory. Same list-vs-single omission as
             `content`.
+        approvedType:
+          type: string
+          enum: [skill, subagent, rule]
+          description: >-
+            The type that is actually being distributed. With `approvedName` it
+            is the file path on every machine receiving this artifact
+            (`skills/<name>/SKILL.md`, `agents/<name>.md`), so it differs from
+            the live `type` exactly while an identity edit waits for approval.
+            Unlike `approvedContent` this is returned on the list route too, so
+            a client can flag a pending identity change without
+            `include=content`.
+        approvedName:
+          type: string
+          description: >-
+            The name that is actually being distributed. Differs from the live
+            `name` while a rename waits for approval, and it is the name the
+            file on a developer's disk still has. Returned on the list route.
+        targetTags:
+          type: array
+          items:
+            type: string
+          maxItems: 16
+          description: >-
+            Rules only. The project tags this rule applies to; a client writes it
+            only into registered projects carrying at least one of them. Absent or
+            empty means every registered project, which is what a rule did before
+            targeting existed. Each tag is a slug (lowercase, digits, dashes), at
+            most 16 of them, and a repeated tag is a 400 rather than a silent
+            dedupe. Rejected with 400 on any type other than `rule`. The tags
+            themselves are declared by each developer on their own machine
+            (`orbeat-sync project add <path> --tag <tag>`); orbeat never learns
+            which projects carry which.
+        ruleScope:
+          type: string
+          enum: [project, global]
+          description: >-
+            Rules only. `project` (the default when absent) writes the rule into each
+            registered project's AGENTS.md; `global` writes it into the developer's
+            user-level instruction files instead, which every project inherits, for
+            instructions about the person rather than about a repository. A `global`
+            rule may not carry `targetTags`: tags select projects, and a global rule is
+            written into none, so the pair is rejected with 400 rather than stored as a
+            constraint that can never be consulted.
+        approvedRuleScope:
+          type: string
+          enum: [project, global]
+          description: >-
+            The scope actually in effect. Differs from the live `ruleScope` while a
+            scope flip waits for approval: moving a rule to global takes it from the
+            developers who registered a matching project to everyone who syncs, which
+            is a governed change.
+        approvedTargetTags:
+          type: array
+          items:
+            type: string
+          maxItems: 16
+          description: >-
+            The targeting that is actually being distributed. Differs from the
+            live `targetTags` while a re-targeting waits for approval, exactly as
+            `approvedVisibility` does for a channel flip: changing who receives a
+            rule is a governed change, not an edit.
+        approvedVisibility:
+          type: string
+          enum: [org, role]
+          description: >-
+            The visibility that is actually being distributed, i.e. which
+            channel this artifact currently arrives on: `org` through the
+            Channel-1 marketplace plugin, `role` through GET /v1/sync/artifacts
+            under the per-role entitlements. Differs from the live `visibility`
+            while a channel flip waits for approval. Returned on the list route.
         submittedBy:
           type: string
         approvedBy:
@@ -1593,6 +3063,42 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ScanFinding"
+        scanFindingsDigest:
+          type: string
+          description: >-
+            A stable digest of this artifact's CURRENT scan findings (migration 00028),
+            absent when the artifact has no findings or has never been submitted. This is
+            the digest a client echoes back as `digest` on
+            POST /v1/admin/artifacts/{id}/acknowledge-findings, or as
+            `acknowledgedFindingsDigest` on POST /v1/admin/artifacts/{id}/approve. Present
+            on the list route too, like `approvedType`/`approvedName` above and for the
+            same reason: it is slug-sized, not the payload `?include=content` exists to
+            drop, and a review queue needs it on every row without a second round trip.
+        findingsAcknowledged:
+          type: boolean
+          description: >-
+            Whether the artifact's SUBMITTER has acknowledged its CURRENT
+            `scanFindingsDigest`. Computed server-side by comparing the stored
+            acknowledgment digest against `scanFindingsDigest`, never sent as a raw digest
+            for a client to compare itself: that comparison is exactly what
+            POST .../approve refuses a stale approval over, and reimplementing it
+            client-side is a second place to get it wrong. `false` both when nothing has
+            ever been acknowledged and when a re-scan superseded an earlier
+            acknowledgment; also `false` (nothing to acknowledge) when
+            `scanFindingsDigest` is absent.
+        findingsAckBy:
+          type: string
+          description: >-
+            Who acknowledged the CURRENT `scanFindingsDigest`. Present only when
+            `findingsAcknowledged` is `true`: a stale acknowledgment a re-scan superseded
+            is never surfaced here, so this field cannot be misread as "someone
+            acknowledged something".
+        findingsAckAt:
+          type: string
+          format: date-time
+          description: >-
+            When `findingsAckBy` acknowledged the current findings. Present under the
+            same condition as `findingsAckBy`.
         rowVersion:
           type: integer
           format: int64
@@ -1601,12 +3107,25 @@ components:
             docs/specs/2026-08-11-orbeat-optimistic-concurrency-design.md §4),
             maintained by a database trigger and bumped on every UPDATE
             (edit, submit, approve, reject, withdraw, rollback). Echo it back
-            as `If-Match: "<rowVersion>"` on PUT /v1/admin/artifacts/{id} or
-            POST /v1/admin/artifacts/{id}/approve.
+            as `If-Match: "<rowVersion>"` on PUT /v1/admin/artifacts/{id},
+            POST /v1/admin/artifacts/{id}/approve or
+            PUT /v1/admin/artifacts/{id}/min-revision.
+        minRevision:
+          type: integer
+          description: >-
+            The admin's minimum-revision floor: the oldest approved revision any
+            developer machine may keep being served for this artifact, overriding
+            whatever it has pinned locally. `0` means no floor, and it is a real
+            value rather than an absent one, so this property is always sent,
+            including on the list route, where `min_revision_num` is projected
+            alongside `approvedType`/`approvedName` rather than blanked with
+            `content`. Written by PUT /v1/admin/artifacts/{id}/min-revision
+            (Enterprise only); read in both editions.
         roleGrants:
           $ref: "#/components/schemas/ArtifactRoleGrants"
       required:
-        [id, type, name, description, content, version, visibility, approvalState, approved, rowVersion]
+        [id, type, name, description, content, version, visibility, approvalState, approved,
+         findingsAcknowledged, rowVersion, minRevision]
 
     ArtifactRoleGrants:
       type: object
@@ -1618,15 +3137,21 @@ components:
         "zero grants": where it is returned it is always present, count 0 and an
         empty roles array included.
 
-        These grants are LIVE while `visibility` is `role` and DORMANT while it is
-        `org`, because only role-visibility artifacts are distributed through
-        entitlements (GET /v1/sync/artifacts). Changing visibility never deletes
-        them, so a flip back to `role` revives every one of them at once. That is
-        what makes a mistaken flip recoverable, and it is why this field exists: an
+        These grants are LIVE while `approvedVisibility` is `role` and DORMANT
+        while it is `org`, because only role-visibility artifacts are distributed
+        through entitlements (GET /v1/sync/artifacts). Note it is the APPROVED
+        visibility that decides, not the live one: editing `visibility` proposes
+        the flip, and the grants change state when that edit is approved.
+        Changing visibility never deletes them, so a flip back to `role` revives
+        every one of them at once when it reaches distribution. That is what
+        makes a mistaken flip recoverable, and it is why this field exists: an
         admin about to flip back needs to see what is about to be restored. The
         transition itself is recorded in the artifact.update audit event
         (visibilityFrom / visibilityTo / roleGrantsAffected / roleGrantsEffect /
-        roles).
+        roles), whose `roleGrantsEffect` says both what the flip does and whether
+        it has happened yet: `revived` / `dormant` where it is already in effect,
+        `revives_on_approval` / `goes_dormant_on_approval` where it is waiting for
+        an approval.
       properties:
         count:
           type: integer
@@ -1705,6 +3230,28 @@ components:
           type: string
         memorySeed:
           type: string
+        type:
+          type: string
+          enum: [skill, subagent, rule]
+          description: >-
+            The type this revision froze, alongside its payload. Absent on a
+            revision approved before migration 00016, which recorded no
+            identity and was deliberately not backfilled.
+        name:
+          type: string
+          description: >-
+            The name this revision froze. Rolling back to this revision
+            restores it, which MOVES the file on every machine receiving the
+            artifact. All three identity fields are absent together or present
+            together; where they are absent, a rollback restores the content
+            and leaves the distributed identity where it is, and a client
+            rendering the confirmation should say so rather than stay silent.
+        visibility:
+          type: string
+          enum: [org, role]
+          description: >-
+            The visibility, and so the distribution channel, this revision
+            froze. Same absence rule as `name`.
         approvedBy:
           type: string
         approvedAt:
@@ -1729,6 +3276,31 @@ components:
           description: Opaque cursor for the next page; empty when this is the last page.
       required: [revisions, limit, nextCursor]
 
+    ApproveInput:
+      type: object
+      description: >-
+        OPTIONAL. Required only when the artifact carries scan findings
+        (`scanFindingsDigest` non-empty): the APPROVER's own confirmation that they
+        read the artifact's CURRENT findings, echoing `scanFindingsDigest` back as
+        `acknowledgedFindingsDigest`. Omit the body entirely for a clean artifact:
+        it is never required there, and an absent body is never an error. See the
+        operation description for the acknowledgment gate this feeds.
+      properties:
+        acknowledgedFindingsDigest:
+          type: string
+
+    AcknowledgeFindingsInput:
+      type: object
+      description: >-
+        The digest of the findings the submitter is confirming they read, exactly as
+        returned by `scanFindingsDigest` on the artifact. Compared against the artifact's
+        CURRENT `scanFindingsDigest`, under a row lock, at request time, never against
+        itself, which is what makes a mismatch (412) actually detectable.
+      required: [digest]
+      properties:
+        digest:
+          type: string
+
     RejectInput:
       type: object
       description: >-
@@ -1750,6 +3322,17 @@ components:
           type: integer
           description: The revision number to restore to distribution.
       required: [revision]
+
+    MinRevisionInput:
+      type: object
+      properties:
+        minRevision:
+          type: integer
+          minimum: 0
+          description: >-
+            The new floor, an ABSOLUTE revision number rather than a delta, between 0
+            and the artifact's newest approved revision inclusive. `0` clears the floor.
+      required: [minRevision]
 
     PublishStatus:
       type: object
@@ -1820,6 +3403,18 @@ components:
       type: object
       description: One entitled artifact for the Channel-2 sync client, rendered to final file content.
       properties:
+        id:
+          type: string
+          format: uuid
+          description: >-
+            The artifact's stable id. Unconditional: always present, in every edition,
+            independent of any feature that consumes it. Survives a rename, unlike name.
+        revision:
+          type: integer
+          description: >-
+            The artifact_revision.revision_num this approved snapshot came from. Ordinal and
+            server-assigned; unrelated to the admin-authored `version` string. Omitted when 0,
+            which is never a real revision.
         type:
           type: string
           enum: [skill, subagent, rule]
@@ -1833,7 +3428,50 @@ components:
         memorySeed:
           type: string
           description: Governed ORBEAT-SEED block body.
-      required: [type, name, content]
+        targetTags:
+          type: array
+          items:
+            type: string
+          description: >-
+            Rules only, and the APPROVED targeting rather than the live one. The
+            client writes this rule only into registered projects carrying at least
+            one of these tags. Absent means every registered project, so an older
+            client and a newer server agree by the field's absence rather than by a
+            negotiation. A `?pin` selects content, never audience, so this is read
+            from the artifact and not from the pinned revision.
+        ruleScope:
+          type: string
+          enum: [global]
+          description: >-
+            Present only on a rule whose APPROVED scope is `global`, meaning the client
+            writes it into the user-level instruction files rather than into registered
+            projects. Project scope is signalled by the field's absence, so a client that
+            predates scoping keeps writing every rule it is served into projects, which
+            is correct for every rule an older server can describe.
+        oldestServable:
+          type: integer
+          description: >-
+            The oldest revision this caller can be served today, `max(minRevisionNum,
+            MIN(revision_num))`. With `latest` it is the window a client validates a
+            `--revision` against before writing a pin. Absent unless this server supports
+            pinning.
+        latest:
+          type: integer
+          description: >-
+            `MAX(revision_num)`, the newest approved revision. Equal to `revision` unless a
+            pin was honoured below it. Absent unless this server supports pinning.
+        pinOverride:
+          type: string
+          enum: [floor, pruned, ahead]
+          description: >-
+            Why the pin for this artifact was NOT honoured, present only when it was not.
+            `pruned` means the pinned revision no longer exists and the oldest survivor was
+            served; `floor` means an admin's minimum-revision floor raised it; `ahead` means
+            the pin names a revision this server has never approved and the newest was
+            served. When both the floor and the prune boundary bite, the BINDING one is
+            reported, which is the bound a developer would have to act on. Absent unless
+            this server supports pinning.
+      required: [id, type, name, content]
 
     SyncArtifactsResponse:
       type: object
@@ -1849,7 +3487,147 @@ components:
       properties:
         gateway_url:
           type: string
-      required: [gateway_url]
+        deploymentRegistry:
+          type: boolean
+          description: >-
+            Whether this server accepts POST /v1/sync/deployments. Absent on a server
+            predating the registry, which decodes as false, so a client that reports only
+            when this is true degrades correctly against an old server with no negotiation
+            step. False in every Community build regardless of configuration.
+        pinning:
+          type: boolean
+          description: >-
+            Whether GET /v1/sync/artifacts honours `?pin` and carries the three pinning
+            fields. Absent on a server predating pinning, which decodes as false. Check it
+            BEFORE sending a pin: an unaware server ignores `?pin` and serves the latest
+            revision with no error, so a client that does not negotiate cannot tell a
+            honoured pin from an ignored one. Unlike deploymentRegistry there is no
+            operator knob behind this: it is an edition fact, false in every Community
+            build and true in every Enterprise one.
+      required: [gateway_url, deploymentRegistry, pinning]
+
+    DeploymentReportRequest:
+      type: object
+      description: >-
+        One install's report of what it applied. Additional properties are REJECTED, which
+        is how the absence of a user field is enforced rather than merely documented.
+      properties:
+        installId:
+          type: string
+          format: uuid
+          description: >-
+            An opaque uuid the client generates once per machine. Trusted for grouping and
+            for nothing else: it names no row anywhere and confers no access.
+        artifacts:
+          type: array
+          description: >-
+            What this install applied. Absent, null and [] are the same request and all
+            three clear the install's rows.
+          items:
+            $ref: "#/components/schemas/DeploymentReportEntry"
+      required: [installId]
+
+    DeploymentReportEntry:
+      type: object
+      properties:
+        artifactId:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          description: >-
+            The revision this machine holds, as served on GET /v1/sync/artifacts. Not the
+            admin-authored version string. Below 1 is dropped.
+        pinned:
+          type: boolean
+          description: >-
+            Whether this install applied `revision` because a local pin
+            (~/.config/orbeat/pins.json) named it, rather than because it is simply the
+            latest the server would otherwise have served. Self-asserted, like every other
+            value here. Sent only when GET /v1/sync/config advertised `pinning: true` for
+            THIS run: a server that has the deployment registry but not pinning has no such
+            property on its own copy of this schema, and DeploymentReportRequest's
+            "additional properties are REJECTED" now means it 400s the whole report on this
+            exact key if a client ever sends it unconditionally. Absent (never `false` on
+            the wire) for an unpinned artifact.
+      required: [artifactId, revision]
+
+    DeploymentReportResponse:
+      type: object
+      properties:
+        recorded:
+          type: integer
+          description: Rows written. Lower than the number sent when an id was repeated, since the last entry for an id wins.
+        dropped:
+          type: integer
+          description: >-
+            Entries not recorded, because the caller is no longer entitled to that artifact
+            or the revision was below 1. The client cannot compute this itself, which is why
+            the response is 200 with counts rather than 204.
+      required: [recorded, dropped]
+
+    ArtifactDeploymentsResponse:
+      type: object
+      description: >-
+        One artifact's deployment picture, aggregated. Every field is a count or a
+        timestamp: there is deliberately no per-install or per-user detail here, and adding
+        any would reverse the design decision this endpoint was built on.
+      properties:
+        installs:
+          type: integer
+          description: Machines holding this artifact. A developer with a laptop and a desktop counts twice.
+        users:
+          type: integer
+          description: Distinct people. Never larger than installs, and not derivable from it.
+        latestRevision:
+          type: integer
+          description: >-
+            The newest APPROVED revision, which is not the newest reported one. 0 for an
+            artifact that has never been approved.
+        byRevision:
+          type: array
+          description: Installs per reported revision, newest reported revision first. Always an array.
+          items:
+            $ref: "#/components/schemas/RevisionInstalls"
+        behindLatest:
+          type: integer
+          description: >-
+            Installs on a revision below latestRevision. Equals installs when a revision was
+            just approved and nothing has picked it up yet.
+        behindLatestPinned:
+          type: integer
+          description: >-
+            Of the installs behindLatest counts, how many reported pinned: true, i.e. a
+            developer deliberately holding a revision back rather than a machine nobody has
+            opened. ONE scalar, not a per-revision split on byRevision: a pinned count on
+            every bar sharpens the exact axis this aggregate exists to blunt, and in a
+            small tenant a bar reading one install names a person.
+        oldestReportedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When the least recently refreshed of these installs last reported. Null when
+            nothing has reported. Without it "3 behind" cannot be told from three laptops
+            thrown away last spring.
+        observable:
+          type: boolean
+          description: >-
+            Whether a zero above means zero. False says orbeat cannot see this artifact's
+            installs at all, which is the opposite fact and produces identical numbers.
+        unobservableReason:
+          type: string
+          description: Why the numbers are blind. Present only when observable is false.
+      required: [installs, users, latestRevision, byRevision, behindLatest, behindLatestPinned, oldestReportedAt, observable]
+
+    RevisionInstalls:
+      type: object
+      properties:
+        revision:
+          type: integer
+        installs:
+          type: integer
+      required: [revision, installs]
 
     AuditEvent:
       type: object
@@ -1888,3 +3666,424 @@ components:
           type: string
           description: Opaque cursor for the next page; empty when this is the last page.
       required: [events, limit, nextCursor]
+
+    ScimError:
+      type: object
+      description: >-
+        The SCIM error object (RFC 7644 §3.12): every 4xx/5xx from a /scim/v2 route,
+        never this document's own Error schema above.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:api:messages:2.0:Error"]
+        status:
+          type: string
+          description: The HTTP status code, as a JSON STRING per RFC 7644 §3.12 verbatim.
+          example: "404"
+        scimType:
+          type: string
+          description: Set to "uniqueness" on a 409 from a duplicate userName; omitted otherwise.
+        detail:
+          type: string
+      required: [schemas, status]
+
+    ScimEmailAddress:
+      type: object
+      description: >-
+        One entry of a RESPONSE's `emails` attribute (RFC 7643 §4.1.2). This API emits
+        at most one, marked primary, because it stores one address per user. The request
+        shape is ScimEmailAddressInput, deliberately a separate schema: what a client
+        may send and what this API emits are different sets, and describing both with
+        one schema is how the create body came to be documented as the four fields its
+        own parser happened to model.
+      properties:
+        value:
+          type: string
+          format: email
+        primary:
+          type: boolean
+
+    ScimEmailAddressInput:
+      type: object
+      description: >-
+        One entry of a REQUEST's `emails` attribute. Any number of entries is accepted,
+        each carrying any sub-attributes (`type`, `display`, ...). The one that is
+        stored is the entry flagged `primary` with a non-empty `value`, or failing that
+        the first non-empty `value`; position does not decide it, because IdPs do not
+        guarantee the primary address is listed first.
+      additionalProperties: true
+      properties:
+        value:
+          type: string
+          format: email
+        primary:
+          type: boolean
+        type:
+          type: string
+          description: Accepted and discarded; never emitted on a response.
+          example: work
+
+    ScimUser:
+      type: object
+      description: The SCIM core User resource (RFC 7643 §4.1), restricted to what orbeat stores.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:schemas:core:2.0:User"]
+        id:
+          type: string
+          format: uuid
+        userName:
+          type: string
+          description: Maps to users.subject (the OIDC subject), unique per tenant.
+        displayName:
+          type: string
+        emails:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScimEmailAddress"
+        active:
+          type: boolean
+          description: The inverse of users.deactivated_at being set (migration 00021).
+        meta:
+          type: object
+          properties:
+            resourceType:
+              type: string
+              example: User
+            location:
+              type: string
+              description: Request-relative path to this resource (e.g. /scim/v2/Users/{id}).
+      required: [schemas, id, userName, active, meta]
+
+    ScimCreateUserInput:
+      type: object
+      description: >-
+        POST /scim/v2/Users' body. The properties below are what this API READS, not
+        what a client may WRITE: decoding is lenient, so every other attribute is
+        accepted and discarded rather than rejected. `password` in particular is
+        accepted and never stored, since authentication belongs to the IdP.
+      additionalProperties: true
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          description: >-
+            Required of a client by RFC 7644 §3.3, and accepted here without being
+            validated. The URL already fixes the resource type, so a check could only
+            reject a request this API would otherwise honour, including the real bodies
+            that list the enterprise extension URN beside the core one.
+          example: ["urn:ietf:params:scim:schemas:core:2.0:User"]
+        userName:
+          type: string
+        displayName:
+          type: string
+        emails:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScimEmailAddressInput"
+        active:
+          type: boolean
+          description: >-
+            Omitted means active (the correct default for a new row). An explicit
+            `false` deactivates the row inside the same transaction that creates it.
+
+
+            A QUOTED boolean is also accepted here and on PATCH (`"true"`, `"false"`,
+            `"True"`, `"False"`), because Microsoft Entra ID's SCIM client sends the
+            value as a string by default and the documented opt-out
+            (`?aadOptscim062020`) does not work with Provision on Demand. Any other
+            string, and any number, is a 400: the widening tolerates a measured client
+            defect, it does not turn the attribute into free text.
+      required: [userName]
+
+    ScimListResponse:
+      type: object
+      description: >-
+        GET /scim/v2/Users' body, always: an empty result is totalResults: 0 with an
+        empty Resources array, never a 404.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:api:messages:2.0:ListResponse"]
+        totalResults:
+          type: integer
+        itemsPerPage:
+          type: integer
+        startIndex:
+          type: integer
+        Resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScimUser"
+      required: [schemas, totalResults, itemsPerPage, startIndex, Resources]
+
+    ScimPatchOperation:
+      type: object
+      additionalProperties: true
+      properties:
+        op:
+          type: string
+          enum: [add, remove, replace]
+          description: >-
+            RFC 7644 §3.5.2's three operations, matched case-insensitively because Entra
+            ID capitalizes them ("Replace") where Okta does not. Any other value, the
+            empty string included, is a 400 with `scimType: "invalidSyntax"`, and since
+            §3.5.2 makes PATCH atomic it fails the whole request before anything is
+            written. On a single-valued attribute `add` replaces the value (§3.5.2.1),
+            so it and `replace` behave identically here.
+          example: replace
+        path:
+          type: string
+          description: >-
+            Attribute path, matched case-insensitively. Only "active" and "displayName"
+            are applied; every other attribute (emails, name.*, ...) is silently
+            ignored, never rejected, under any op. Omitted entirely is accepted for
+            add/replace (RFC 7644 §3.5.2.3): "value" is then a whole object of attribute
+            names to new values, the shape Okta is known to send for "active". Omitted
+            on a `remove` is a 400 with `scimType: "noTarget"` (§3.5.2.2 verbatim), and
+            `remove` of "active" is a 400 with `scimType: "invalidValue"` because
+            `users.deactivated_at` is either set or unset, leaving no way to read the
+            operation except by guessing a deprovision or a reactivation.
+        value:
+          description: >-
+            Required for add and replace; a `remove` legitimately carries none, and one
+            sent with a remove is not read.
+      required: [op]
+
+    ScimPatchRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          description: >-
+            Accepted and deliberately not validated, the same call ScimCreateUserInput
+            documents for its own `schemas`.
+          example: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"]
+        Operations:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ScimPatchOperation"
+      required: [Operations]
+
+    ScimServiceProviderConfig:
+      type: object
+      description: >-
+        GET /scim/v2/ServiceProviderConfig's body (RFC 7644 §4.1; RFC 7643 §5, example
+        §8.5): ONE JSON object, not an array or a ListResponse, since there is exactly
+        one service provider to describe. patch and filter are true because both are
+        genuinely implemented; bulk, changePassword, sort and etag are honestly false --
+        none of them exist on this surface, and advertising true would let an IdP send a
+        request this server then rejects at runtime.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"]
+        patch:
+          $ref: "#/components/schemas/ScimSupportedFlag"
+        bulk:
+          type: object
+          properties:
+            supported: { type: boolean, example: false }
+            maxOperations: { type: integer }
+            maxPayloadSize: { type: integer }
+          required: [supported]
+        filter:
+          type: object
+          description: >-
+            maxResults is 1, not a round number: the only filter this API accepts
+            (userName eq) matches users.subject, unique per tenant, so a filtered query
+            can never return more than one resource.
+          properties:
+            supported: { type: boolean, example: true }
+            maxResults: { type: integer, example: 1 }
+          required: [supported, maxResults]
+        changePassword:
+          $ref: "#/components/schemas/ScimSupportedFlag"
+        sort:
+          $ref: "#/components/schemas/ScimSupportedFlag"
+        etag:
+          $ref: "#/components/schemas/ScimSupportedFlag"
+        authenticationSchemes:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, example: oauthbearertoken }
+              name: { type: string }
+              description: { type: string }
+              specUri: { type: string }
+              primary: { type: boolean }
+        meta:
+          type: object
+          properties:
+            resourceType: { type: string, example: ServiceProviderConfig }
+            location: { type: string }
+      required: [schemas, patch, bulk, filter, changePassword, sort, etag, meta]
+
+    ScimSupportedFlag:
+      type: object
+      description: The shared shape of every all-or-nothing capability flag in ScimServiceProviderConfig.
+      properties:
+        supported:
+          type: boolean
+      required: [supported]
+
+    ScimResourceType:
+      type: object
+      description: >-
+        One entry of GET /scim/v2/ResourceTypes' body (RFC 7643 §6, example §8.6): a
+        bare JSON array, never ListResponse-wrapped. Exactly one entry exists -- User --
+        per the design's DECIDED "no /Groups" position (spec §1): orbeat stores no group
+        membership, so a Group entry would advertise a capability that silently does
+        nothing.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:schemas:core:2.0:ResourceType"]
+        id:
+          type: string
+          example: User
+        name:
+          type: string
+          example: User
+        endpoint:
+          type: string
+          example: /scim/v2/Users
+        description:
+          type: string
+        schema:
+          type: string
+          example: "urn:ietf:params:scim:schemas:core:2.0:User"
+        meta:
+          type: object
+          properties:
+            resourceType: { type: string, example: ResourceType }
+            location: { type: string }
+      required: [schemas, id, name, endpoint, schema, meta]
+
+    ScimAttribute:
+      type: object
+      description: One entry of a ScimSchema's "attributes" (RFC 7643 §7).
+      properties:
+        name: { type: string }
+        type: { type: string }
+        multiValued: { type: boolean }
+        description: { type: string }
+        required: { type: boolean }
+        caseExact: { type: boolean }
+        mutability: { type: string, enum: [readOnly, readWrite, immutable, writeOnly] }
+        returned: { type: string, enum: [always, never, default, request] }
+        uniqueness: { type: string, enum: [none, server, global] }
+        subAttributes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScimAttribute"
+      required: [name, type, multiValued, required, caseExact, mutability, returned, uniqueness]
+
+    ScimSchema:
+      type: object
+      description: >-
+        One entry of GET /scim/v2/Schemas' body (RFC 7643 §7, example §8.7): a bare
+        JSON array, never ListResponse-wrapped. id is the URN of the schema being
+        described (e.g. urn:ietf:params:scim:schemas:core:2.0:User), not the
+        urn:...:Schema meta-schema, which appears in "schemas" instead. Describes
+        exactly the attributes internal/scim.User (and ScimUser above) actually carry --
+        userName, displayName, emails, active -- and no others.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:schemas:core:2.0:Schema"]
+        id:
+          type: string
+          example: "urn:ietf:params:scim:schemas:core:2.0:User"
+        name:
+          type: string
+          example: User
+        description:
+          type: string
+        attributes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScimAttribute"
+        meta:
+          type: object
+          properties:
+            resourceType: { type: string, example: Schema }
+            location: { type: string }
+      required: [schemas, id, name, attributes, meta]
+
+    UsageReportRow:
+      type: object
+      description: >-
+        Total ALLOWED calls for one (role, server) pair, summed across every subject and
+        every day in the requested range.
+      properties:
+        roleId:
+          type: string
+          format: uuid
+        serverId:
+          type: string
+          format: uuid
+        calls:
+          type: integer
+          format: int64
+      required: [roleId, serverId, calls]
+
+    UsageReportResponse:
+      type: object
+      properties:
+        usage:
+          type: array
+          items:
+            $ref: "#/components/schemas/UsageReportRow"
+        limit:
+          type: integer
+          description: The effective page size after clamping.
+        nextCursor:
+          type: string
+          description: Opaque cursor for the next page; empty when this is the last page.
+      required: [usage, limit, nextCursor]
+
+    RoleQuotaInput:
+      type: object
+      properties:
+        monthlyCalls:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            0 blocks every call for the role starting the next quota-cache refresh; there
+            is no separate "unlimited" value on this schema, since unlimited is expressed
+            by having no quota row at all (DELETE this resource).
+      required: [monthlyCalls]
+
+    RoleQuota:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The role_quota row's own id.
+        roleId:
+          type: string
+          format: uuid
+        monthlyCalls:
+          type: integer
+          format: int64
+        rowVersion:
+          type: integer
+          description: >-
+            The optimistic-concurrency token PUT/DELETE's If-Match must quote, mirrored
+            on the `ETag` response header. Read it from either; prefer the `ETag` header
+            or this `rowVersion` body field, e.g. `"3"`, sent back as `If-Match: "3"`.
+      required: [id, roleId, monthlyCalls, rowVersion]

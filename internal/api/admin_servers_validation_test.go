@@ -358,7 +358,7 @@ func TestServerWriteAcceptsWellFormed(t *testing.T) {
 	in := map[string]any{
 		"name": "val-ok", "transport": "http",
 		"endpointOrCommand": "http://upstream:8000",
-		"secretRef":         "env:GITHUB_TOKEN", "status": "active",
+		"secretRef":         "env:ORBEAT_UPSTREAM_GITHUB_TOKEN", "status": "active",
 	}
 	rec := httptest.NewRecorder()
 	srv.handleCreateServer(rec, adminReq(ctx, http.MethodPost, "/v1/admin/servers", in, tn))
@@ -379,12 +379,14 @@ func TestServerWriteValidatesTLSCARef(t *testing.T) {
 		wantOK bool
 	}{
 		{"empty is allowed", "", true},
-		{"registered scheme", "env:INTERNAL_CA", true},
+		{"registered scheme", "env:ORBEAT_UPSTREAM_INTERNAL_CA", true},
 		{"unregistered scheme", "valut:pki/ca#pem", false},
 		{"no scheme", "just-a-string", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			msg, ok := validateServerWrite(secrets.NewResolver(), "https://h/x", "", tc.ref)
+			empty := ""
+			ref := tc.ref
+			msg, ok := validateServerWrite(secrets.NewResolver(), "https://h/x", &empty, &ref)
 			if ok != tc.wantOK {
 				t.Fatalf("validateServerWrite(tlsCaRef=%q) ok = %v, want %v (msg %q)", tc.ref, ok, tc.wantOK, msg)
 			}
@@ -421,7 +423,7 @@ func TestCreateServerPersistsTLSCARef(t *testing.T) {
 	in := map[string]any{
 		"name": "tls-good", "transport": "http",
 		"endpointOrCommand": "https://ok.example/mcp", "status": "active",
-		"tlsCaRef": "env:INTERNAL_CA",
+		"tlsCaRef": "env:ORBEAT_UPSTREAM_INTERNAL_CA",
 	}
 	rec := httptest.NewRecorder()
 	srv.handleCreateServer(rec, adminReq(ctx, http.MethodPost, "/v1/admin/servers", in, tn))
@@ -444,7 +446,7 @@ func TestCreateServerPersistsTLSCARef(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("get: status = %d, want 200 (body %s)", rec.Code, rec.Body)
 	}
-	if got := rec.Body.String(); strings.Contains(got, "env:INTERNAL_CA") {
+	if got := rec.Body.String(); strings.Contains(got, "env:ORBEAT_UPSTREAM_INTERNAL_CA") {
 		t.Fatalf("get response echoes the raw tlsCaRef locator: %s", got)
 	}
 	var got map[string]any

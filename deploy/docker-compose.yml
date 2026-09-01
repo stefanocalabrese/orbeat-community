@@ -91,25 +91,50 @@ services:
       ORBEAT_GATEWAY_RESOURCE_URL: "http://localhost:8090"
       # Per-principal rate limiting (docs/specs/2026-08-12-orbeat-rate-limiting-design.md).
       # The production default (rps=50, burst=200, cmd/api/main.go) is sized
-      # for one interactive admin and is deliberately NOT raised here — this
-      # override exists only because THIS stack also backs `make smoke` and
-      # the portal e2e suite, and three of its specs
-      # (pagination.spec.ts, concurrency.spec.ts, roles.spec.ts) all seed
-      # through the real API as the SAME (subject=boss, client=orbeat-cli)
-      # principal — one shared bucket (internal/ratelimit.KeyFor keys on
-      # subject+client, not per-test). Measured call counts against that one
-      # bucket for a full run: pagination.spec.ts alone issues ~531 (105
-      # server creates + 105 deletes, 105 artifact creates + 105 submits +
-      # 105 deletes, ~6 calls across its other two single-row tests);
-      # concurrency.spec.ts adds ~19; roles.spec.ts adds ~13. Total ~563.
-      # Raised to 1000 (not the plan's originally-proposed 400, which left
-      # only ~15% headroom over the window it modeled — see plan correction
-      # C4, docs/plans/orbeat-rate-limiting-2026-08-12.md): ~78% headroom
-      # over the measured 563, so the gate does not flake on timing, and
-      # slack for a future admin e2e spec to add its own calls to this SAME
-      # bucket without silently re-tripping this limit. If you add such a
-      # spec and it starts flaking here, re-derive the count above — do not
-      # "fix" it by lowering this value or slowing the tests.
+      # for one interactive admin. This override exists only because THIS
+      # stack also backs `make smoke` and the portal e2e suite, whose seeding
+      # traffic is a short structural spike rather than anything a human does.
+      #
+      # BACK TO 1000 on 2026-08-27, and the reason is that the premise of the
+      # previous derivation stopped being true the same day. That derivation
+      # measured 793 requests on ONE bucket because nearly every spec in
+      # portal/e2e authenticated as "boss", and internal/ratelimit.KeyFor keys
+      # on subject+client, so fourteen spec files shared a single bucket. The
+      # five seeding-heavy specs now each have their own Keycloak identity
+      # (deploy/keycloak/orbeat-realm.json, gated by
+      # internal/deploy/e2e_identity_test.go), so that one bucket no longer
+      # exists and 1600 was sized for a condition that is gone.
+      #
+      # Measured after the split, from the api container's own request logs
+      # over a full 32-spec run on a fresh stack, grouped by identity:
+      # e2e-pagination 552, e2e-sortsearch 217, boss 128, boss2 72,
+      # e2e-concurrency 34, e2e-roles 28, e2e-auditfilters 10, alice 6.
+      # All 969 of those were one bucket before the split.
+      #
+      # BE PRECISE ABOUT WHAT 552 IS. It is counted per SUBJECT, which merges
+      # this user's browser client (orbeat-portal) and its direct-seeding
+      # client (orbeat-cli) even though those are two separate buckets. So 552
+      # is an UPPER BOUND on any single bucket, not a measurement of one. The
+      # refill-aware minimum was NOT re-derived here: the previous round
+      # replayed captured arrival timestamps through the real token-bucket
+      # semantics to get 533 against a raw 793, and no equivalent replay was
+      # run this time.
+      #
+      # 1000 is justified without that replay, by comparison rather than by a
+      # fresh model: 1000 previously absorbed a raw 793 on a single bucket
+      # across six full-suite runs with ZERO 429s observed, and the new raw
+      # upper bound per bucket is 552. Strictly less demand against the same
+      # depth means strictly more headroom than it had when it was already
+      # sufficient. rps stays at the production default, because the excess is
+      # a spike over roughly 5 seconds, not sustained load above 50/s.
+      #
+      # No 429 has ever been observed here, at 1000 or at 1600. That is worth
+      # stating plainly: this limit has not been seen to trip, and the 1600
+      # raise was precautionary rather than a fix for anything reproduced.
+      #
+      # If a new spec starts flaking here, first check it has its own identity
+      # (the gate above enforces that for specs defining a local adminToken),
+      # then re-derive the counts. Do not "fix" it by slowing the tests.
       ORBEAT_RATELIMIT_BURST: "1000"
       # Unset (the default) resolves to "", which internal/config treats as
       # "OTel disabled" — no-op providers, zero overhead, exactly as before.
@@ -128,6 +153,48 @@ services:
       # variable. scripts/smoke.sh exports its own value before bringing the
       # stack up, exercising the cap without touching make up/e2e.
       ORBEAT_ARTIFACT_REVISION_KEEP: ${ORBEAT_ARTIFACT_REVISION_KEEP:-}
+      # Artifact deployment registry (docs/specs/2026-08-22-orbeat-artifact-
+      # deployment-registry-design.md). Unset (the default) resolves to "",
+      # which config.DeploymentRegistryEnabled reads as OFF: no report route is
+      # registered and /v1/sync/config advertises deploymentRegistry false, so
+      # `make up` and the Playwright e2e job collect nothing about anybody.
+      # Do NOT hard-code a value here. This knob turns on per-developer
+      # collection, and the one place it may default to on is nowhere.
+      # scripts/smoke.sh exports "true" before bringing the stack up, because
+      # its binary gate is the only place a client report can be observed end
+      # to end (spec sec 15, G1).
+      ORBEAT_DEPLOYMENT_REGISTRY: ${ORBEAT_DEPLOYMENT_REGISTRY:-}
+      # Advisory LLM content scanner, pointed at the fake-llm service below.
+      #
+      # HARD-CODED ON, where ORBEAT_OTEL_ENDPOINT / _ARTIFACT_REVISION_KEEP /
+      # _DEPLOYMENT_REGISTRY above are deliberately left as unset
+      # passthroughs. The difference is what the knob turns on. Those three
+      # change what the product does to real operators and real developers, so
+      # their default is off. This one points at a fixture that exists only in
+      # this file, and its whole purpose is that the code path runs on every
+      # `make up`, `make smoke` and Playwright run rather than never running
+      # anywhere: an off default would reproduce the situation this was added
+      # to fix.
+      #
+      # WHAT THIS DOES NOT ESTABLISH: fake-llm's findings are canned, so a
+      # green run here is coverage of the path and nothing more. It is not
+      # evidence about a real model's false-positive rate, and so not an input
+      # to whether an LLM finding may ever block a submit.
+      #
+      # In a Community build this is inert: the generator drops
+      # cmd/api/scanner_enterprise.ee.go and the no-op counterpart ignores
+      # every ORBEAT_SCAN_LLM_* value, so fake-llm sits idle and the rule
+      # scanner runs alone, exactly as before.
+      ORBEAT_SCAN_LLM_ENDPOINT: "http://fake-llm:9100"
+      ORBEAT_SCAN_LLM_PROVIDER: "openai"
+      ORBEAT_SCAN_LLM_MODEL: "fake-llm-dev"
+      # The key ref is resolved fail-closed at startup (internal/secrets), so
+      # this pair covers the real resolution path rather than skipping it: an
+      # unset or empty ORBEAT_FAKE_LLM_KEY aborts cmd/api instead of quietly
+      # sending an empty bearer token. The value is not a secret and is not
+      # checked by fake-llm, which only asserts that SOME key arrived.
+      ORBEAT_SCAN_LLM_KEY_REF: "env:ORBEAT_FAKE_LLM_KEY"
+      ORBEAT_FAKE_LLM_KEY: "dev-fake-llm-key-not-a-secret"
     ports:
       - "127.0.0.1:8080:8080"
     # Self-probe healthcheck: the distroless image has no shell/curl, so the
@@ -144,6 +211,14 @@ services:
         condition: service_healthy
       keycloak:
         condition: service_healthy
+      # service_healthy, not service_started, and the reason is the scanner's
+      # fail-open contract: if a scan cannot reach its endpoint it returns an
+      # "info" finding rather than an error. An api that started ahead of
+      # fake-llm would therefore not fail, it would silently attach a finding
+      # to any artifact submitted in that window, suspending trusted-author
+      # auto-approval for reasons no test would connect to a startup race.
+      fake-llm:
+        condition: service_healthy
 
   upstream:
     build:
@@ -151,6 +226,36 @@ services:
       dockerfile: deploy/Dockerfile.upstream
     ports:
       - "127.0.0.1:9000:9000"
+
+  # Stand-in LLM endpoint for the advisory content scanner. Full rationale,
+  # including the sentinel and why it flags nothing else, is in
+  # deploy/fakellm/main.go; the api's ORBEAT_SCAN_LLM_* block above points at
+  # it.
+  #
+  # Deliberately publishes NO host port. Nothing on the host calls it: the api
+  # reaches it by compose service name, and the evidence that it ran is its own
+  # log line (`docker compose -f deploy/docker-compose.yml logs fake-llm`,
+  # one "fakellm: scan ..." line per artifact submit), which is better proof
+  # than a port anyone could curl.
+  #
+  # Deliberately NOT behind a compose profile either, and that is not an
+  # oversight. Profiles gate services, not the variables on other services, so
+  # a profiled fake-llm plus a hard-coded ORBEAT_SCAN_LLM_ENDPOINT on api would
+  # leave the default stack scanning against a service that is not running.
+  # The scanner fails OPEN, so that would not error: it would attach an "info"
+  # finding to every single submit, which is exactly the outcome the sentinel
+  # design exists to avoid.
+  fake-llm:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.fakellm
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/fakellm", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
   gateway:
     build:

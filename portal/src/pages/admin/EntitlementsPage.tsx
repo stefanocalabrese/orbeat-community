@@ -5,6 +5,7 @@ import {
   useDeleteEntitlement,
   useEntitlements,
   useRoles,
+  useUpdateEntitlement,
 } from "../../api/queries";
 import { ApiRequestError, errMsg } from "../../api/client";
 import { FormField, inputCls } from "../../components/FormField";
@@ -12,15 +13,26 @@ import { QueryGate } from "../../components/QueryGate";
 import { Button } from "../../components/ui/Button";
 import { Chip } from "../../components/ui/Badge";
 import { Card, Panel } from "../../components/ui/Card";
+import { SortableTh } from "../../components/ui/AdminListControls";
 
 export default function EntitlementsPage() {
-  const ents = useEntitlements();
+  // order-only: entitlements REFUSE ?q= with 400 on mere presence
+  // (useEntitlements's params type carries no q field at all), so this page
+  // renders no search box; see ListSearchBox's own comment.
+  const [order, setOrder] = useState<"asc" | "desc">("asc");
+  const ents = useEntitlements({ order });
   const { rows: entitlements } = ents;
   const roles = useRoles();
   const servers = useAdminServers();
   const create = useCreateEntitlement();
   const del = useDeleteEntitlement();
+  const update = useUpdateEntitlement();
   const [open, setOpen] = useState(false);
+  // The row being edited, and the draft tool list for it. Keyed by id rather
+  // than by index: the list re-sorts and re-pages under the user, and an index
+  // would silently start editing a different grant.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTools, setEditTools] = useState("");
   const [roleId, setRoleId] = useState("");
   const [serverId, setServerId] = useState("");
   const [tools, setTools] = useState("");
@@ -57,12 +69,52 @@ export default function EntitlementsPage() {
     );
   }
 
+  // "" means every tool, matching the API's `allowedTools: null`. The empty
+  // string cannot mean "no tools": a grant that allows nothing is a grant that
+  // should be deleted, and letting a blank field mean that would turn a
+  // half-finished edit into a silent revocation.
+  const parseTools = (raw: string): string[] | null => {
+    const parts = raw.split(",").map((t) => t.trim()).filter(Boolean);
+    return parts.length === 0 ? null : parts;
+  };
+
+  function startEdit(id: string, allowedTools: string[] | null) {
+    // Reset the mutation when (re)opening an edit, same as every other
+    // admin form's openCreate/openEdit — otherwise a stale 412 from a
+    // PRIOR attempt (on this row or another) outlives the edit that caused
+    // it, including surviving Cancel below, which discards the draft but
+    // not the mutation's own error state.
+    update.reset();
+    setEditingId(id);
+    setEditTools(allowedTools === null ? "" : allowedTools.join(", "));
+  }
+
+  function cancelEdit() {
+    update.reset();
+    setEditingId(null);
+  }
+
+  function saveEdit(e: React.FormEvent, row: { id: string; permissions: string[]; rowVersion: number }) {
+    e.preventDefault();
+    update.mutate(
+      {
+        id: row.id,
+        allowedTools: parseTools(editTools),
+        // Permissions are not editable here and are echoed back unchanged: the
+        // PUT is a full replace, so omitting them would silently clear them.
+        permissions: row.permissions,
+        rowVersion: row.rowVersion,
+      },
+      { onSuccess: () => setEditingId(null) },
+    );
+  }
+
   const entitlementsTable = (
     <Panel className="mt-4">
       <table className="w-full text-sm">
         <thead className="bg-inset">
           <tr>
-            <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">Role</th>
+            <SortableTh label="Role" order={order} onToggle={() => setOrder(order === "asc" ? "desc" : "asc")} />
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">Server</th>
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint">Tools</th>
             <th className="border-b border-border p-3 text-left text-[11px] font-semibold uppercase tracking-wide text-faint" />
@@ -77,7 +129,18 @@ export default function EntitlementsPage() {
                 <td className={`${cellCls} font-medium text-text`}>{roleName(e.roleId)}</td>
                 <td className={`${cellCls} text-text`}>{serverName(e.mcpServerId)}</td>
                 <td className={cellCls}>
-                  {e.allowedTools === null ? (
+                  {editingId === e.id ? (
+                    <form id={`edit-${e.id}`} onSubmit={(ev) => saveEdit(ev, e)}>
+                      <input
+                        type="text"
+                        aria-label={`Allowed tools for ${roleName(e.roleId)} on ${serverName(e.mcpServerId)}`}
+                        value={editTools}
+                        onChange={(ev) => setEditTools(ev.target.value)}
+                        placeholder="leave empty for all tools"
+                        className={inputCls}
+                      />
+                    </form>
+                  ) : e.allowedTools === null ? (
                     <span className="text-xs text-faint">all tools</span>
                   ) : (
                     <div className="flex flex-wrap gap-1">
@@ -88,14 +151,37 @@ export default function EntitlementsPage() {
                   )}
                 </td>
                 <td className={`${cellCls} text-right`}>
-                  <button
-                    onClick={() => {
-                      if (window.confirm("Delete entitlement?")) del.mutate(e.id);
-                    }}
-                    className="text-sm font-medium text-danger hover:text-danger"
-                  >
-                    Delete
-                  </button>
+                  {editingId === e.id ? (
+                    <div className="flex justify-end gap-2">
+                      {/* type is explicit on both: a bare <button> inside a
+                          form defaults to submit, so an untyped Cancel would
+                          save the edit it is meant to discard. */}
+                      <Button type="submit" form={`edit-${e.id}`} disabled={update.isPending}>
+                        {update.isPending ? "Saving…" : "Save"}
+                      </Button>
+                      <Button type="button" variant="ghost" onClick={cancelEdit}>
+                        Cancel
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="flex justify-end gap-3">
+                      <button
+                        type="button"
+                        onClick={() => startEdit(e.id, e.allowedTools)}
+                        className="text-sm font-medium text-accent-ink hover:underline"
+                      >
+                        Edit tools
+                      </button>
+                      <button
+                        onClick={() => {
+                          if (window.confirm("Delete entitlement?")) del.mutate(e.id);
+                        }}
+                        className="text-sm font-medium text-danger hover:text-danger"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  )}
                 </td>
               </tr>
             );
@@ -116,6 +202,14 @@ export default function EntitlementsPage() {
           New entitlement
         </Button>
       </div>
+
+      {update.error && (
+        <p className="mt-4 text-sm text-danger">
+          {update.error instanceof ApiRequestError && update.error.status === 412
+            ? "Someone else changed this entitlement while you were editing. Reload the page and reapply your change."
+            : `Failed to update entitlement: ${errMsg(update.error)}`}
+        </p>
+      )}
 
       {del.error && (
         <p className="mt-2 text-sm text-danger">Delete failed: {errMsg(del.error)}</p>

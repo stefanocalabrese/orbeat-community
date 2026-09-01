@@ -6,6 +6,8 @@ import App from "./App";
 import { AppAuthProvider } from "./auth/AuthProvider";
 import { createAppQueryClient } from "./api/client";
 import { loadConfig } from "./config";
+import { ToastProvider } from "./components/ui/Toast";
+import ConfigWarningBanner from "./components/ConfigWarningBanner";
 
 const queryClient = createAppQueryClient();
 
@@ -15,9 +17,21 @@ const queryClient = createAppQueryClient();
 void loadConfig().then(() => {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
+      {/* Rendered outside AppAuthProvider/QueryClientProvider on purpose: it
+          reads only the module-level configLoadFailed flag loadConfig() just
+          settled above, needs no auth or query context, and must still show
+          even if a bad oidcAuthority (drawn from the same failed config)
+          makes AppAuthProvider itself unable to render anything useful. */}
+      <ConfigWarningBanner />
       <AppAuthProvider>
         <QueryClientProvider client={queryClient}>
-          <App />
+          {/* Inside QueryClientProvider because useInvalidating (api/queries.ts)
+              calls useToast from every mutation hook, and outside App so a
+              toast survives a route change: the page that started a mutation is
+              often not the page that is on screen when it lands. */}
+          <ToastProvider>
+            <App />
+          </ToastProvider>
         </QueryClientProvider>
       </AppAuthProvider>
     </StrictMode>,

@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 
 	"github.com/stefanocalabrese/orbeat-community/internal/logging"
 	"github.com/stefanocalabrese/orbeat-community/internal/store"
@@ -11,6 +13,27 @@ import (
 // (fail-closed auditing). After the tx COMMITS, it dual-emits the audit event
 // as a structured log line for stream/SIEM ingestion — never before commit, so
 // a rolled-back mutation emits nothing.
+// nudgesGatewaySessions reports whether an audit action changed something a
+// gateway session SNAPSHOTS at build time: its entitlements, the roles they
+// hang off, or the servers it dials.
+//
+// Matched by PREFIX rather than by an exact list, deliberately. An exact list
+// is a second place to remember, and the failure it produces is silent: a new
+// `entitlement.update` handler would simply stop nudging, and nobody would
+// notice for five minutes at a time. A prefix covers the family.
+//
+// Artifacts are absent on purpose: they are Channel-1 and Channel-2 content and
+// no gateway session reads them, so nudging on an artifact change would drop
+// live MCP sessions to no effect.
+func nudgesGatewaySessions(action string) bool {
+	for _, prefix := range []string{"entitlement.", "role.", "server."} {
+		if strings.HasPrefix(action, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) auditedTx(
 	ctx context.Context,
 	mutate func(tx *store.Store) (store.AuditEvent, error),
@@ -26,6 +49,20 @@ func (s *Server) auditedTx(
 			return e
 		}
 		emitted = stored
+		// The entitlement-change nudge, emitted INSIDE the transaction so
+		// Postgres delivers it on commit and never on a rollback. Driven by the
+		// audit action rather than by the call site, so a handler added later
+		// cannot forget it: see nudgesGatewaySessions.
+		//
+		// A failure here is logged and swallowed. Failing an admin's write
+		// because a performance hint could not be queued would be the tail
+		// wagging the dog, and the gateway's five-minute rebuild is the actual
+		// guarantee either way.
+		if nudgesGatewaySessions(ev.Action) {
+			if e := tx.NotifyEntitlementChange(ctx, ev.TenantID); e != nil {
+				slog.WarnContext(ctx, "entitlement nudge not sent", "action", ev.Action, "err", e.Error())
+			}
+		}
 		return nil
 	})
 	if err != nil {

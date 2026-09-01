@@ -1,13 +1,12 @@
 import { useState } from "react";
-import { useAuditPage } from "../../api/queries";
+import { emptyAuditFilters, useAuditPage, type AuditFilters } from "../../api/queries";
 import type { AuditEvent } from "../../api/types";
-import { errMsg } from "../../api/client";
+import { apiFetchRaw, errMsg, reportApiError } from "../../api/client";
 import { QueryGate } from "../../components/QueryGate";
 import { Button } from "../../components/ui/Button";
 import { Panel } from "../../components/ui/Card";
 import { JsonTree } from "../../components/ui/JsonTree";
 import { useAuth } from "../../auth/useAuth";
-import { config } from "../../config";
 
 const decisionCls: Record<string, string> = {
   allow: "text-ok bg-ok-weak",
@@ -81,7 +80,18 @@ export default function AuditPage() {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [exportMsg, setExportMsg] = useState("");
-  const auditQuery = useAuditPage(cursor);
+  // B15: the export used to give no in-flight signal at all — the button
+  // stayed clickable and nothing on screen said a request was even running,
+  // so a hung export (previously with no timeout to end it) was
+  // indistinguishable from a button that silently did nothing.
+  const [exporting, setExporting] = useState(false);
+  // `applied` is what the server is being asked for; `draft` is what is typed
+  // into the form. Separating them is what keeps a request from firing on every
+  // keystroke, and it is why the Apply button is the only thing that can change
+  // which page is loaded.
+  const [applied, setApplied] = useState<AuditFilters>(emptyAuditFilters);
+  const [draft, setDraft] = useState<AuditFilters>(emptyAuditFilters);
+  const auditQuery = useAuditPage(cursor, applied);
   const { data } = auditQuery;
 
   // The date range scopes ONLY the export (not the table below), and an inverted
@@ -89,19 +99,19 @@ export default function AuditPage() {
   const rangeInvalid = from !== "" && to !== "" && from > to;
 
   async function exportAudit(format: "json" | "csv") {
-    if (rangeInvalid) return;
+    if (rangeInvalid || exporting) return;
     setExportMsg("");
+    setExporting(true);
     const params = new URLSearchParams({ format });
     if (from) params.set("from", from);
     if (to) params.set("to", to);
     try {
-      const res = await fetch(`${config.apiBase}/v1/admin/audit/export?${params.toString()}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) {
-        setExportMsg(`Export failed (HTTP ${res.status}).`);
-        return;
-      }
+      // apiFetchRaw (not a hand-rolled fetch): the same bearer-token
+      // request, hard 30s timeout, and ApiRequestError body parse every
+      // other admin request already gets. Returns the raw Response (rather
+      // than apiFetch<T>'s parsed JSON) so the truncation header can still
+      // be read before the body is consumed as a Blob.
+      const res = await apiFetchRaw(`/v1/admin/audit/export?${params.toString()}`, token);
       const truncated = res.headers.get("X-Orbeat-Export-Truncated") === "true";
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -113,19 +123,52 @@ export default function AuditPage() {
       a.remove();
       URL.revokeObjectURL(url);
       if (truncated) setExportMsg("Export reached the row cap and was truncated — narrow the date range for a complete export.");
-    } catch {
-      setExportMsg("Export failed — network error.");
+    } catch (e) {
+      // The same 401 → re-login / 402 → cap-dialog policy every query and
+      // mutation already gets (reportApiError's own comment on why this is
+      // ONE function shared across every call site, not a copy per site).
+      reportApiError(e);
+      setExportMsg(`Export failed: ${errMsg(e)}`);
+    } finally {
+      setExporting(false);
     }
   }
 
-  // Append newly fetched page exactly once per cursor value.
-  // The seenCursor guard ensures this runs once per cursor — not a hook-rules
-  // violation since both branches are top-level (not inside a hook).
-  const [seenCursor, setSeenCursor] = useState<string | null>(null);
-  if (data && seenCursor !== cursor) {
-    setRows((prev) => [...prev, ...data.events.filter((e) => !prev.some((p) => p.id === e.id))]);
-    setSeenCursor(cursor);
+  // Consume each fetched page exactly once, keyed on the (filters, cursor) pair
+  // this page came from. Two mechanisms carry the whole behaviour and BOTH are
+  // red-proven necessary: remove either one and the "applying a filter renders
+  // the filtered page" test fails.
+  //
+  //  1. The key carries the FILTERS, not just the cursor. Applying a filter
+  //     resets the cursor to "", so a cursor-only key would compare "" against
+  //     the "" already consumed and skip the new first page, leaving the
+  //     previous filter's rows on screen under the new filter's controls.
+  //  2. An empty cursor REPLACES the rows; a non-empty one appends. An empty
+  //     cursor can only be a first page, whether from the initial load or from
+  //     the reset that applying performs, so replacing is what discards the
+  //     rows the previous filter accumulated.
+  //
+  // Deliberately NOT here: an explicit setRows([]) inside applyFilters. It was,
+  // and it made all three of these mutually redundant, so no test could fail
+  // for any one of them. The visible difference is that the previous rows stay
+  // up for the length of the fetch instead of blanking, which is the better of
+  // the two anyway. Not a hook-rules violation: both branches are top-level.
+  const pageKey = [applied.actor, applied.action, applied.decision, cursor].join("\u0000");
+  const [seenKey, setSeenKey] = useState<string | null>(null);
+  if (data && seenKey !== pageKey) {
+    setRows((prev) =>
+      cursor === "" ? data.events : [...prev, ...data.events.filter((e) => !prev.some((p) => p.id === e.id))],
+    );
+    setSeenKey(pageKey);
   }
+
+  function applyFilters(next: AuditFilters) {
+    setApplied(next);
+    setDraft(next);
+    setCursor("");
+  }
+
+  const filtering = applied.actor !== "" || applied.action !== "" || applied.decision !== "";
 
   const auditTable = (
     <Panel className="mt-4">
@@ -159,7 +202,8 @@ export default function AuditPage() {
           Export range
         </legend>
         <p className="mb-2 text-xs text-muted">
-          Scopes the downloaded export only — the table below always shows the most recent events.
+          Scopes the downloaded export only. It is independent of the table filters below: an
+          export always contains every event in the range, whatever the table is showing.
         </p>
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1 text-xs font-medium text-muted">
@@ -182,14 +226,74 @@ export default function AuditPage() {
               className="rounded-md border border-border-strong bg-surface px-2 py-1 text-sm text-text focus-visible:border-accent"
             />
           </label>
-          <Button variant="ghost" disabled={rangeInvalid} onClick={() => exportAudit("json")}>Export JSON</Button>
-          <Button variant="ghost" disabled={rangeInvalid} onClick={() => exportAudit("csv")}>Export CSV</Button>
+          <Button variant="ghost" disabled={rangeInvalid || exporting} onClick={() => void exportAudit("json")}>
+            {exporting ? "Exporting…" : "Export JSON"}
+          </Button>
+          <Button variant="ghost" disabled={rangeInvalid || exporting} onClick={() => void exportAudit("csv")}>
+            {exporting ? "Exporting…" : "Export CSV"}
+          </Button>
         </div>
         {rangeInvalid && (
           <p className="mt-2 text-sm text-danger">The From date must be on or before the To date.</p>
         )}
       </fieldset>
       {exportMsg && <p className="mt-2 text-sm text-warn">{exportMsg}</p>}
+
+      <form
+        className="mt-4 rounded-lg border border-border p-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          applyFilters(draft);
+        }}
+      >
+        <p className="px-1 text-xs font-semibold uppercase tracking-wide text-faint">Filter events</p>
+        <p className="mb-2 mt-1 text-xs text-muted">
+          Actor and action match exactly, not by prefix. Filters apply to the table only.
+        </p>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="flex flex-col gap-1 text-xs font-medium text-muted">
+            Actor
+            <input
+              type="text"
+              aria-label="Filter by actor"
+              value={draft.actor}
+              onChange={(e) => setDraft({ ...draft, actor: e.target.value })}
+              className="rounded-md border border-border-strong bg-surface px-2 py-1 text-sm text-text focus-visible:border-accent"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs font-medium text-muted">
+            Action
+            <input
+              type="text"
+              aria-label="Filter by action"
+              value={draft.action}
+              onChange={(e) => setDraft({ ...draft, action: e.target.value })}
+              className="rounded-md border border-border-strong bg-surface px-2 py-1 text-sm text-text focus-visible:border-accent"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs font-medium text-muted">
+            Decision
+            <select
+              aria-label="Filter by decision"
+              value={draft.decision}
+              onChange={(e) => setDraft({ ...draft, decision: e.target.value })}
+              className="rounded-md border border-border-strong bg-surface px-2 py-1 text-sm text-text focus-visible:border-accent"
+            >
+              <option value="">Any</option>
+              <option value="allow">allow</option>
+              <option value="deny">deny</option>
+              <option value="error">error</option>
+            </select>
+          </label>
+          {/* Explicit types: Button renders a bare <button>, which inside a form
+              defaults to type="submit" — an untyped Clear would submit the draft
+              it is meant to discard. */}
+          <Button type="submit">Apply filters</Button>
+          <Button type="button" variant="ghost" disabled={!filtering && draft === applied} onClick={() => applyFilters(emptyAuditFilters)}>
+            Clear
+          </Button>
+        </div>
+      </form>
 
       {rows.length === 0 ? (
         // First page: the gate owns loading/error; success renders the (possibly

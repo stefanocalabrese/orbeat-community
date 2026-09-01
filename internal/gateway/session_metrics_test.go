@@ -66,7 +66,7 @@ func TestSessionCacheGetRecordsDirtyReclaim(t *testing.T) {
 	defer c.closeAll()
 
 	s := &session{subject: "s", slugToServer: map[string]string{}}
-	c.put(s, time.Now())
+	c.put("s", s, time.Now())
 	s.markDirty()
 
 	if _, hit := c.get("s", time.Now()); hit {
@@ -87,7 +87,7 @@ func TestSessionCacheGetRecordsMaxAgeReclaim(t *testing.T) {
 
 	base := time.Now()
 	s := &session{subject: "s", slugToServer: map[string]string{}}
-	c.put(s, base.Add(-6*time.Minute)) // builtAt/lastSeen both 6m ago; maxAge is 5m
+	c.put("s", s, base.Add(-6*time.Minute)) // builtAt/lastSeen both 6m ago; maxAge is 5m
 
 	if _, hit := c.get("s", base); hit {
 		t.Fatal("max-age-expired session must be evicted, not returned as a hit")
@@ -108,7 +108,7 @@ func TestSessionCacheReapRecordsIdleReclaim(t *testing.T) {
 
 	base := time.Now()
 	s := &session{subject: "idle", slugToServer: map[string]string{}}
-	c.put(s, base.Add(-2*time.Minute))
+	c.put("idle", s, base.Add(-2*time.Minute))
 
 	c.reap(base)
 
@@ -124,7 +124,7 @@ func TestSessionCacheCloseAllRecordsExplicitReclaim(t *testing.T) {
 	c := newSessionCache(time.Hour, time.Hour, metrics)
 
 	s := &session{subject: "s", slugToServer: map[string]string{}}
-	c.put(s, time.Now())
+	c.put("s", s, time.Now())
 
 	c.closeAll()
 
@@ -143,7 +143,7 @@ func TestSessionCachePutAfterCloseRecordsExplicitReclaim(t *testing.T) {
 	c.closeAll()
 
 	late := &session{subject: "late", slugToServer: map[string]string{}}
-	c.put(late, time.Now())
+	c.put("late", late, time.Now())
 
 	if got := collect()[reclaimExplicit]; got != 1 {
 		t.Fatalf("%s reclaim count (post-close put) = %d, want 1", reclaimExplicit, got)
@@ -159,8 +159,8 @@ func TestSessionCacheSizeReflectsCache(t *testing.T) {
 	if got := c.size(); got != 0 {
 		t.Fatalf("size on an empty cache = %d, want 0", got)
 	}
-	c.put(&session{subject: "a", slugToServer: map[string]string{}}, time.Now())
-	c.put(&session{subject: "b", slugToServer: map[string]string{}}, time.Now())
+	c.put("a", &session{subject: "a", slugToServer: map[string]string{}}, time.Now())
+	c.put("b", &session{subject: "b", slugToServer: map[string]string{}}, time.Now())
 	if got := c.size(); got != 2 {
 		t.Fatalf("size after two puts = %d, want 2", got)
 	}
@@ -177,7 +177,7 @@ func TestSessionCacheGetOrBuildRecordsHit(t *testing.T) {
 	defer c.closeAll()
 
 	s := &session{subject: "s", slugToServer: map[string]string{}}
-	c.put(s, time.Now())
+	c.put("s", s, time.Now())
 
 	got, err := c.getOrBuild("s", time.Now(), func() (*session, error) {
 		t.Fatal("build must not run on a cache hit")
@@ -240,7 +240,7 @@ func TestSessionCacheGetOrBuildExpiryCountsOneReclaimAndOneMiss(t *testing.T) {
 
 	base := time.Now()
 	stale := &session{subject: "s", slugToServer: map[string]string{}}
-	c.put(stale, base.Add(-6*time.Minute)) // builtAt/lastSeen both 6m ago; maxAge is 5m
+	c.put("s", stale, base.Add(-6*time.Minute)) // builtAt/lastSeen both 6m ago; maxAge is 5m
 
 	rebuilt := &session{subject: "s", slugToServer: map[string]string{}}
 	got, err := c.getOrBuild("s", base, func() (*session, error) { return rebuilt, nil })

@@ -2,10 +2,7 @@ package store
 
 import (
 	"context"
-	"errors"
 	"fmt"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // ArtifactEntitlement grants a role access to a role-visibility artifact.
@@ -46,11 +43,21 @@ func (s *Store) DeleteArtifactEntitlement(ctx context.Context, tenantID, id stri
 
 // artifactEntitlementKeys is artifact_entitlement's sort order (id appended by
 // keysetTail). Like entitlement, role_id is NOT unique here.
+//
+// Also like entitlement, this list carries NO ?q= search filter, the same
+// Decision 1 (docs/plans/orbeat-admin-search-sort-2026-08-27.md Task 4;
+// rbac.go's entitlementKeys carries the full reasoning). role_id is a uuid
+// with no text of its own to search, and adding one would mean joining to
+// role.name in a keyset query that has no join today. The API layer
+// (admin_artifact_entitlements.go's refuseSearch) rejects ?q= on this route
+// with 400 instead.
 var artifactEntitlementKeys = []sortKey{{Col: "role_id", Cast: "uuid"}}
 
-// ArtifactEntitlementCursor is the keyset position just after e.
-func ArtifactEntitlementCursor(e ArtifactEntitlement) ListCursor {
-	return ListCursor{Keys: []string{e.RoleID}, ID: e.ID}
+// ArtifactEntitlementCursor is the keyset position just after e, walked in
+// direction desc (?order), see RoleCursor's doc comment (rbac.go) for why
+// desc must match.
+func ArtifactEntitlementCursor(e ArtifactEntitlement, desc bool) ListCursor {
+	return ListCursor{Keys: []string{e.RoleID}, ID: e.ID, Sort: sortIdentity("artifact_entitlement", artifactEntitlementKeys, desc)}
 }
 
 // artifactEntitlementPageSQL builds the tenant-scoped keyset page query and
@@ -64,11 +71,11 @@ func ArtifactEntitlementCursor(e ArtifactEntitlement) ListCursor {
 // so the bare name in ORDER BY resolved against that output LABEL, not the
 // uuid column, and no index on role_id could serve the sort. Table-qualifying
 // via keysetTail fixes it the same way Task 2b fixed audit.go.
-func artifactEntitlementPageSQL(tenantID string, cursor *ListCursor, limit int) (string, []any, error) {
+func artifactEntitlementPageSQL(tenantID string, cursor *ListCursor, limit int, desc bool) (string, []any, error) {
 	const base = `
 		SELECT id::text, tenant_id::text, role_id::text, artifact_id::text
 		FROM artifact_entitlement WHERE tenant_id=$1`
-	tail, tailArgs, err := keysetTail("artifact_entitlement", artifactEntitlementKeys, false, cursor, limit, 1)
+	tail, tailArgs, err := keysetTail("artifact_entitlement", artifactEntitlementKeys, desc, cursor, limit, 1)
 	if err != nil {
 		return "", nil, err
 	}
@@ -97,10 +104,10 @@ func (s *Store) queryArtifactEntitlements(ctx context.Context, sql string, args 
 }
 
 // ListArtifactEntitlementsPage returns up to limit artifact entitlements for a
-// tenant ordered (role_id, id), starting strictly after cursor. limit <= 0
-// means no limit.
-func (s *Store) ListArtifactEntitlementsPage(ctx context.Context, tenantID string, cursor *ListCursor, limit int) ([]ArtifactEntitlement, error) {
-	sql, args, err := artifactEntitlementPageSQL(tenantID, cursor, limit)
+// tenant ordered (role_id, id), or (role_id DESC, id DESC) when desc is true
+// (?order=desc), starting strictly after cursor. limit <= 0 means no limit.
+func (s *Store) ListArtifactEntitlementsPage(ctx context.Context, tenantID string, cursor *ListCursor, limit int, desc bool) ([]ArtifactEntitlement, error) {
+	sql, args, err := artifactEntitlementPageSQL(tenantID, cursor, limit, desc)
 	if err != nil {
 		// Distinct prefix from queryArtifactEntitlements' query-failure branch:
 		// this is a cursor-shape/arity error building the SQL, not a DB error
@@ -112,32 +119,71 @@ func (s *Store) ListArtifactEntitlementsPage(ctx context.Context, tenantID strin
 	return s.queryArtifactEntitlements(ctx, sql, args...)
 }
 
-// ListEntitledArtifacts returns active, role-visibility artifacts entitled to any
-// of roleIDs (the Channel-2 sync read path). Empty roleIDs returns no rows.
-// The visibility='role' filter is belt-and-suspenders: only role artifacts are
-// ever entitled, but this guarantees an org artifact can never escape via sync.
+// ListEntitledArtifacts returns the artifacts whose APPROVED visibility is
+// 'role' and which are entitled to any of roleIDs (the Channel-2 sync read
+// path). Empty roleIDs returns no rows.
+//
+// Projection and filter both read the approved snapshot (migration 00016), so
+// this query no longer joins a live name to a frozen body: the name the sync
+// client writes to disk and the bytes it writes there were approved together,
+// in one transaction, by one reviewer. Before 00016 it took type and name from
+// the live row and content from the snapshot, which is why renaming an
+// approved artifact had to be refused outright.
+//
+// approved_visibility rather than visibility means a role -> org flip moves the
+// artifact from this channel to the marketplace when the flip is approved, not
+// when it is saved. The filter itself is still belt-and-suspenders: only role
+// artifacts are ever entitled, but it guarantees an org artifact can never
+// escape via sync.
+//
+// The projection is distArtifactCols verbatim (see its comment in artifact.go:
+// the two distribution queries share a positional scan, so a hand-copied list
+// that drifts is a runtime scan error rather than a compile error).
+//
+// The artifact table is NOT aliased to `a` here, and that is what makes the
+// shared const work in this query. distArtifactCols qualifies every column
+// with `artifact.` because it projects a bare id, and artifact_entitlement has
+// an id column of its own: unqualified, that is SQLSTATE 42702, ambiguous
+// column reference, in THIS query and legal in the org one. An alias would
+// leave the const's `artifact.` prefix unresolvable, so the table name is the
+// join's only handle on it. `ae` keeps its alias: nothing in the shared
+// projection names that table.
 func (s *Store) ListEntitledArtifacts(ctx context.Context, tenantID string, roleIDs []string) ([]Artifact, error) {
 	if len(roleIDs) == 0 {
 		return nil, nil
 	}
 	return s.queryDistArtifacts(ctx, `
-		SELECT DISTINCT a.type, a.name, a.approved_content, a.approved_memory_scope, a.approved_memory_seed
-		FROM artifact a
-		JOIN artifact_entitlement ae ON ae.artifact_id = a.id
-		WHERE a.tenant_id=$1 AND a.visibility='role' AND a.approved_content IS NOT NULL AND ae.role_id = ANY($2)
-		ORDER BY a.type, a.name`, tenantID, roleIDs)
+		SELECT DISTINCT `+distArtifactCols+`
+		FROM artifact
+		JOIN artifact_entitlement ae ON ae.artifact_id = artifact.id
+		WHERE artifact.tenant_id=$1 AND artifact.approved_visibility='role'
+		  AND artifact.approved_content IS NOT NULL AND ae.role_id = ANY($2)
+		ORDER BY artifact.approved_type, artifact.approved_name`, tenantID, roleIDs)
 }
 
-// ArtifactExistsInTenant locks the artifact row (FOR SHARE) and reports whether it
-// belongs to tenantID — mirrors RoleExistsInTenant, so a handler can validate +
-// insert a referencing entitlement in one transaction without a delete race.
+// ArtifactExistsInTenant locks the artifact row (FOR SHARE) and reports whether
+// it belongs to tenantID, so a handler can validate and insert a referencing
+// entitlement in one transaction without a delete race.
+//
+// It mirrors RoleExistsInTenant (rbac.go) down to the error mapping, and that
+// last part is what this comment used to claim without doing. Both ids reach
+// their check unvalidated out of the same JSON body
+// (handleCreateArtifactEntitlement), so a malformed value fails Postgres' uuid
+// cast with SQLSTATE 22P02 instead of matching no row, and errors.Is(err,
+// pgx.ErrNoRows) does not match a 22P02. internal/api/respond.go's fail() has
+// no arm for that SQLSTATE either, so a malformed artifactId used to reach the
+// client as 500 "internal error" while a malformed roleId on the SAME request
+// body returned 400, both measured through the handler. idCastNotFound folds
+// the two into "doesn't exist" the way the role sibling always has, and, as
+// there, the only user-supplied cast in this statement is id (tenant_id comes
+// from the authz resolver), so it cannot mask an unrelated cast failure.
 func (s *Store) ArtifactExistsInTenant(ctx context.Context, tenantID, id string) (bool, error) {
 	var got string
 	err := s.db.QueryRow(ctx,
 		`SELECT id::text FROM artifact WHERE tenant_id=$1 AND id=$2 FOR SHARE`,
 		tenantID, id).Scan(&got)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if idCastNotFound(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("artifact exists check: %w", err)
@@ -148,19 +194,24 @@ func (s *Store) ArtifactExistsInTenant(ctx context.Context, tenantID, id string)
 // ArtifactRoleGrants reports the per-role grants attached to ONE artifact: the
 // artifact_entitlement rows pointing at it, resolved to role names.
 //
-// Those rows are consulted only while the artifact's visibility is 'role'
-// (ListEntitledArtifacts, above, filters on it). Flipping an artifact to 'org'
-// does NOT delete them: they go DORMANT, and flipping back to 'role' revives
-// every one of them at once, with nobody re-granting anything. The retention is
-// deliberate, since it is what makes a mistaken flip recoverable, so what this
+// Those rows are consulted only while the artifact's APPROVED visibility is
+// 'role' (ListEntitledArtifacts, above, filters on approved_visibility since
+// migration 00016, so the dormancy begins when a flip to 'org' is approved,
+// not when it is saved). Flipping an artifact to 'org' does NOT delete them:
+// they go DORMANT, and flipping back to 'role' revives every one of them at
+// once, with nobody re-granting anything. The retention is deliberate, since
+// it is what makes a mistaken flip recoverable, so what this
 // type exists for is legibility, not prevention: it is the count and the names
 // an admin needs in front of them before such a flip, and in the audit record
 // afterwards.
 //
-// Shaped like RevokedGrants (rbac.go) and capped the same way: Count is exact,
-// RoleNames holds at most maxGrantNames of them, Truncated says whether that cap
-// bit, and RoleNames is never nil so a caller never has to tell JSON `null` from
-// `[]`.
+// Shaped like RevokedGrants (rbac.go) and capped like its two SURVIVOR lists:
+// Count is exact, RoleNames holds at most MaxGrantNames of them, Truncated
+// says whether that cap bit, and RoleNames is never nil so a caller never has
+// to tell JSON `null` from `[]`. The cap is right here and wrong for
+// RevokedGrants.VirtualKeyClientIDs for the same reason: these role rows
+// survive the call, so a capped list is one admin-list call away from being
+// completed.
 type ArtifactRoleGrants struct {
 	Count     int
 	RoleNames []string
@@ -241,7 +292,11 @@ func (s *Store) ArtifactRoleGrantsForUpdate(ctx context.Context, tenantID, artif
 }
 
 func (s *Store) artifactRoleGrants(ctx context.Context, sql, tenantID, artifactID string) (ArtifactRoleGrants, error) {
-	names, n, truncated, err := s.readGrantNames(ctx, sql, tenantID, artifactID)
+	// MaxGrantNames, like DeleteRole's two survivor lists and unlike its
+	// virtual-key list: these role names describe role rows this call does
+	// not touch, so a capped list is one admin-list call away from being
+	// completed rather than a permanent loss.
+	names, n, truncated, err := s.readGrantNames(ctx, sql, tenantID, artifactID, MaxGrantNames)
 	if err != nil {
 		return ArtifactRoleGrants{}, fmt.Errorf("artifact role grants: %w", err)
 	}

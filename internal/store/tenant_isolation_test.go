@@ -78,7 +78,7 @@ func TestCrossTenantIsolation(t *testing.T) {
 			Transport:         "http",
 			EndpointOrCommand: "https://evil.example",
 			Status:            "active",
-		})
+		}, nil, nil)
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("UpdateMCPServer with wrong tenant ID: want ErrNotFound, got %v", err)
 		}
@@ -121,7 +121,7 @@ func TestCrossTenantIsolation(t *testing.T) {
 	})
 
 	t.Run("entA still exists under tenant A", func(t *testing.T) {
-		ents, err := s.ListEntitlementsPage(ctx, tenantA.ID, nil, 0)
+		ents, err := s.ListEntitlementsPage(ctx, tenantA.ID, nil, 0, false)
 		if err != nil {
 			t.Fatalf("ListEntitlementsPage(A): %v", err)
 		}

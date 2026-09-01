@@ -29,6 +29,7 @@ import (
 	"github.com/stefanocalabrese/orbeat-community/internal/secrets"
 	"github.com/stefanocalabrese/orbeat-community/internal/store"
 	"github.com/stefanocalabrese/orbeat-community/internal/telemetry"
+	"github.com/stefanocalabrese/orbeat-community/internal/version"
 )
 
 func main() {
@@ -96,7 +97,16 @@ func run() int {
 	// AWSSMProvider cache their backend client per instance (sync.Once), so
 	// reusing one Resolver avoids each site building and authenticating its own
 	// client against the same backend.
-	secretsResolver := secrets.NewResolver()
+	//
+	// NewProcessConfigResolver, not NewResolver: every ref this variable
+	// resolves comes from the process environment (the marketplace git
+	// credential below, the LLM scanner key, the DCR client secret), never from
+	// the catalog, so the ORBEAT_SECRET_ENV_ALLOW allowlist does not apply to
+	// them. See that constructor's doc comment for why applying it here would
+	// be both pointless and breaking. The CATALOG resolver, which does enforce
+	// the allowlist, is api.New's own default (internal/api/api.go); it is
+	// deliberately not overridden here.
+	secretsResolver := secrets.NewProcessConfigResolver()
 
 	// Fail closed at boot on a malformed marketplace git credential ref. Without
 	// this, the ref is only exercised at first push, so a typo stays invisible
@@ -121,9 +131,16 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	tel, shutdownTel, err := telemetry.Setup(ctx, telemetry.Config{
-		Endpoint:       cfg.OTelEndpoint,
-		ServiceName:    orDefault(cfg.OTelServiceName, "orbeat-api"),
-		ServiceVersion: "dev",
+		Endpoint:    cfg.OTelEndpoint,
+		ServiceName: orDefault(cfg.OTelServiceName, "orbeat-api"),
+		// version.Version, not a literal. This was hardcoded "dev" until audit
+		// C8, while release.yml injects the real tag into internal/version via
+		// -ldflags, so every trace and metric emitted by a signed release image
+		// was attributed to "dev" and no telemetry could be tied to a release.
+		// internal/version's own doc says it "must be the ONLY place the
+		// version is read from" and names three consumers; this was a silent
+		// fourth. Gated by TestOTelServiceVersionIsNotALiteral.
+		ServiceVersion: version.Version,
 		SampleRatio:    cfg.OTelSampleRatio,
 		Insecure:       cfg.OTelInsecure,
 	})
@@ -248,6 +265,28 @@ func run() int {
 		slog.Info("audit retention enabled", "older_than_days", days, "interval", cfg.AuditRetentionIntervalDuration().String())
 	}
 
+	// Deployment retention (ORBEAT_DEPLOYMENT_RETENTION_DAYS, default 90),
+	// which is ON where audit retention just above is off: the two defaults
+	// are opposite on purpose (spec docs/specs/2026-08-22-orbeat-artifact-
+	// deployment-registry-design.md sec 7.2). Behind an edition seam because
+	// this file is shared with Community and must name neither
+	// store.PruneDeploymentsOlderThan nor api.RunDeploymentRetention;
+	// deployment_retention.{ee,community}.go carry the two halves, and the
+	// Community one starts nothing. nil means no loop, exactly as
+	// stopRetention above already means.
+	stopDeploymentRetention := startDeploymentRetention(st, cfg)
+
+	// Usage retention (ORBEAT_USAGE_RETENTION_DAYS, default 90), the same
+	// on-by-default shape as deployment retention just above and for the
+	// same reason (docs/specs/2026-08-25-orbeat-usage-metering-design.md
+	// section 4: usage_daily rows accumulate forever otherwise). Behind an
+	// edition seam because this file is shared with Community and must name
+	// neither store.PruneUsageOlderThan nor api.RunUsageRetention;
+	// usage_retention.{ee,community}.go carry the two halves, and the
+	// Community one starts nothing. nil means no loop, exactly as
+	// stopRetention/stopDeploymentRetention above already mean.
+	stopUsageRetention := startUsageRetention(st, cfg)
+
 	srv := api.New(st, resolver, v, cfg.CORSOrigins, pub)
 
 	// Governance scanner: rules always; buildScanner (scanner_enterprise.ee.go /
@@ -261,6 +300,28 @@ func run() int {
 	srv.SetScanner(scanner)
 	srv.SetGatewayURL(cfg.GatewayResourceURL)
 	srv.SetAuditExportMaxRows(cfg.AuditExportMaxRowsN())
+
+	// Virtual-key DCR service account (ORBEAT_DCR_CLIENT_ID), off unless the
+	// operator sets it (docs/specs/2026-08-25-orbeat-virtual-keys-design.md).
+	// The SAME account also backs the role-rename identity-provider check
+	// (docs/plans/orbeat-role-rename-2026-08-27.md): checkRoleExists is built
+	// from the identical *keycloak.DCRClient register/del come from, not a
+	// second client -- see buildDCRClient's own doc comment for why. That
+	// function (dcr_client.ee.go / dcr_client.community.go) is the only place
+	// in this shared file allowed to reach into internal/keycloak. (nil, nil,
+	// nil) means both features stay unavailable: SetDCRClient's and
+	// SetRoleExistsChecker's own nil-ignore contracts leave dcrRegister/
+	// dcrDelete/roleExists unset, so POST /v1/admin/virtual-keys keeps
+	// refusing cleanly through its existing nil branch and PUT
+	// /v1/admin/roles/{id} falls back to the operator-assertion path, rather
+	// than this binary failing to start -- mirroring buildScanner's
+	// fail-closed-only-when-configured shape directly above.
+	dcrRegister, dcrDelete, checkRoleExists, err := buildDCRClient(ctx, cfg, secretsResolver)
+	if err != nil {
+		return fatal("build dcr client", err)
+	}
+	srv.SetDCRClient(dcrRegister, dcrDelete)
+	srv.SetRoleExistsChecker(checkRoleExists)
 
 	// Artifact revision pruning cap (0 = unlimited, no pruning — the default,
 	// spec docs/specs/2026-08-19-orbeat-revision-pruning-design.md §5).
@@ -292,6 +353,20 @@ func run() int {
 			}[keep])
 	}
 
+	// Artifact deployment registry (ORBEAT_DEPLOYMENT_REGISTRY), off unless
+	// the operator sets it. SetDeploymentRegistry returns the EFFECTIVE value,
+	// not the argument, so this line cannot claim collection is running in a
+	// build that ignores the knob. Enabling the registry is a config change
+	// with no API route to audit, which makes this log line the record of it
+	// (spec docs/specs/2026-08-22-orbeat-artifact-deployment-registry-design.md
+	// sec 9.4), so it names what starts being recorded rather than only that a
+	// flag flipped.
+	if srv.SetDeploymentRegistry(cfg.DeploymentRegistryEnabled()) {
+		slog.Info("artifact deployment registry enabled",
+			"records", "per user, per machine: which artifacts at which revision, and when last reported",
+			"erasure", "DELETE /v1/admin/users/{id} cascades")
+	}
+
 	// Community 402 cap-response contact address (ORBEAT_CONTACT_EMAIL).
 	// cfg.ContactEmail is empty unless the operator set it; both
 	// SetContactEmail methods ignore an empty string and keep their own
@@ -316,9 +391,17 @@ func run() int {
 
 	handler := srv.Handler()
 
-	// ReadTimeout/IdleTimeout are safe here because the API has no streaming
-	// endpoints (unlike the gateway's MCP stream): a slow-loris client or a
-	// leaked idle connection gets bounded instead of pinning a conn forever.
+	// ReadTimeout and IdleTimeout are safe here, but NOT for the reason this
+	// comment used to give. It said "the API has no streaming endpoints",
+	// which is false: GET /v1/admin/audit/export streams row by row with
+	// cw.Flush(), up to 100,000 rows (audit C7).
+	//
+	// They are safe because neither bounds the RESPONSE. What would truncate a
+	// large export mid-stream is WriteTimeout, and none is set here on
+	// purpose. cmd/portal/main.go DOES set one, and a maintainer harmonising
+	// the two servers on the strength of the old sentence would have broken
+	// every large export with no test failing, which is why the reason is
+	// spelled out rather than left as "safe".
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           handler,
@@ -356,6 +439,12 @@ func run() int {
 	}
 	if stopRetention != nil {
 		stopRetention()
+	}
+	if stopDeploymentRetention != nil {
+		stopDeploymentRetention()
+	}
+	if stopUsageRetention != nil {
+		stopUsageRetention()
 	}
 	return exit
 }

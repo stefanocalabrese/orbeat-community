@@ -57,6 +57,18 @@ func tokenWithAzp(t *testing.T, idp *mwOrderTestIdP, subject, azp string, roles 
 // and the tenant name the resolver will lazily create rows under — needed by
 // tests that assert "no user row exists" AFTER driving a request, the same
 // way TestAllAdminRoutesRejectNonAdminBeforeAnyDBWrite does.
+//
+// It turns the deployment registry ON, which is not the product default and is
+// deliberate here. TestAllAuthenticatedRoutesAreRateLimited derives its route
+// set from SOURCE (derivedLimitedRoutes -> codeRoutes), and POST
+// /v1/sync/deployments is registered conditionally, so a server built with the
+// registry off answers 404 where that test wants 429 and the gate fails for a
+// reason that has nothing to do with rate limiting. The alternative, excluding
+// the route from the derived set, would ship the one route in this package
+// whose limiting nothing checks. In a generated Community tree this line
+// stores false (deployment_registry.community.go) and codeRoutes finds no such
+// registration either, so the two stay consistent there without a second
+// branch.
 func newRateLimitedServer(t *testing.T, tenantPrefix string, l *ratelimit.Limiter) (srv *Server, st *store.Store, idp *mwOrderTestIdP, tenantName string) {
 	t.Helper()
 	ctx := context.Background()
@@ -74,6 +86,7 @@ func newRateLimitedServer(t *testing.T, tenantPrefix string, l *ratelimit.Limite
 	srv = New(st, authz.NewResolver(st, tenantName), v, nil, nil)
 	t.Cleanup(func() { _ = l.Close() })
 	srv.SetRateLimiter(l)
+	srv.SetDeploymentRegistry(true)
 	return srv, st, idp, tenantName
 }
 

@@ -77,6 +77,10 @@ func (s *Server) handleCreateArtifactEntitlement(w http.ResponseWriter, r *http.
 // tiebreaker matters). The nextCursor heuristic (len(rows)==limit means
 // "possibly more"; an exact multiple of limit costs one extra empty page) is
 // documented once, on handleListRoles.
+//
+// ?q= is REFUSED with 400, mirroring handleListEntitlements above for the
+// identical reason (Decision 1, docs/plans/orbeat-admin-search-sort-2026-08-27.md
+// Task 4): role_id is a uuid with no natural text column of its own.
 func (s *Server) handleListArtifactEntitlements(w http.ResponseWriter, r *http.Request) {
 	rc, _, ok := s.resolved(w, r)
 	if !ok {
@@ -87,7 +91,16 @@ func (s *Server) handleListArtifactEntitlements(w http.ResponseWriter, r *http.R
 		fail(w, err)
 		return
 	}
-	ents, err := s.store.ListArtifactEntitlementsPage(r.Context(), rc.TenantID, cursor, limit)
+	if err := refuseSearch(r); err != nil {
+		fail(w, err)
+		return
+	}
+	desc, err := sortOrderParams(r, artifactEntitlementSortName)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	ents, err := s.store.ListArtifactEntitlementsPage(r.Context(), rc.TenantID, cursor, limit, desc)
 	if err != nil {
 		fail(w, err)
 		return
@@ -98,7 +111,7 @@ func (s *Server) handleListArtifactEntitlements(w http.ResponseWriter, r *http.R
 	}
 	next := ""
 	if len(ents) == limit && limit > 0 {
-		next = encodeListCursor(store.ArtifactEntitlementCursor(ents[len(ents)-1]))
+		next = encodeListCursor(store.ArtifactEntitlementCursor(ents[len(ents)-1], desc))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"artifactEntitlements": out, "limit": limit, "nextCursor": next})
 }

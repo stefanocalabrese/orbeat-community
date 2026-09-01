@@ -53,7 +53,7 @@ func StartKeycloak(t testing.TB, ctx context.Context) (issuer, tokenEndpoint str
 			// to create a second container with the same name — the suffix means
 			// a stale leftover from a crashed run can never collide with this run.
 			Name:  "orbeat-keycloak-" + strings.ReplaceAll(t.Name(), "/", "-") + "-" + randomSuffix(t),
-			Image: "quay.io/keycloak/keycloak:26.2",
+			Image: "quay.io/keycloak/keycloak:26.7",
 			Cmd:   []string{"start-dev", "--import-realm"},
 			Env: map[string]string{
 				"KC_BOOTSTRAP_ADMIN_USERNAME": "admin",

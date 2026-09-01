@@ -1,6 +1,7 @@
 package syncclient
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +11,7 @@ import (
 func TestMergeRulesAppendUpdateIdempotentStrip(t *testing.T) {
 	// Append into a file with the dev's own content.
 	existing := "# My project\n\nHand-written guidance.\n"
-	merged, changed := mergeRules(existing, "## r1\n\nbody one\n")
+	merged, changed, _ := mergeRules(existing, "## r1\n\nbody one\n")
 	if !changed {
 		t.Fatal("append: expected change")
 	}
@@ -22,12 +23,12 @@ func TestMergeRulesAppendUpdateIdempotentStrip(t *testing.T) {
 	}
 
 	// Idempotent: same body → no change.
-	if _, c := mergeRules(merged, "## r1\n\nbody one\n"); c {
+	if _, c, _ := mergeRules(merged, "## r1\n\nbody one\n"); c {
 		t.Fatal("identical body reported a change")
 	}
 
 	// Update in place: changed body → change, single block, dev content intact.
-	updated, c := mergeRules(merged, "## r1\n\nbody TWO\n")
+	updated, c, _ := mergeRules(merged, "## r1\n\nbody TWO\n")
 	if !c {
 		t.Fatal("changed body not written")
 	}
@@ -65,12 +66,15 @@ func TestMergeRulesFileSkipsMalformedMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	changed, warning, err := mergeRulesFile(r, path, "## r\n\nbody\n")
+	changed, notes, err := mergeRulesFile(r, path, "## r\n\nbody\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changed || warning == "" {
-		t.Fatalf("expected skip+warning, got changed=%v warning=%q", changed, warning)
+	// The skip must land in notes.skips specifically: that is the slice the
+	// caller consults to withhold the applied claim, and notes.restored is
+	// deliberately not consulted for it.
+	if changed || len(notes.skips) != 1 || len(notes.restored) != 0 {
+		t.Fatalf("expected skip+warning, got changed=%v notes=%+v", changed, notes)
 	}
 	after, _ := os.ReadFile(path)
 	if string(after) != orphan {
@@ -81,7 +85,7 @@ func TestMergeRulesFileSkipsMalformedMarkers(t *testing.T) {
 func TestMergeRulesUpdatePreservesContentAboveAndBelow(t *testing.T) {
 	existing := "# top\n\n<!-- ORBEAT-RULES:BEGIN sha=" + rulesHash("## r\n\nold\n") +
 		" — managed -->\n## r\n\nold\n<!-- ORBEAT-RULES:END -->\n\n# bottom dev section\n"
-	out, changed := mergeRules(existing, "## r\n\nnew\n")
+	out, changed, _ := mergeRules(existing, "## r\n\nnew\n")
 	if !changed {
 		t.Fatal("expected change")
 	}
@@ -125,7 +129,7 @@ func TestReconcileRulesWarnsOnDeadProject(t *testing.T) {
 	claudeDir := filepath.Join(home, ".claude")
 	must(t, os.MkdirAll(claudeDir, 0o755))
 	dead := filepath.Join(home, "nonexistent-proj")
-	res, err := ReconcileRules(claudeDir, []string{dead}, []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil)
+	res, err := ReconcileRules(claudeDir, projs(dead), []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +146,7 @@ func TestReconcileRulesPreservesFileMode(t *testing.T) {
 	proj := t.TempDir()
 	ap := filepath.Join(proj, "AGENTS.md")
 	must(t, os.WriteFile(ap, []byte("# dev\n"), 0o600))
-	if _, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	fi, _ := os.Stat(ap)
@@ -164,7 +168,7 @@ func TestReconcileRulesWritesProjectsAndStrips(t *testing.T) {
 		{Type: "skill", Name: "ignore-me", Content: "not a rule"},
 	}
 
-	res, err := ReconcileRules(claudeDir, []string{proj}, rules, nil)
+	res, err := ReconcileRules(claudeDir, projs(proj), rules, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,13 +188,13 @@ func TestReconcileRulesWritesProjectsAndStrips(t *testing.T) {
 	}
 
 	// Idempotent re-run.
-	res2, _ := ReconcileRules(claudeDir, []string{proj}, rules, nil)
+	res2, _ := ReconcileRules(claudeDir, projs(proj), rules, nil)
 	if res2.Written != 0 {
 		t.Fatalf("re-run should be unchanged, got %+v", res2)
 	}
 
 	// De-entitle everything → both blocks stripped.
-	res3, err := ReconcileRules(claudeDir, []string{proj}, nil, nil)
+	res3, err := ReconcileRules(claudeDir, projs(proj), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +213,7 @@ func TestStripProjectRules(t *testing.T) {
 	claudeDir := filepath.Join(home, ".claude")
 	must(t, os.MkdirAll(claudeDir, 0o755))
 	proj := t.TempDir()
-	if _, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	n, err := StripProjectRules(claudeDir, proj)
@@ -231,7 +235,7 @@ func TestReconcileRulesWriteFailureIsolated(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(bad, "AGENTS.md"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	res, err := ReconcileRules(claudeDir, []string{good, bad}, []Artifact{{Type: "rule", Name: "r", Content: "do the thing"}}, nil)
+	res, err := ReconcileRules(claudeDir, projs(good, bad), []Artifact{{Type: "rule", Name: "r", Content: "do the thing"}}, nil)
 
 	if err != nil {
 		t.Fatalf("per-project I/O failure must be non-fatal: %v", err)
@@ -244,12 +248,64 @@ func TestReconcileRulesWriteFailureIsolated(t *testing.T) {
 	}
 }
 
+// writeRulesToProject's per-file isolation, write side: a genuine I/O failure
+// on the FIRST managed file the loop reaches (AGENTS.md) must not stop the
+// SECOND (CLAUDE.md) from being attempted. Before this fix, mergeRulesFile's
+// error on AGENTS.md returned immediately from writeRulesToProject's loop —
+// CLAUDE.md's spec was never even reached, so its @AGENTS.md import never
+// landed even though nothing about the CLAUDE.md write itself was broken.
+// Mirrors TestStripProjectRulesIsolatesAPerFileFailure on the strip side,
+// except this reproduces the ORDER the old code got wrong: a strip failure on
+// AGENTS.md never blocked CLAUDE.md's strip (stripRulesFromProject was
+// already isolated), but a WRITE failure on AGENTS.md did block CLAUDE.md's
+// write, because the two loops were not built the same way.
+func TestReconcileRulesWriteIsolatesAPerFileFailure(t *testing.T) {
+	claudeDir := t.TempDir()
+	proj := t.TempDir()
+	// A directory at AGENTS.md makes mergeRulesFile's read fail (EISDIR) — the
+	// first file the write loop reaches.
+	must(t, os.MkdirAll(filepath.Join(proj, "AGENTS.md"), 0o755))
+
+	res, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil)
+	if err != nil {
+		t.Fatalf("a per-file I/O failure must be non-fatal: %v", err)
+	}
+	if len(res.Failures) != 1 {
+		t.Fatalf("want exactly 1 failure, got %v", res.Failures)
+	}
+	claude, err := os.ReadFile(filepath.Join(proj, "CLAUDE.md"))
+	if err != nil {
+		t.Fatalf("CLAUDE.md must have been attempted despite AGENTS.md's failure: %v", err)
+	}
+	if !strings.Contains(string(claude), "@AGENTS.md") || !strings.Contains(string(claude), "ORBEAT-RULES:BEGIN") {
+		t.Fatalf("CLAUDE.md's import block must land even though AGENTS.md failed:\n%s", claude)
+	}
+	// The project is a first-ever sync with a genuinely partial result on
+	// disk (CLAUDE.md written, AGENTS.md not), so its ledger entry must be
+	// preserved for a retry — same load-bearing reasoning as
+	// TestReconcileRulesPartialWriteRecordsLedger, just with the two files'
+	// roles swapped.
+	m, err := loadManifest(claudeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range m.Rules {
+		if filepath.Clean(p) == filepath.Clean(proj) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a partially-written project must be in the ledger; ledger=%v", m.Rules)
+	}
+}
+
 // THE LOAD-BEARING CASE: a strip that fails keeps its ledger entry, so a later
 // run retries instead of orphaning the block forever (no fs-scan net for rules).
 func TestReconcileRulesStripFailurePreservesLedger(t *testing.T) {
 	claudeDir := t.TempDir()
 	proj := t.TempDir()
-	if _, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil); err != nil {
 		t.Fatalf("run 1: %v", err)
 	}
 	// Replace AGENTS.md with a directory so the strip's read fails (EISDIR).
@@ -259,7 +315,7 @@ func TestReconcileRulesStripFailurePreservesLedger(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(proj, "AGENTS.md"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	res, err := ReconcileRules(claudeDir, []string{proj}, nil, nil) // de-entitle
+	res, err := ReconcileRules(claudeDir, projs(proj), nil, nil) // de-entitle
 	if err != nil {
 		t.Fatalf("strip I/O failure must be non-fatal: %v", err)
 	}
@@ -287,7 +343,7 @@ func TestReconcileRulesWriteFailurePreservesLedger(t *testing.T) {
 	claudeDir := t.TempDir()
 	proj := t.TempDir()
 	// Run 1: establish the block + ledger entry.
-	if _, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(proj, "AGENTS.md")); err != nil {
@@ -297,7 +353,7 @@ func TestReconcileRulesWriteFailurePreservesLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Run 2: still entitled but the project now fails.
-	res, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "v2"}}, nil)
+	res, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "v2"}}, nil)
 
 	if err != nil {
 		t.Fatalf("must be non-fatal: %v", err)
@@ -321,14 +377,14 @@ func TestReconcileRulesAtomicWriteFailureIsolated(t *testing.T) {
 	}
 	claudeDir := t.TempDir()
 	proj := t.TempDir()
-	if _, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(proj, 0o500); err != nil { // readable, not writable
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(proj, 0o755) })
-	res, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "v2"}}, nil)
+	res, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "v2"}}, nil)
 	// changed -> write attempted
 	if err != nil {
 		t.Fatalf("write failure must be non-fatal: %v", err)
@@ -360,7 +416,7 @@ func TestReconcileRulesMissingProjectPreservesLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	art := []Artifact{{Type: "rule", Name: "r", Content: "x"}}
-	if _, err := ReconcileRules(claudeDir, []string{proj}, art, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(proj), art, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate a transient outage: move the whole project dir away.
@@ -368,7 +424,7 @@ func TestReconcileRulesMissingProjectPreservesLedger(t *testing.T) {
 	if err := os.Rename(proj, away); err != nil {
 		t.Fatal(err)
 	}
-	res, err := ReconcileRules(claudeDir, []string{proj}, art, nil)
+	res, err := ReconcileRules(claudeDir, projs(proj), art, nil)
 	if err != nil {
 		t.Fatalf("a missing project must not be fatal: %v", err)
 	}
@@ -386,7 +442,7 @@ func TestReconcileRulesMissingProjectPreservesLedger(t *testing.T) {
 	if err := os.Rename(away, proj); err != nil {
 		t.Fatal(err)
 	}
-	res2, err := ReconcileRules(claudeDir, []string{proj}, nil, nil)
+	res2, err := ReconcileRules(claudeDir, projs(proj), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +465,7 @@ func TestReconcileRulesPartialWriteRecordsLedger(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(proj, "CLAUDE.md"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	res, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil)
+	res, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil)
 
 	if err != nil {
 		t.Fatalf("partial write must be non-fatal: %v", err)
@@ -443,7 +499,7 @@ func TestReconcileRulesPartialWriteRecordsLedger(t *testing.T) {
 func TestReconcileRulesDeEntitlementSkipsMalformedMarker(t *testing.T) {
 	claudeDir := t.TempDir()
 	proj := t.TempDir()
-	if _, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	target := filepath.Join(proj, "AGENTS.md")
@@ -455,7 +511,7 @@ func TestReconcileRulesDeEntitlementSkipsMalformedMarker(t *testing.T) {
 	must(t, os.WriteFile(target, []byte(corrupted), 0o644))
 
 	// De-entitle: the strip pass must now see AGENTS.md's block as undesired.
-	res, err := ReconcileRules(claudeDir, []string{proj}, nil, nil)
+	res, err := ReconcileRules(claudeDir, projs(proj), nil, nil)
 	if err != nil {
 		t.Fatalf("must be non-fatal: %v", err)
 	}
@@ -491,7 +547,7 @@ func TestReconcileRulesDeEntitlementSkipsMalformedMarker(t *testing.T) {
 func TestStripProjectRulesPreservesLedgerOnMalformedMarker(t *testing.T) {
 	claudeDir := t.TempDir()
 	proj := t.TempDir()
-	if _, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
+	if _, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	target := filepath.Join(proj, "AGENTS.md")
@@ -540,17 +596,101 @@ func TestStripProjectRulesPreservesLedgerOnMalformedMarker(t *testing.T) {
 	}
 }
 
+// B24-mirror: a genuine per-file I/O failure (not a malformed marker) on
+// AGENTS.md must not stop StripProjectRules from stripping the OTHER managed
+// file (CLAUDE.md), and must not skip the ledger update + manifest save.
+// Before this fix, stripRulesFromProject's loop over rulesManagedFiles
+// returned on the FIRST per-file error — AGENTS.md is ordered before
+// CLAUDE.md, so CLAUDE.md was never even attempted — and that early return
+// sat above StripProjectRules' ledger cleanup + saveManifest, so even
+// CLAUDE.md's block, had it been stripped, would never have been recorded.
+func TestStripProjectRulesIsolatesAPerFileFailure(t *testing.T) {
+	claudeDir := t.TempDir()
+	proj := t.TempDir()
+	if _, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	claudeMD := filepath.Join(proj, "CLAUDE.md")
+	if !strings.Contains(read(t, claudeMD), "ORBEAT-RULES") {
+		t.Fatal("precondition: CLAUDE.md's import block never landed")
+	}
+
+	// Replace AGENTS.md with a directory so its strip read fails (EISDIR) —
+	// reproduces "one unreadable managed file" without depending on
+	// root-independent permission bits.
+	agentsMD := filepath.Join(proj, "AGENTS.md")
+	must(t, os.Remove(agentsMD))
+	must(t, os.MkdirAll(agentsMD, 0o755))
+
+	// Plant an unrelated, deliberately UNSORTED manifest field as a witness
+	// that the manifest save actually ran: saveManifest sorts m.Files on
+	// every save, and StripProjectRules never touches m.Files itself. This is
+	// the mutant this test exists to catch: a "fix" that isolates the
+	// per-file strip loop in stripRulesFromProject but leaves
+	// StripProjectRules's own `if err != nil { return … }` early return in
+	// place (skipping the ledger update AND saveManifest) would satisfy every
+	// assertion below EXCEPT this one — proj's ledger entry was never
+	// touched by either the old or the fixed code in THIS single-project
+	// scenario (both correctly preserve it, one by explicit `keep` logic,
+	// the other merely by never writing at all), so "the entry is still
+	// there" cannot by itself prove the save ran.
+	//
+	// The fixture is written with encoding/json directly, NOT via
+	// saveManifest — saveManifest sorts m.Files on every call, including a
+	// setup call, which would silently pre-sort the witness before
+	// StripProjectRules ever ran and make the assertion below pass
+	// vacuously regardless of whether its own save fires.
+	mSetup, err := loadManifest(claudeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mSetup.Files = []string{"zzz-unrelated", "aaa-unrelated"}
+	raw, err := json.MarshalIndent(mSetup, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	must(t, os.WriteFile(filepath.Join(claudeDir, manifestName), raw, 0o644))
+
+	n, err := StripProjectRules(claudeDir, proj)
+	if err == nil {
+		t.Fatal("a genuinely unreadable managed file must be reported, not silently dropped")
+	}
+	if n != 1 {
+		t.Fatalf("CLAUDE.md's healthy block must still be stripped despite AGENTS.md's failure, got n=%d", n)
+	}
+	if strings.Contains(read(t, claudeMD), "ORBEAT-RULES") {
+		t.Fatal("CLAUDE.md must have been stripped even though AGENTS.md failed")
+	}
+
+	m, err := loadManifest(claudeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range m.Rules {
+		if filepath.Clean(p) == filepath.Clean(proj) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the failed project must keep its ledger entry so a later run retries it; ledger=%v", m.Rules)
+	}
+	if len(m.Files) != 2 || m.Files[0] != "aaa-unrelated" || m.Files[1] != "zzz-unrelated" {
+		t.Fatalf("manifest save must have run (witness: saveManifest always sorts Files), got %v", m.Files)
+	}
+}
+
 func TestReconcileRulesPlanModeWritesNothing(t *testing.T) {
 	home, proj := t.TempDir(), t.TempDir()
 	arts := []Artifact{{Name: "std", Type: "rule", Content: "RULE-BODY"}}
-	if _, err := ReconcileRules(home, []string{proj}, arts, nil); err != nil {
+	if _, err := ReconcileRules(home, projs(proj), arts, nil); err != nil {
 		t.Fatal(err)
 	}
 	beforeProj, beforeHome := treeSnapshot(t, proj), treeSnapshot(t, home)
 
 	arts[0].Content = "RULE-BODY-CHANGED"
 	var p Plan
-	res, err := ReconcileRules(home, []string{proj}, arts, &p)
+	res, err := ReconcileRules(home, projs(proj), arts, &p)
 	if err != nil {
 		t.Fatalf("plan run must not error: %v", err)
 	}
@@ -589,7 +729,7 @@ func TestReconcileRulesManifestSaveFailureIsRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(claudeDir, 0o755) })
-	res, err := ReconcileRules(claudeDir, []string{proj}, []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil)
+	res, err := ReconcileRules(claudeDir, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "x"}}, nil)
 
 	if err != nil {
 		t.Fatalf("manifest-save failure must be non-fatal: %v", err)
@@ -602,5 +742,91 @@ func TestReconcileRulesManifestSaveFailureIsRecorded(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("manifest-save failure must be recorded in Failures, got %v", res.Failures)
+	}
+}
+
+// B23: a rules ledger entry naming a project this run was NOT handed must be
+// left completely alone. Before this fix, the strip pass trusted a ledger
+// entry the moment validRulesPath's SHAPE check (absolute + clean) passed and
+// os.Stat found a real directory — registration was never checked, so a
+// de-registered project (or a tampered manifest) still had its ORBEAT-RULES
+// block stripped by an ordinary sync. This is the exact construction
+// trustedSeedBoundary was introduced to close for seeds (seed.go); this test
+// reproduces the identical hole on the rules side, which trustedSeedBoundary's
+// own doc comment names as the thing to avoid but never closed here.
+func TestReconcileRulesRefusesToStripAnUnregisteredProjectLedgerEntry(t *testing.T) {
+	home := t.TempDir()
+	unregistered := t.TempDir()
+	agents := filepath.Join(unregistered, "AGENTS.md")
+	content := "precious dev notes\n\n" + renderRulesBlock("## org\n\nrule body")
+	must(t, os.WriteFile(agents, []byte(content), 0o644))
+	must(t, saveManifest(home, manifest{Rules: []string{unregistered}}, nil))
+
+	// No projects registered, nothing entitled: every ledger entry is
+	// undesired and the strip pass runs against exactly this path.
+	res, err := ReconcileRules(home, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("an unregistered ledger entry is a skip, not an abort: %v", err)
+	}
+	if got := read(t, agents); got != content {
+		t.Fatalf("a project this run was not handed must not be touched:\nwant: %q\ngot:  %q", content, got)
+	}
+	if res.Stripped != 0 {
+		t.Fatalf("nothing outside the trusted (registered) project set may be stripped, got Stripped=%d", res.Stripped)
+	}
+	named := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, unregistered) {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatalf("the skip must be surfaced and must name the path, got warnings=%v", res.Warnings)
+	}
+
+	m, err := loadManifest(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range m.Rules {
+		if filepath.Clean(p) == filepath.Clean(unregistered) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the refused entry must stay in the ledger so a future 'project add' + sync can recover it; ledger=%v", m.Rules)
+	}
+}
+
+// The de-registered-but-formerly-managed case: a project WAS registered and
+// carried a block, then dropped out of the registered set (simulating a
+// missed/partial 'project remove' — B24) without its block ever being
+// stripped. A later ordinary sync — one that knows nothing about this
+// project anymore — must not reach in and touch it; only 're-registering +
+// sync' or 'project remove' may.
+func TestReconcileRulesPreservesABlockAfterItsProjectIsNoLongerRegistered(t *testing.T) {
+	home := t.TempDir()
+	proj := t.TempDir()
+	if _, err := ReconcileRules(home, projs(proj), []Artifact{{Type: "rule", Name: "r", Content: "v1"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	before := read(t, filepath.Join(proj, "AGENTS.md"))
+	if !strings.Contains(before, "ORBEAT-RULES") {
+		t.Fatal("precondition: the block never landed")
+	}
+
+	// The project drops out of the registered set on this run (simulating a
+	// projects.json edit or a partial 'project remove'), but its ledger entry
+	// is untouched — exactly RemoveProject's old (pre-B24) behavior.
+	res, err := ReconcileRules(home, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Stripped != 0 {
+		t.Fatalf("a now-unregistered project's block must not be stripped by an ordinary sync, got Stripped=%d", res.Stripped)
+	}
+	if got := read(t, filepath.Join(proj, "AGENTS.md")); got != before {
+		t.Fatalf("the block must survive untouched:\nwant: %q\ngot:  %q", before, got)
 	}
 }

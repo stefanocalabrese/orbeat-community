@@ -47,10 +47,22 @@ func (e SeatLimitError) Error() string {
 // refresh an existing one. Checking the count first and rejecting whenever
 // it is at/over the cap, with no existence check, would reject every one of
 // a tenant's already-seated users on their very next request too, once the
-// tenant reached its cap. That is the exact failure mode docs/plans/orbeat-
-// community-caps-2026-08-19.md Task 4 names directly: "an existing user
-// inside the window must never be blocked by the cap, or the eleventh
-// signup locks out the ten people already working."
+// tenant reached its cap: at the shipped Community number of 10
+// (seatlimit.community.go), the eleventh signup would lock out the ten
+// people already working.
+//
+// That justification is this code's own, not a quotation. No plan or spec
+// sentence states the requirement, and an earlier version of this comment
+// attributed an invented one to docs/plans/orbeat-community-caps-2026-08-19.md
+// Task 4, which says nothing of the kind: its seat bullet covers only where
+// the check goes and that a capped seat reaches an MCP client illegibly, and
+// its gate bullet asks only that each cap fire at N+1 and not at N.
+// docs/runbooks/community-edition.md section 3 does describe the behaviour to
+// operators, in wording read out of that file rather than recalled: "The cap
+// only ever gates a subject this tenant has never seen." It was written two
+// days after this code, so it records the property rather than requiring it.
+// What holds the property is TestCheckSeatCapNeverBlocksExistingUser and
+// TestCheckSeatCapIgnoresStaleExistingUser (seatcap_test.go).
 func (r *Resolver) checkSeatCap(ctx context.Context, tenantID, subject string) error {
 	if r.seatLimit <= 0 {
 		return nil

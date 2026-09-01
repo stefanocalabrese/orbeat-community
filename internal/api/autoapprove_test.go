@@ -328,11 +328,15 @@ func TestHandleCreateThenSyncEmptyWithoutAutoApprove(t *testing.T) {
 // entitledSyncArtifacts drives the real GET /v1/sync/artifacts handler as a
 // normal user holding roleID and returns the decoded artifact rows. It reads
 // through the Channel-2 read path (store.ListEntitledArtifacts), which is the
-// only place the identity-vs-snapshot desync described on the identity lock in
-// admin_artifacts.go can actually be observed: that query takes `type` and
-// `name` from the LIVE artifact row but `approved_content` from the FROZEN
-// snapshot, so a rename that is not accompanied by a fresh snapshot ships the
-// new name carrying the old bytes.
+// surface every claim about what a developer machine actually receives has to
+// be made against.
+//
+// Until migration 00016 that query joined the LIVE `type` and `name` to the
+// FROZEN `approved_content`, so a rename not accompanied by a fresh snapshot
+// shipped the new name carrying the old bytes, and the identity lock in
+// admin_artifacts.go existed to refuse the rename outright. It now projects
+// approved_type/approved_name alongside approved_content, so the pair it
+// returns was approved together.
 func entitledSyncArtifacts(t *testing.T, srv *Server, tn store.Tenant, roleID string) []map[string]any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/v1/sync/artifacts", nil)
@@ -391,25 +395,27 @@ func updateArtifactAs(t *testing.T, srv *Server, tn store.Tenant, id string, row
 	return rec
 }
 
-// TestIdentityLockLiftedUnderAutoApproveRenameReachesSync is the end-to-end
-// gate for the identity lock's !s.autoApprove term (admin_artifacts.go): with
-// auto-approve on, renaming an artifact that already has a live approved
-// snapshot must succeed AND the sync channel must immediately serve the NEW
-// name carrying the NEW content.
+// TestAutoApproveRenameReachesSyncImmediately is the Community regression gate
+// for a rename: with auto-approve on, renaming an artifact that already has a
+// live approved snapshot must succeed AND the sync channel must immediately
+// serve the NEW name carrying the NEW content.
 //
-// The second half is the assertion that matters. A test that only checked the
-// PUT returned 200 would pass on the broken shape this lock exists to prevent,
-// because ListEntitledArtifacts joins the live `name` to the frozen
-// `approved_content`: the fix is only correct because tx.UpdateArtifact and
-// s.maybeAutoApprove run in the SAME auditedTx, so identity and snapshot can
-// never be observed apart. Red-proved by suppressing the maybeAutoApprove call
-// that follows the update, which leaves this test reporting the new name with
-// the old body, exactly the desync the Enterprise lock guards.
+// IMMEDIATELY is the word that carries the point, and it is the half of this
+// design Community does not get. Distribution reads approved_name next to
+// approved_content (migration 00016), so an identity edit reaches developers
+// when it is APPROVED, not when it is saved, and in Enterprise that is a
+// second admin at a later time. Under auto-approve there is no later:
+// tx.UpdateArtifact and s.maybeAutoApprove run in the SAME auditedTx, so the
+// promotion commits with the edit and no reader can observe one without the
+// other. Red-proved by suppressing the maybeAutoApprove call that follows the
+// update, which leaves the snapshot at the old pair and this test reporting
+// the OLD name, which is the pending state a Community admin has no route out
+// of.
 //
 // The store is re-read at the end rather than trusting the handler's own
 // response body: a stale snapshot is a property of the ROW, and the response
 // is built from the same in-memory value the write produced.
-func TestIdentityLockLiftedUnderAutoApproveRenameReachesSync(t *testing.T) {
+func TestAutoApproveRenameReachesSyncImmediately(t *testing.T) {
 	ctx := context.Background()
 	srv, st, tn := newAdminServer(t)
 	srv.autoApprove = true
@@ -435,8 +441,8 @@ func TestIdentityLockLiftedUnderAutoApproveRenameReachesSync(t *testing.T) {
 		"visibility": "role",
 	})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("rename under auto-approve = %d, want 200; the identity lock has no unlock in an "+
-			"auto-approving tree (withdraw is Enterprise-only), so it must not fire here. body %s", rec.Code, rec.Body)
+		t.Fatalf("rename under auto-approve = %d, want 200; an artifact's identity is editable in "+
+			"every edition since the lock was deleted. body %s", rec.Code, rec.Body)
 	}
 
 	after := entitledSyncArtifacts(t, srv, tn, role.ID)
@@ -448,9 +454,10 @@ func TestIdentityLockLiftedUnderAutoApproveRenameReachesSync(t *testing.T) {
 	}
 	content, _ := after[0]["content"].(string)
 	if !strings.Contains(content, "V2 BODY") || strings.Contains(content, "V1 BODY") {
-		t.Fatalf("sync served the new name with STALE content %q: ListEntitledArtifacts takes name from "+
-			"the live row and content from the approved snapshot, so lifting the lock is only safe while "+
-			"the update and its re-approval commit in one transaction", content)
+		t.Fatalf("sync served the new name with STALE content %q: sync serves approved_name next to "+
+			"approved_content, so seeing the new name here means the snapshot was refreshed, and the "+
+			"body must be the new one too. Auto-approve gets that for free only because the update "+
+			"and its re-approval commit in one transaction", content)
 	}
 
 	reread, err := st.GetArtifact(ctx, tn.ID, id)
@@ -463,15 +470,15 @@ func TestIdentityLockLiftedUnderAutoApproveRenameReachesSync(t *testing.T) {
 	}
 }
 
-// TestIdentityLockLiftedUnderAutoApproveTypeChangeReachesSync covers the second
-// of the three locked fields on its own, because a type change is not a rename:
+// TestAutoApproveTypeChangeReachesSyncImmediately covers the second of the
+// three identity fields on its own, because a type change is not a rename:
 // the sync client derives an artifact's path from type AND name
 // (fileBackedTypes, internal/syncclient/reconcile.go), so skill -> subagent
 // moves the file from skills/<name>/SKILL.md to agents/<name>.md. What this
 // package owns is the payload that drives that move, so the assertion is that
 // the sync row's `type` flips and its content is the newly approved body, not
 // the snapshot taken while it was still a skill.
-func TestIdentityLockLiftedUnderAutoApproveTypeChangeReachesSync(t *testing.T) {
+func TestAutoApproveTypeChangeReachesSyncImmediately(t *testing.T) {
 	ctx := context.Background()
 	srv, st, tn := newAdminServer(t)
 	srv.autoApprove = true
@@ -510,19 +517,20 @@ func TestIdentityLockLiftedUnderAutoApproveTypeChangeReachesSync(t *testing.T) {
 	}
 }
 
-// TestIdentityLockLiftedUnderAutoApproveVisibilityChangeSwitchesChannel covers
-// the third locked field, which is the one that is not a relocation but a
-// change of DISTRIBUTION CHANNEL: role visibility is served by
+// TestAutoApproveVisibilityChangeSwitchesChannelImmediately covers the third
+// identity field, which is the one that is not a relocation but a change of
+// DISTRIBUTION CHANNEL: role visibility is served by
 // GET /v1/sync/artifacts (Channel 2), org visibility by the marketplace plugin
 // (Channel 1, store.ListActiveOrgArtifacts). Both sides are asserted, because
 // "sync no longer serves it" on its own is also what a broken update that
 // simply destroyed the artifact would look like.
 //
 // The role's artifact_entitlement row is deliberately left in place: it is
-// inert while visibility is 'org' (ListEntitledArtifacts filters on the live
-// visibility) and becomes live again if the artifact is flipped back, which is
-// the behaviour a Community admin correcting a mistake depends on.
-func TestIdentityLockLiftedUnderAutoApproveVisibilityChangeSwitchesChannel(t *testing.T) {
+// inert while the APPROVED visibility is 'org' (ListEntitledArtifacts filters
+// on approved_visibility since migration 00016) and becomes live again if the
+// artifact is flipped back, which is the behaviour a Community admin
+// correcting a mistake depends on.
+func TestAutoApproveVisibilityChangeSwitchesChannelImmediately(t *testing.T) {
 	ctx := context.Background()
 	srv, st, tn := newAdminServer(t)
 	srv.autoApprove = true
@@ -570,60 +578,5 @@ func TestIdentityLockLiftedUnderAutoApproveVisibilityChangeSwitchesChannel(t *te
 		t.Fatalf("Channel 1 served the pre-change snapshot %q; ListActiveOrgArtifacts reads "+
 			"approved_content, so the flip is only safe because the re-approval shares the update's "+
 			"transaction", orgAfter[0].Content)
-	}
-}
-
-// TestIdentityLockHoldsWhenAutoApproveDisabled is the controlled-experiment
-// sibling of the three tests above: identical setup, one variable flipped, so
-// each of them is falsifiable inside this file. Without it every assertion
-// above would still pass with the whole identity-lock `if` deleted, which is
-// the "test that cannot fail for the reason it names" shape.
-//
-// autoApprove is set to false EXPLICITLY rather than left at New's default,
-// which is edition-specific (false in this repo's own build, true in a
-// generated Community tree, where communitygen copies this ordinary _test.go
-// verbatim). Setting it keeps the experiment valid in both editions. The
-// Enterprise claim that the DEFAULT holds the lock, together with the exact
-// operator-facing message, lives in admin_artifacts.ee_test.go, which the
-// generator drops.
-func TestIdentityLockHoldsWhenAutoApproveDisabled(t *testing.T) {
-	ctx := context.Background()
-	srv, st, tn := newAdminServer(t)
-	srv.autoApprove = false
-
-	created, err := st.CreateArtifact(ctx, store.Artifact{
-		TenantID: tn.ID, Type: "skill", Name: "locked-skill", Visibility: "role",
-		Content: "---\nname: locked-skill\ndescription: d\n---\nV1 BODY",
-	})
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	// Approve out of band: this build has the real review workflow, but the
-	// point here is the lock's precondition (a live snapshot), not how it got
-	// there, and SetArtifactApproved is the same call maybeAutoApprove makes.
-	var approved store.Artifact
-	if err := st.InTx(ctx, func(tx *store.Store) error {
-		var e error
-		approved, _, e = tx.SetArtifactApproved(ctx, tn.ID, created.ID, "bob", 0)
-		return e
-	}); err != nil {
-		t.Fatalf("approve: %v", err)
-	}
-
-	rec := updateArtifactAs(t, srv, tn, created.ID, approved.RowVersion, map[string]any{
-		"type": "skill", "name": "renamed-skill", "description": "d",
-		"content":    "---\nname: renamed-skill\ndescription: d\n---\nV2 BODY",
-		"visibility": "role",
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("rename with a live snapshot and auto-approve OFF = %d, want 400: the lock must survive "+
-			"for every caller that can write identity and snapshot at different times. body %s", rec.Code, rec.Body)
-	}
-	reread, err := st.GetArtifact(ctx, tn.ID, created.ID)
-	if err != nil {
-		t.Fatalf("reread: %v", err)
-	}
-	if reread.Name != "locked-skill" || reread.Content != created.Content {
-		t.Fatalf("a rejected identity change must not mutate the row, got name %q content %q", reread.Name, reread.Content)
 	}
 }

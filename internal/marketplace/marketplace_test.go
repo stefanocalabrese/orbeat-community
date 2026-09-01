@@ -2,8 +2,11 @@ package marketplace
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -54,6 +57,17 @@ func TestGenerateTrimsTrailingSlashOnGatewayURL(t *testing.T) {
 	}
 }
 
+// TestGenerateIsDeterministic derives the set of files to compare from what
+// Generate actually wrote into a (filesUnder), rather than a hand-maintained
+// list of relative paths: a fixed list only ever proves determinism for the
+// files someone remembered to name in it, and silently stops proving
+// anything about a file added to (or removed from) Generate's output later.
+//
+// It checks BOTH directions between the two independently generated trees:
+// that a and b list the exact same files (a file Generate writes only
+// sometimes -- e.g. conditionally, on some future flag -- is itself a
+// determinism bug this loop-only-over-a's-files would miss), and that every
+// shared file's content matches byte-for-byte.
 func TestGenerateIsDeterministic(t *testing.T) {
 	a, b := t.TempDir(), t.TempDir()
 	opts := Options{GatewayURL: "http://localhost:8090"}
@@ -63,19 +77,90 @@ func TestGenerateIsDeterministic(t *testing.T) {
 	if err := Generate(b, opts); err != nil {
 		t.Fatal(err)
 	}
-	for _, rel := range relFiles() {
+
+	filesA := filesUnder(t, a)
+	filesB := filesUnder(t, b)
+	if len(filesA) == 0 {
+		t.Fatal("Generate wrote zero files into a; every determinism assertion below would " +
+			"compare an empty set against itself and pass over nothing")
+	}
+	if diff := diffFileSets(filesA, filesB); diff != "" {
+		t.Fatalf("the two independently generated trees list DIFFERENT files:\n%s", diff)
+	}
+
+	for _, rel := range filesA {
 		if string(mustRead(t, filepath.Join(a, rel))) != string(mustRead(t, filepath.Join(b, rel))) {
 			t.Errorf("%s not deterministic", rel)
 		}
 	}
 }
 
-func relFiles() []string {
-	return []string{
-		filepath.Join(".claude-plugin", "marketplace.json"),
-		filepath.Join("plugins", "orbeat-gateway", ".claude-plugin", "plugin.json"),
-		filepath.Join("plugins", "orbeat-gateway", ".mcp.json"),
+// filesUnder returns every regular file under dir, as paths relative to dir,
+// sorted. Deriving the file set this way -- by asking the filesystem what is
+// actually there -- is what lets a caller compare "what Generate rendered"
+// against "what is committed" without either side needing a name in advance:
+// a fourth file Generate starts writing, or a fifth someone deletes,
+// changes this function's return value with zero code change here.
+func filesUnder(t *testing.T, dir string) []string {
+	t.Helper()
+	var rels []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		rels = append(rels, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
 	}
+	sort.Strings(rels)
+	return rels
+}
+
+// diffFileSets returns a human-readable description of how the sorted file
+// lists a and b differ (entries only in a, entries only in b), or "" if they
+// are identical. Used to compare two independently derived file sets rather
+// than trusting either one to already be authoritative.
+func diffFileSets(a, b []string) string {
+	inA := map[string]bool{}
+	for _, f := range a {
+		inA[f] = true
+	}
+	inB := map[string]bool{}
+	for _, f := range b {
+		inB[f] = true
+	}
+
+	var onlyInA, onlyInB []string
+	for _, f := range a {
+		if !inB[f] {
+			onlyInA = append(onlyInA, f)
+		}
+	}
+	for _, f := range b {
+		if !inA[f] {
+			onlyInB = append(onlyInB, f)
+		}
+	}
+	if len(onlyInA) == 0 && len(onlyInB) == 0 {
+		return ""
+	}
+	msg := ""
+	if len(onlyInA) > 0 {
+		msg += "only in the first set: " + strings.Join(onlyInA, ", ") + "\n"
+	}
+	if len(onlyInB) > 0 {
+		msg += "only in the second set: " + strings.Join(onlyInB, ", ") + "\n"
+	}
+	return msg
 }
 
 func readJSON(t *testing.T, path string, v any) {

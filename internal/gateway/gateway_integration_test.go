@@ -655,8 +655,15 @@ func TestGatewaySlugCollisionFirstServerWins(t *testing.T) {
 	for _, tl := range tools.Tools {
 		names[tl.Name] = true
 	}
-	if !names["collide__echo"] || !names["collide__danger"] || names["collide__intruder"] {
-		t.Fatalf("tools = %v, want A's tools only (no collide__intruder)", names)
+	// fable-audit B11 (session build filters by server visibility; per-tool
+	// AllowedTools used to be applied only at call time): srvA's entitlement
+	// grants ONLY "echo", so collide__danger -- a real tool on the WINNING
+	// server A, not merely on the skipped collider B -- must be filtered at
+	// registration and never appear here. collide__intruder stays absent for
+	// the original, unrelated reason this test exists: server B never won
+	// the slug, so its tools were never even considered.
+	if !names["collide__echo"] || names["collide__danger"] || names["collide__intruder"] {
+		t.Fatalf("tools = %v, want ONLY collide__echo (danger is not entitled; intruder's server never won the slug)", names)
 	}
 
 	// The entitled call routes to A and succeeds.
@@ -669,11 +676,113 @@ func TestGatewaySlugCollisionFirstServerWins(t *testing.T) {
 	}
 
 	// THE MISROUTE PIN: the caller is entitled to echo ONLY on the slug's
-	// server. Today the slug resolves to B, whose nil-AllowedTools entitlement
-	// authorizes ANY of A's registered tools — this call succeeds. Correct
-	// behavior: authorized against A → denied.
+	// server. Before the v1.17.0 slug-collision fix the slug resolved to B,
+	// whose nil-AllowedTools entitlement authorized ANY of A's registered
+	// tools -- so this call succeeded (a privilege escalation). It still
+	// denies here via the ORDINARY call-time RBAC check in rbacMiddleware
+	// (toolCallAuthorization resolves "collide" to A regardless of which of
+	// A's tools got registered, so A's own entitlement, echo-only, is what's
+	// consulted) -- that half of the fix predates fable-audit B11 and this
+	// call alone does not distinguish it from B11's registration-time
+	// filter. The ListTools assertion above is the one B11 actually gates:
+	// collide__danger is not merely denied when called, it was never
+	// registered or listed in the first place.
 	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "collide__danger", Arguments: json.RawMessage(`{"text":"boom"}`)}); err == nil {
 		t.Fatal("non-entitled tool on the winning server must be denied, not authorized against the collider's entitlement")
+	}
+}
+
+// TestSessionCacheKeyedPerClientNotJustSubject is fable-audit B14's gate:
+// buildSession forks on p.ClientID (virtual keys) and Resolve reconciles
+// roles from the token's own realm_access -- a PER-CLIENT value under
+// Keycloak's client role scope mappings -- yet withSession used to cache the
+// resulting gateway session under p.Subject alone. Two OAuth clients
+// belonging to the SAME human (Claude Code and Codex, spec §4.2's own
+// example) but carrying DIFFERENT roles would then share one cached
+// session, and whichever client connected first silently decided what the
+// other could do.
+//
+// This drives that exact scenario for real: one subject, two tokens with
+// different ClientID AND different Roles, each granting a DIFFERENT tool on
+// a DIFFERENT server. Client A connects and lists tools first (building and
+// caching a session for A's own key); client B then connects SEPARATELY.
+// Under the bug, B's connection would hit A's cached session (keyed on bare
+// subject, a cache HIT) and see A's tool, never its own. The fix keys on
+// ratelimit.KeyFor(p) ("subject|azp"), so B's key misses the cache, builds
+// its OWN session from its OWN roles, and sees its OWN tool.
+func TestSessionCacheKeyedPerClientNotJustSubject(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	st, err := store.New(ctx, gwDSN)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(st.Close)
+
+	upA := newUpstreamFixtureWithTools(t, "tool-a")
+	upB := newUpstreamFixtureWithTools(t, "tool-b")
+
+	tn, err := st.GetOrCreateTenantByName(ctx, fmt.Sprintf("b14-clientkey-%d", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("tenant: %v", err)
+	}
+	roleA, err := st.CreateRole(ctx, tn.ID, "role-a")
+	if err != nil {
+		t.Fatalf("role a: %v", err)
+	}
+	roleB, err := st.CreateRole(ctx, tn.ID, "role-b")
+	if err != nil {
+		t.Fatalf("role b: %v", err)
+	}
+	srvA, err := st.CreateMCPServer(ctx, store.MCPServer{TenantID: tn.ID, Name: "servera", Transport: "http", EndpointOrCommand: upA.URL, Status: "active"})
+	if err != nil {
+		t.Fatalf("mcp server a: %v", err)
+	}
+	srvB, err := st.CreateMCPServer(ctx, store.MCPServer{TenantID: tn.ID, Name: "serverb", Transport: "http", EndpointOrCommand: upB.URL, Status: "active"})
+	if err != nil {
+		t.Fatalf("mcp server b: %v", err)
+	}
+	if _, err := st.CreateEntitlement(ctx, store.Entitlement{TenantID: tn.ID, RoleID: roleA.ID, MCPServerID: srvA.ID, AllowedTools: []string{"tool-a"}}); err != nil {
+		t.Fatalf("entitle a: %v", err)
+	}
+	if _, err := st.CreateEntitlement(ctx, store.Entitlement{TenantID: tn.ID, RoleID: roleB.ID, MCPServerID: srvB.ID, AllowedTools: []string{"tool-b"}}); err != nil {
+		t.Fatalf("entitle b: %v", err)
+	}
+
+	const humanSubject = "kc-shared-human"
+	verifier := stubVerifier(map[string]auth.Principal{
+		"tok-client-a": {Subject: humanSubject, Email: "shared@x.io", Roles: []string{"role-a"}, ClientID: "client-a"},
+		"tok-client-b": {Subject: humanSubject, Email: "shared@x.io", Roles: []string{"role-b"}, ClientID: "client-b"},
+	})
+
+	gw := New(st, authz.NewResolver(st, tn.Name), verifier, secrets.NewResolver(), "http://gw.test", "http://kc.test/realms/orbeat")
+	t.Cleanup(gw.Close)
+	httpSrv := httptest.NewServer(gw.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	csA := connectThroughGateway(t, ctx, httpSrv.URL+"/mcp", "tok-client-a")
+	t.Cleanup(func() { _ = csA.Close() })
+	toolsA, err := csA.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools (client A): %v", err)
+	}
+	if len(toolsA.Tools) != 1 || toolsA.Tools[0].Name != "servera__tool-a" {
+		t.Fatalf("client A tools = %+v, want only [servera__tool-a]", toolsA.Tools)
+	}
+
+	// Client B: SAME subject, DIFFERENT client/roles, a SEPARATE connection.
+	csB := connectThroughGateway(t, ctx, httpSrv.URL+"/mcp", "tok-client-b")
+	t.Cleanup(func() { _ = csB.Close() })
+	toolsB, err := csB.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools (client B): %v", err)
+	}
+	// THE ASSERTION THAT FAILS ON THE BUG: under bare-subject keying, this
+	// would be a cache HIT on client A's session, so client B would see
+	// servera__tool-a (A's tool) instead of its own.
+	if len(toolsB.Tools) != 1 || toolsB.Tools[0].Name != "serverb__tool-b" {
+		t.Fatalf("client B tools = %+v, want only [serverb__tool-b] -- got A's session instead of building its own", toolsB.Tools)
 	}
 }
 

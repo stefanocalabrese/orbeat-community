@@ -1,6 +1,13 @@
 .git
 bin
+# A bare `.env` matches the context ROOT only and matches no suffixed name,
+# so `deploy/.env.prod` shipped into every build context the moment an
+# operator created it (audit B36). The final distroless stage copies only the
+# binary, so nothing reached a published image, but the builder layer held it.
 .env
+.env.*
+**/.env
+**/.env.*
 *.local
 docs
 *.md

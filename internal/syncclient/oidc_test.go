@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -47,5 +48,22 @@ func TestDiscoverNon200(t *testing.T) {
 	defer srv.Close()
 	if _, err := Discover(context.Background(), http.DefaultClient, srv.URL); err == nil {
 		t.Fatal("expected error on non-200 status")
+	}
+}
+
+// B26: the discovery document comes from ORBEAT_OIDC_DISCOVERY_URL, client
+// config this same client does not fully control — a bare
+// json.NewDecoder(resp.Body).Decode had no upper bound.
+func TestDiscoverRefusesAnOversizedResponseBody(t *testing.T) {
+	huge := strings.Repeat("A", int(maxJSONBodyBytes)+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"device_authorization_endpoint":"`))
+		_, _ = w.Write([]byte(huge))
+		_, _ = w.Write([]byte(`","token_endpoint":"https://kc/token"}`))
+	}))
+	defer srv.Close()
+	if _, err := Discover(context.Background(), http.DefaultClient, srv.URL); err == nil {
+		t.Fatal("an oversized discovery document must be refused")
 	}
 }

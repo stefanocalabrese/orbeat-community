@@ -1,10 +1,13 @@
 import { expect, test, vi, beforeEach, afterEach } from "vitest";
 import {
   apiFetch,
+  apiFetchRaw,
   ApiRequestError,
   createAppQueryClient,
   errMsg,
   notifyUnauthorized,
+  reportApiError,
+  setLimitReachedHandler,
   setUnauthorizedHandler,
 } from "./client";
 
@@ -53,6 +56,20 @@ test("maps api error body to ApiRequestError with status + message", async () =>
   await expect(
     apiFetch("/v1/admin/servers", "tok", { method: "POST", body: {} }),
   ).rejects.toMatchObject({ status: 409, message: "already exists" });
+});
+
+test("captures a machine-readable `code` field alongside the message, on any status", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    okJson({ error: { message: "confirm the rename" }, code: "idp_rename_assertion_required" }, 400),
+  );
+  await expect(
+    apiFetch("/v1/admin/roles/1", "tok", { method: "PUT", body: {} }),
+  ).rejects.toMatchObject({ status: 400, code: "idp_rename_assertion_required" });
+});
+
+test("a body with no `code` field leaves ApiRequestError.code undefined", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(okJson({ error: { message: "boom" } }, 409));
+  await expect(apiFetch("/x", "tok")).rejects.toMatchObject({ code: undefined });
 });
 
 test("204 returns undefined", async () => {
@@ -142,4 +159,77 @@ test("ApiRequestError is an Error subclass", () => {
   expect(err).toBeInstanceOf(ApiRequestError);
   expect(err.status).toBe(500);
   expect(err.message).toBe("boom");
+});
+
+// ── apiFetchRaw (B15) ────────────────────────────────────────────────────────
+// The audit export needs the raw Response (to read a header and call .blob())
+// rather than apiFetch<T>'s parsed JSON, but must NOT lose any of apiFetch's
+// protections in the process — this proves apiFetchRaw carries the exact same
+// ones apiFetch's own tests above pin, on the same request path.
+
+test("apiFetchRaw attaches the bearer token like apiFetch", async () => {
+  const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("blob-bytes", { status: 200 }));
+  await apiFetchRaw("/v1/admin/audit/export?format=csv", "tok");
+  const [, init] = spy.mock.calls[0]!;
+  expect((init!.headers as Record<string, string>).Authorization).toBe("Bearer tok");
+});
+
+test("apiFetchRaw passes an AbortSignal to fetch even with no caller signal (the same hard timeout apiFetch has)", async () => {
+  const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("x", { status: 200 }));
+  await apiFetchRaw("/x", "tok");
+  const [, init] = spy.mock.calls[0]!;
+  expect(init!.signal).toBeInstanceOf(AbortSignal);
+});
+
+test("apiFetchRaw returns the raw Response on success (not parsed JSON) so a caller can read headers and call .blob()", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response("csv,bytes", { status: 200, headers: { "X-Orbeat-Export-Truncated": "true" } }),
+  );
+  const res = await apiFetchRaw("/v1/admin/audit/export?format=csv", "tok");
+  expect(res.headers.get("X-Orbeat-Export-Truncated")).toBe("true");
+  await expect(res.text()).resolves.toBe("csv,bytes");
+});
+
+test("apiFetchRaw maps a non-ok response to ApiRequestError exactly like apiFetch does", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    okJson({ error: { message: "row cap exceeded" } }, 500),
+  );
+  await expect(apiFetchRaw("/v1/admin/audit/export?format=json", "tok")).rejects.toMatchObject({
+    status: 500,
+    message: "row cap exceeded",
+  });
+});
+
+// ── reportApiError (B15) ─────────────────────────────────────────────────────
+// The SAME policy createAppQueryClient's caches already apply to every query
+// and mutation (this file's own doc comment on why it is ONE function), now
+// reusable by a plain imperative fetch like the audit export — rather than a
+// second, drift-prone copy of "if 401 notifyUnauthorized, if 402
+// notifyLimitReached" living beside it.
+
+afterEach(() => setLimitReachedHandler(null));
+
+test("reportApiError fires the unauthorized handler on a 401", () => {
+  const handler = vi.fn();
+  setUnauthorizedHandler(handler);
+  reportApiError(new ApiRequestError(401, "token expired"));
+  expect(handler).toHaveBeenCalledTimes(1);
+});
+
+test("reportApiError fires the limit-reached handler on a 402 carrying a limit payload", () => {
+  const handler = vi.fn();
+  setLimitReachedHandler(handler);
+  const limit = { resource: "servers", max: 10, current: 10, contact: "sales@orbeat.example" };
+  reportApiError(new ApiRequestError(402, "cap reached", limit));
+  expect(handler).toHaveBeenCalledWith(limit);
+});
+
+test("reportApiError does nothing for an ordinary 500", () => {
+  const unauthorizedHandler = vi.fn();
+  const limitHandler = vi.fn();
+  setUnauthorizedHandler(unauthorizedHandler);
+  setLimitReachedHandler(limitHandler);
+  reportApiError(new ApiRequestError(500, "boom"));
+  expect(unauthorizedHandler).not.toHaveBeenCalled();
+  expect(limitHandler).not.toHaveBeenCalled();
 });

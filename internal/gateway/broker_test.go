@@ -141,7 +141,7 @@ func TestRegisterProxiesForwardsCall(t *testing.T) {
 
 	gw := mcp.NewServer(&mcp.Implementation{Name: "orbeat-gateway", Version: "test"}, nil)
 	// nil tracer: this test is about call forwarding, not tracing.
-	names, err := registerProxies(ctx, gw, conn, func() {}, nil)
+	names, err := registerProxies(ctx, gw, conn, func() {}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("registerProxies: %v", err)
 	}
@@ -175,6 +175,105 @@ func TestRegisterProxiesForwardsCall(t *testing.T) {
 	}
 }
 
+// TestRegisterProxiesFiltersToolsNotInAllowedTools is fable-audit B11's
+// gate, first half: "session build filters by server visibility; per-tool
+// AllowedTools is applied only at call time, so a caller entitled to `echo`
+// sees the `danger` tool with its full schema". The upstream here serves
+// BOTH echo and danger; sess's entitlement grants only echo. Before the fix,
+// registerProxies registered every upstream tool regardless of sess, so
+// danger was both LISTED and (per rbacMiddleware's own, separately-correct
+// call-time check) deniable but still visible with its full schema -- the
+// two surfaces disagreeing, exactly as the finding describes.
+//
+// Mutant: drop the toolCallAllowed filter (or pass sess.entitlements from
+// the wrong server/slug). "up__danger" would then appear in names and in a
+// live tools/list.
+func TestRegisterProxiesFiltersToolsNotInAllowedTools(t *testing.T) {
+	up := newUpstreamFixtureWithTools(t, "echo", "danger")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	srv := store.MCPServer{ID: "srv-1", Name: "up", Transport: "http", EndpointOrCommand: up.URL, Status: "active"}
+	conn, err := connectUpstream(ctx, srv, "", "", 0)
+	if err != nil {
+		t.Fatalf("connectUpstream: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.session.Close() })
+
+	sess := &session{
+		subject: "kc-filter", tenantID: "tenant-filter",
+		entitlements: []store.Entitlement{{MCPServerID: "srv-1", AllowedTools: []string{"echo"}}},
+		slugToServer: map[string]string{},
+	}
+
+	gw := mcp.NewServer(&mcp.Implementation{Name: "orbeat-gateway", Version: "test"}, nil)
+	names, err := registerProxies(ctx, gw, conn, func() {}, nil, nil, sess)
+	if err != nil {
+		t.Fatalf("registerProxies: %v", err)
+	}
+	if len(names) != 1 || names[0] != "up__echo" {
+		t.Fatalf("registered = %v, want ONLY [up__echo] -- danger is not entitled and must never be registered", names)
+	}
+
+	st, ct := mcp.NewInMemoryTransports()
+	if _, err := gw.Connect(ctx, st, nil); err != nil {
+		t.Fatalf("gw.Connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err := client.Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+
+	tools, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if len(tools.Tools) != 1 || tools.Tools[0].Name != "up__echo" {
+		t.Fatalf("tools/list = %+v, want ONLY up__echo", tools.Tools)
+	}
+
+	// The unregistered tool must fail at the SDK's own routing, never reach
+	// an upstream call -- a stronger closure than an RBAC-time deny.
+	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "up__danger", Arguments: json.RawMessage(`{}`)}); err == nil {
+		t.Fatal("CallTool on a non-entitled, never-registered tool succeeded; want an error")
+	}
+}
+
+// TestRegisterProxiesRegistersEverythingWhenSessIsNil pins the nil-sess
+// escape hatch every pre-existing broker_test.go call site (including
+// TestRegisterProxiesForwardsCall above) relies on: several tests call
+// registerProxies directly with sess == nil and must see byte-identical
+// behaviour to before fable-audit B11's filter existed -- no filtering at
+// all, every upstream tool registered. The real production caller
+// (buildSession) never passes a nil session.
+func TestRegisterProxiesRegistersEverythingWhenSessIsNil(t *testing.T) {
+	up := newUpstreamFixtureWithTools(t, "echo", "danger")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	srv := store.MCPServer{ID: "srv-1", Name: "up", Transport: "http", EndpointOrCommand: up.URL, Status: "active"}
+	conn, err := connectUpstream(ctx, srv, "", "", 0)
+	if err != nil {
+		t.Fatalf("connectUpstream: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.session.Close() })
+
+	gw := mcp.NewServer(&mcp.Implementation{Name: "orbeat-gateway", Version: "test"}, nil)
+	names, err := registerProxies(ctx, gw, conn, func() {}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("registerProxies: %v", err)
+	}
+	got := map[string]bool{}
+	for _, n := range names {
+		got[n] = true
+	}
+	if !got["up__echo"] || !got["up__danger"] {
+		t.Fatalf("registered = %v, want both up__echo and up__danger with sess == nil", names)
+	}
+}
+
 // TestRegisterProxiesEmitsSpanForCall is the fable-audit §7 #14 gate for the
 // proxy-hop span: the actual upstream tools/call is the uninstrumented
 // latency between the gateway's own http.server span (otelhttp) and pgx's
@@ -205,7 +304,7 @@ func TestRegisterProxiesEmitsSpanForCall(t *testing.T) {
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 
 	gw := mcp.NewServer(&mcp.Implementation{Name: "orbeat-gateway", Version: "test"}, nil)
-	if _, err := registerProxies(ctx, gw, conn, func() {}, tp.Tracer("gateway-test")); err != nil {
+	if _, err := registerProxies(ctx, gw, conn, func() {}, tp.Tracer("gateway-test"), nil, nil); err != nil {
 		t.Fatalf("registerProxies: %v", err)
 	}
 
@@ -295,7 +394,7 @@ func TestRegisterProxiesFollowsToolPagination(t *testing.T) {
 
 	gw := mcp.NewServer(&mcp.Implementation{Name: "orbeat-gateway", Version: "test"}, nil)
 	// nil tracer: this test is about pagination, not tracing.
-	names, err := registerProxies(ctx, gw, conn, func() {}, nil)
+	names, err := registerProxies(ctx, gw, conn, func() {}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("registerProxies: %v", err)
 	}

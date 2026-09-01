@@ -146,11 +146,22 @@ func TestHTTPRejectedLogContainsExportedMessage(t *testing.T) {
 	}
 }
 
-// TestHTTPLogIsSampledNotPerRejection pins the "at most once per key per
-// window" requirement itself (spec §9): a client hammering a drained bucket
-// must still increment the counter on every single rejection (the durable
-// instrument), but must produce only ONE log line for the whole streak (the
-// breadcrumb) — not one per rejection.
+// TestHTTPLogIsSampledNotPerRejection pins that the HTTP adapter forwards the
+// limiter's sampling decision instead of asking for a line on every rejection:
+// a client hammering a drained bucket must still increment the counter every
+// time (the durable instrument) while producing only ONE log line (the
+// breadcrumb).
+//
+// WHAT IT DOES NOT PROVE, stated because it used to be read as proving it.
+// This was the whole gate on spec §9's "at most once per key per window", and
+// it passed on a sampler that was defeated by any sustained overload: 25
+// rejections in a tight loop leave no room for a token to refill, so no
+// allowed request lands between them, and the per-streak flag that shipped was
+// only ever cleared by an allowed request. One line here was equally true of
+// the broken code and the fixed code. The traffic shape that actually occurs,
+// a client above its limit getting one request in every 1/rps admitted, is
+// covered in sample_test.go against a synthetic clock, where the same scenario
+// produced 241 lines for 241 rejections before the fix.
 func TestHTTPLogIsSampledNotPerRejection(t *testing.T) {
 	obs, rdr, logBuf := newTestObservability()
 

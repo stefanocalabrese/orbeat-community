@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+# Pin the Go minor line to match go.mod (1.26.x); see Dockerfile.api.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+COPY go.su[m] ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /out/fakellm ./deploy/fakellm
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/fakellm /fakellm
+EXPOSE 9100
+USER nonroot:nonroot
+ENTRYPOINT ["/fakellm"]

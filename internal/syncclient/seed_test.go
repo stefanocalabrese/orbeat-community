@@ -48,14 +48,14 @@ func TestMergeSeed(t *testing.T) {
 	block := renderSeedBlock("rev", body)
 
 	t.Run("into empty content", func(t *testing.T) {
-		out, changed := mergeSeed("", "rev", body)
+		out, changed, _ := mergeSeed("", "rev", body)
 		if !changed || out != block {
 			t.Fatalf("changed=%v out=%q", changed, out)
 		}
 	})
 
 	t.Run("prepends above existing notes with one blank line", func(t *testing.T) {
-		out, changed := mergeSeed("- my own note\n", "rev", body)
+		out, changed, _ := mergeSeed("- my own note\n", "rev", body)
 		want := block + "\n- my own note\n"
 		if !changed || out != want {
 			t.Fatalf("changed=%v\nout:  %q\nwant: %q", changed, out, want)
@@ -64,7 +64,7 @@ func TestMergeSeed(t *testing.T) {
 
 	t.Run("idempotent no-op when hash unchanged", func(t *testing.T) {
 		existing := block + "\n- my own note\n"
-		out, changed := mergeSeed(existing, "rev", body)
+		out, changed, _ := mergeSeed(existing, "rev", body)
 		if changed || out != existing {
 			t.Fatalf("expected no-op, changed=%v", changed)
 		}
@@ -72,7 +72,7 @@ func TestMergeSeed(t *testing.T) {
 
 	t.Run("replaces block on new body, preserving notes", func(t *testing.T) {
 		existing := block + "\n- my own note\n"
-		out, changed := mergeSeed(existing, "rev", "new seed v2")
+		out, changed, _ := mergeSeed(existing, "rev", "new seed v2")
 		want := renderSeedBlock("rev", "new seed v2") + "\n- my own note\n"
 		if !changed || out != want {
 			t.Fatalf("changed=%v\nout:  %q\nwant: %q", changed, out, want)
@@ -81,7 +81,7 @@ func TestMergeSeed(t *testing.T) {
 
 	t.Run("re-hoists a relocated block to the top on change", func(t *testing.T) {
 		existing := "- note above\n\n" + block + "\n- note below\n"
-		out, changed := mergeSeed(existing, "rev", "new seed v2")
+		out, changed, _ := mergeSeed(existing, "rev", "new seed v2")
 		want := renderSeedBlock("rev", "new seed v2") + "\n- note above\n\n- note below\n"
 		if !changed || out != want {
 			t.Fatalf("changed=%v\nout:  %q\nwant: %q", changed, out, want)
@@ -90,7 +90,7 @@ func TestMergeSeed(t *testing.T) {
 
 	t.Run("relocated but unchanged block stays put", func(t *testing.T) {
 		existing := "- note above\n\n" + block
-		out, changed := mergeSeed(existing, "rev", body)
+		out, changed, _ := mergeSeed(existing, "rev", body)
 		if changed || out != existing {
 			t.Fatalf("expected no-op for unchanged relocated block, changed=%v", changed)
 		}
@@ -103,7 +103,7 @@ func TestMergeSeed(t *testing.T) {
 	t.Run("re-hoist still collapses the gap when the old block had no trailing newline", func(t *testing.T) {
 		noTrailingNL := strings.TrimSuffix(block, "\n")
 		existing := "- note above\n\n" + noTrailingNL + "\n- note below\n"
-		out, changed := mergeSeed(existing, "rev", "new seed v2")
+		out, changed, _ := mergeSeed(existing, "rev", "new seed v2")
 		want := renderSeedBlock("rev", "new seed v2") + "\n- note above\n\n- note below\n"
 		if !changed || out != want {
 			t.Fatalf("changed=%v\nout:  %q\nwant: %q", changed, out, want)
@@ -116,7 +116,7 @@ func TestMergeSeed(t *testing.T) {
 	// hand-computed byte string.
 	t.Run("body containing a literal --> is not mistaken for the end marker", func(t *testing.T) {
 		trapBody := "line one\n--> not an end marker\nline two"
-		out, changed := mergeSeed("", "rev", trapBody)
+		out, changed, _ := mergeSeed("", "rev", trapBody)
 		if !changed {
 			t.Fatalf("expected change")
 		}
@@ -126,7 +126,7 @@ func TestMergeSeed(t *testing.T) {
 		if got := strings.Count(out, "ORBEAT-SEED:END rev "); got != 1 {
 			t.Fatalf("END count = %d, out=%q", got, out)
 		}
-		out2, changed2 := mergeSeed(out, "rev", trapBody)
+		out2, changed2, _ := mergeSeed(out, "rev", trapBody)
 		if changed2 || out2 != out {
 			t.Fatalf("expected stable idempotent merge, changed=%v", changed2)
 		}
@@ -135,7 +135,7 @@ func TestMergeSeed(t *testing.T) {
 	t.Run("name is not a prefix trap", func(t *testing.T) {
 		// A block for "rev" must not be matched when merging "rev-two".
 		existing := block + "\n- note\n"
-		out, changed := mergeSeed(existing, "rev-two", "other seed")
+		out, changed, _ := mergeSeed(existing, "rev-two", "other seed")
 		if !changed || !strings.Contains(out, "ORBEAT-SEED:BEGIN rev ") || !strings.Contains(out, "ORBEAT-SEED:BEGIN rev-two ") {
 			t.Fatalf("prefix collision:\n%s", out)
 		}
@@ -151,7 +151,7 @@ func TestMergeSeed(t *testing.T) {
 		fakeHash := seedHash(newBody)
 		oldBody := "decoy sha=" + fakeHash + " embedded"
 		existing := renderSeedBlock("rev", oldBody)
-		out, changed := mergeSeed(existing, "rev", newBody)
+		out, changed, _ := mergeSeed(existing, "rev", newBody)
 		want := renderSeedBlock("rev", newBody)
 		if !changed || out != want {
 			t.Fatalf("changed=%v\nout:  %q\nwant: %q", changed, out, want)
@@ -162,7 +162,7 @@ func TestMergeSeed(t *testing.T) {
 	// in trailing newlines from what's already on disk must be a no-op.
 	t.Run("trailing-newline-only difference in body is a no-op", func(t *testing.T) {
 		existing := block
-		out, changed := mergeSeed(existing, "rev", body+"\n\n\n")
+		out, changed, _ := mergeSeed(existing, "rev", body+"\n\n\n")
 		if changed || out != existing {
 			t.Fatalf("expected no-op for trailing-newline-only body difference, changed=%v out=%q", changed, out)
 		}
@@ -740,6 +740,60 @@ func TestStripProjectSeedsPreservesLedgerOnMalformedMarker(t *testing.T) {
 	}
 }
 
+// B24: one unreadable candidate must not stop StripProjectSeeds from
+// finishing the OTHERS, or from saving the manifest for the ones that DID
+// succeed. Before this fix, the strip loop returned immediately on the FIRST
+// per-candidate error — skipping every remaining candidate — and, because
+// that early return sat above the ledger-cleanup + saveManifest call, even a
+// candidate that succeeded and was already rewritten on disk never got its
+// ledger entry updated.
+//
+// Go's map iteration order over `candidates` is randomized, so the assertion
+// has to hold regardless of which candidate the loop reaches first. Checking
+// the SAVED manifest (not the return value, and not the file alone) is what
+// makes this discriminating either way: on the unfixed code, if the bad
+// candidate is reached first the good one is never even attempted, and if the
+// good one is reached first its write lands on disk but the save that would
+// record it in the ledger never runs, because the function returns before
+// reaching it — so under BOTH orderings the saved ledger fails to reflect
+// reality on the unfixed code, while it always does on the fixed code.
+func TestStripProjectSeedsIsolatesAPerCandidateFailure(t *testing.T) {
+	claudeDir := t.TempDir()
+	proj := t.TempDir()
+
+	// goodagent: a real, healthy, project-scope seed via the ordinary path.
+	if _, err := ReconcileSeeds(claudeDir, []string{proj}, []Artifact{seedArt("goodagent", "project", "body")}, nil); err != nil {
+		t.Fatalf("seed goodagent: %v", err)
+	}
+	goodPath := filepath.Join(proj, ".claude", "agent-memory", "goodagent", "MEMORY.md")
+	if !strings.Contains(readFileT(t, goodPath), "ORBEAT-SEED:BEGIN goodagent") {
+		t.Fatal("precondition: goodagent's block never landed")
+	}
+
+	// badagent: a ledger entry shaped like a real MEMORY.md path, but a
+	// DIRECTORY on disk — reproduces "one unreadable MEMORY.md" (EISDIR)
+	// without needing root-independent permission bits.
+	badPath := filepath.Join(proj, ".claude", "agent-memory", "badagent", "MEMORY.md")
+	must(t, os.MkdirAll(badPath, 0o755))
+	m, err := loadManifest(claudeDir)
+	must(t, err)
+	m.Seeds["badagent"] = []string{badPath}
+	must(t, saveManifest(claudeDir, m, nil))
+
+	if _, err := StripProjectSeeds(claudeDir, proj); err == nil {
+		t.Fatal("a genuinely unreadable candidate must be reported, not silently dropped")
+	}
+
+	m2, err := loadManifest(claudeDir)
+	must(t, err)
+	if _, ok := m2.Seeds["goodagent"]; ok {
+		t.Fatalf("the healthy candidate must be stripped AND saved out of the ledger regardless of which candidate the loop reaches first; ledger=%v", m2.Seeds)
+	}
+	if _, ok := m2.Seeds["badagent"]; !ok {
+		t.Fatalf("the failed candidate must keep its ledger entry so a later run retries it; ledger=%v", m2.Seeds)
+	}
+}
+
 // Regression guard: a legitimate single well-formed block — planted directly
 // rather than via a prior ReconcileSeeds run — must still merge and strip
 // normally; the malformed-marker gate must not false-positive on it.
@@ -1059,5 +1113,81 @@ func TestReconcileSeedsPlanVsApply_ForeignNestedBlockDiverges(t *testing.T) {
 
 	if applyRes.Stripped == planRes.Stripped {
 		t.Fatalf("this fixture is meant to demonstrate a divergence; got the same Stripped=%d on both sides — has the invariant this pins changed?", applyRes.Stripped)
+	}
+}
+
+// A manifest seed entry lying under NEITHER claudeDir NOR any registered
+// project must be left completely alone. This is the shape a tampered
+// ~/.claude/.orbeat-sync-manifest.json produces: the path passes
+// validSeedPath (absolute, and shaped .../agent-memory/<slug>/MEMORY.md) yet
+// names a file the user never asked orbeat-sync to manage.
+//
+// The fixture is built so that a containment root DERIVED from the path (four
+// filepath.Dir calls, which is what the strip pass used to do) lands on base,
+// a directory that exists and that os.OpenRoot therefore accepts. That is the
+// whole defect: a root derived from an untrusted path is by construction an
+// ancestor of it, so rooted.rel can never refuse the operation. The root has
+// to come from the set this run was handed, claudeDir plus the registered
+// projects, and a path under none of them is not orbeat-sync's to touch.
+func TestReconcileSeedsLeavesALedgerPathOutsideEveryTrustedRootAlone(t *testing.T) {
+	base := t.TempDir()
+	cd := filepath.Join(base, "home", ".claude")
+	must(t, os.MkdirAll(cd, 0o755))
+	proj := filepath.Join(base, "registered-project")
+	must(t, os.MkdirAll(proj, 0o755))
+
+	victim := filepath.Join(base, "elsewhere", "agent-memory", "rev", "MEMORY.md")
+	must(t, os.MkdirAll(filepath.Dir(victim), 0o755))
+	content := renderSeedBlock("rev", "governed body") + "\nprecious developer content\n"
+	must(t, os.WriteFile(victim, []byte(content), 0o644))
+	must(t, saveManifest(cd, manifest{Seeds: map[string][]string{"rev": {victim}}}, nil))
+
+	// No artifacts, so every ledger entry is undesired and the strip pass
+	// runs against exactly this path.
+	res, err := ReconcileSeeds(cd, []string{proj}, nil, nil)
+	if err != nil {
+		t.Fatalf("an untrusted ledger entry is a skip, not an abort: %v", err)
+	}
+	if got := readFileT(t, victim); got != content {
+		t.Fatalf("a path under no trusted root must not be touched:\nwant: %q\ngot:  %q", content, got)
+	}
+	if res.Stripped != 0 {
+		t.Fatalf("nothing outside a trusted root may be stripped, got Stripped=%d", res.Stripped)
+	}
+	named := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, victim) {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatalf("the skip must be surfaced and must name the path, got warnings=%v", res.Warnings)
+	}
+}
+
+// The entry the run refused to touch keeps its ledger line. The block may
+// still be on disk and this run did not verify otherwise, so the same
+// preservation rule the rest of ReconcileSeeds applies to a unit it could not
+// complete applies here: over-recording falls out by itself the first run
+// that can see the path, under-recording is permanent.
+func TestReconcileSeedsPreservesTheLedgerEntryItRefusedToTouch(t *testing.T) {
+	base := t.TempDir()
+	cd := filepath.Join(base, "home", ".claude")
+	must(t, os.MkdirAll(cd, 0o755))
+	victim := filepath.Join(base, "elsewhere", "agent-memory", "rev", "MEMORY.md")
+	must(t, os.MkdirAll(filepath.Dir(victim), 0o755))
+	must(t, os.WriteFile(victim, []byte(renderSeedBlock("rev", "governed body")), 0o644))
+	must(t, saveManifest(cd, manifest{Seeds: map[string][]string{"rev": {victim}}}, nil))
+
+	if _, err := ReconcileSeeds(cd, nil, nil, nil); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	m, err := loadManifest(cd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Seeds["rev"]) != 1 || m.Seeds["rev"][0] != victim {
+		t.Fatalf("a skipped entry must stay in the ledger for a run that can see it: ledger=%v", m.Seeds)
 	}
 }

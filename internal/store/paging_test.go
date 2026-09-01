@@ -2,9 +2,199 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
+
+// mcpServerKeysByVersion is a SECOND single-key sort over mcp_server, used
+// only by TestCursorSortMismatchIsRefused below. Production code has no real
+// second sort for any list yet (that is docs/plans/orbeat-admin-search-sort-
+// 2026-08-27.md's Task 2, the sort allowlist), this exists purely to give
+// the hazard test two real, single-key, same-Cast sorts of the same table to
+// mint a cursor under one of and replay against the other, which is exactly
+// the situation Task 2/3 create for real once a list gains more than one
+// sort option. "version" (not "status") because mcp_server.status carries a
+// CHECK constraint (migration 00009, active|disabled) that would reject the
+// deliberately-crafted values this test needs; version is free text.
+var mcpServerKeysByVersion = []sortKey{{Col: "version", Cast: "text"}}
+
+// queryMCPServersSortedBy runs the mcp_server keyset query under an arbitrary
+// single-key sort. Mirrors mcpServerPageSQL + (*Store).queryMCPServers
+// exactly, but takes keys as a parameter instead of hard-coding
+// mcpServerKeys, since this file needs a second sort that production code
+// does not define anywhere.
+func queryMCPServersSortedBy(ctx context.Context, s *Store, tenantID string, keys []sortKey, cursor *ListCursor, limit int) ([]MCPServer, error) {
+	const base = `SELECT ` + mcpServerCols + ` FROM mcp_server WHERE tenant_id = $1`
+	tail, args, err := keysetTail("mcp_server", keys, false, cursor, limit, 1)
+	if err != nil {
+		return nil, err
+	}
+	return s.queryMCPServers(ctx, base+tail, append([]any{tenantID}, args...)...)
+}
+
+// TestCursorSortMismatchIsRefused is the decisive test for this slice: it
+// mints a cursor while sorting mcp_server by name, then replays it while
+// sorting the same table by version, a different single-key sort of the
+// identical shape (one key, Cast "text"). keysetTail's key-count check
+// (paging.go) cannot see anything wrong here: both sorts produce exactly one
+// key. That is precisely the hazard docs/plans/orbeat-admin-search-sort-
+// 2026-08-27.md's "correctness core" section describes.
+//
+// The three rows are seeded so a walk that silently mixes the two sorts is
+// caught two ways at once rather than merely "returning some other valid
+// order":
+//   - row-1 has the smallest NAME (so it is page 1 under the real name sort)
+//     and a VERSION ("zoo-version") that sorts after row-1's own name
+//     ("row-1") lexically, so when its name is misread as a version cursor
+//     value, row-1 satisfies its own "strictly after" predicate and comes
+//     back a SECOND time: a duplicate.
+//   - row-2 has a VERSION ("aardvark-version") that sorts BEFORE "row-1"
+//     lexically, so under the same misread predicate it is excluded
+//     forever: a silent SKIP, even though it was never visited on any page.
+//   - row-3's version ("yak-version") also sorts after "row-1", so it
+//     reappears too, correctly, keeping the example from being "everything
+//     is wrong" and showing the walk is not simply broken across the board.
+//
+// RED-PROOF: this test was written and run BEFORE the fix, to observe the
+// hazard directly rather than assume it, see this task's report for the
+// exact rows/counts that run produced. It is kept, unmodified in its
+// assertions, as the permanent regression test: with the fix in place the
+// mismatched replay must be flatly refused (ErrCursorSortMismatch), and the
+// Fatalf reachable only when it is NOT refused spells out exactly what silent
+// corruption would look like if this regressed.
+func TestCursorSortMismatchIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tn := mustTenant(t, s)
+
+	type seed struct{ name, version string }
+	seeds := []seed{
+		{"row-1", "zoo-version"},      // smallest name -> page 1 under name sort; version sorts after "row-1" -> reappears (DUPLICATE)
+		{"row-2", "aardvark-version"}, // version sorts before "row-1" -> excluded from the mismatched replay (SKIPPED)
+		{"row-3", "yak-version"},      // version sorts after "row-1" -> correctly reappears once
+	}
+	for _, sd := range seeds {
+		if _, err := s.CreateMCPServer(ctx, MCPServer{
+			TenantID: tn.ID, Name: sd.name, Version: sd.version, Status: "active",
+			Transport: "http", EndpointOrCommand: "https://example.invalid/mcp",
+		}); err != nil {
+			t.Fatalf("create %s: %v", sd.name, err)
+		}
+	}
+
+	// Page 1, minted under the REAL "sort mcp_server by name" list.
+	page1, err := s.ListMCPServersPage(ctx, tn.ID, nil, 1, false, "")
+	if err != nil || len(page1) != 1 || page1[0].Name != "row-1" {
+		t.Fatalf("page 1 (by name) = %+v, err=%v; want [row-1]", page1, err)
+	}
+	mintedByName := MCPServerCursor(page1[0], false)
+
+	// Replay that SAME cursor under the DIFFERENT "sort by version" order.
+	replayed, err := queryMCPServersSortedBy(ctx, s, tn.ID, mcpServerKeysByVersion, &mintedByName, 100)
+	if err == nil {
+		names := make([]string, len(replayed))
+		for i, m := range replayed {
+			names[i] = m.Name
+		}
+		t.Fatalf("replaying a name-sorted cursor under a version sort returned %v with NO error. "+
+			"This is the hazard itself: row-1 is duplicated (it is both page 1 and %v), "+
+			"and row-2 never appears on any page. A cursor must carry the sort identity it "+
+			"was minted under and refuse a mismatch instead of silently misreading rows", names, names)
+	}
+	if !errors.Is(err, ErrCursorSortMismatch) {
+		t.Fatalf("replaying under a mismatched sort returned %v, want ErrCursorSortMismatch", err)
+	}
+}
+
+// TestKeysetTailKeyCountCheckIsIndependentOfSortCheck proves the pre-existing
+// key-count check (paging.go:126-ish, unchanged by this task) still fires on
+// its own, even for a cursor whose Sort is EXACTLY right for the list. The
+// sort-identity check added by this task cannot substitute for it: Sort is
+// correct here by construction, so only the key-count check can catch the
+// wrong-length Keys slice below. Without this test, folding both guards into
+// one (e.g. deriving "is this cursor valid" solely from whether Sort
+// matches) would pass every other test in this file yet leave a
+// wrong-length Keys slice free to misalign the positional read in
+// keysetTail's vals/phs construction, silently substituting a stray key
+// value for the real id, or worse.
+//
+// This is a pure unit test: keysetTail is a string-building function with no
+// DB dependency, so there is no need for a real Postgres connection to prove
+// it refuses before ever building a query.
+func TestKeysetTailKeyCountCheckIsIndependentOfSortCheck(t *testing.T) {
+	cursor := &ListCursor{
+		Keys: []string{"role-name-value", "11111111-2222-3333-4444-555555555555"}, // 2 keys; role sorts on exactly 1
+		ID:   "22222222-3333-4444-5555-666666666666",
+		Sort: sortIdentity("role", roleKeys, false), // deliberately CORRECT, to isolate the count check
+	}
+	if _, _, err := keysetTail("role", roleKeys, false, cursor, 10, 1); err == nil {
+		t.Fatal("keysetTail accepted a cursor whose key count does not match roleKeys even though " +
+			"its Sort identity is exactly right; the key-count check must fire independently of the sort check")
+	}
+}
+
+// TestCursorSortMismatchIsRefusedForDirectionChange is
+// TestCursorSortMismatchIsRefused's sibling for the axis Task 3
+// (docs/plans/orbeat-admin-search-sort-2026-08-27.md) adds: ?order. Before
+// this task, every list's direction was hardcoded ascending in the SQL, so a
+// cursor's Sort identity never needed to vary with it. Now that ?order is
+// client-controlled, a cursor minted while walking ascending and replayed
+// while walking descending has the exact right key COUNT, Col and Cast --
+// same list, same single key, same shape, and only the comparison operator
+// keysetTail emits ("<" vs ">") actually differs. Without direction folded
+// into sortIdentity, that mismatch would be invisible to every existing
+// check, and the walk would silently misread rows exactly like the
+// column-mismatch case above.
+//
+// Three assertions, not one: ascending-minted cursor refused under a
+// descending replay, descending-minted cursor refused under an ascending
+// replay (the mismatch is symmetric, not just "ascending is the only
+// trusted direction"), and, the check this test would be incomplete
+// without, a cursor replayed under the SAME direction it was minted under
+// must still be ACCEPTED. A version of this fix that rejected every cursor
+// regardless of direction would pass the first two assertions and break
+// every real paginated walk in this package; only the third assertion catches
+// that.
+func TestCursorSortMismatchIsRefusedForDirectionChange(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tn := mustTenant(t, s)
+
+	for _, n := range []string{"dir-a", "dir-b", "dir-c"} {
+		if _, err := s.CreateRole(ctx, tn.ID, n); err != nil {
+			t.Fatalf("create role %s: %v", n, err)
+		}
+	}
+
+	ascFirst, err := s.ListRolesPage(ctx, tn.ID, nil, 1, false, "")
+	if err != nil || len(ascFirst) != 1 {
+		t.Fatalf("ascending first page: %+v, err=%v", ascFirst, err)
+	}
+	ascCursor := RoleCursor(ascFirst[0], false)
+
+	descFirst, err := s.ListRolesPage(ctx, tn.ID, nil, 1, true, "")
+	if err != nil || len(descFirst) != 1 {
+		t.Fatalf("descending first page: %+v, err=%v", descFirst, err)
+	}
+	descCursor := RoleCursor(descFirst[0], true)
+
+	// Ascending-minted cursor, replayed descending: refused.
+	if _, err := s.ListRolesPage(ctx, tn.ID, &ascCursor, 10, true, ""); !errors.Is(err, ErrCursorSortMismatch) {
+		t.Fatalf("replaying an ascending-minted cursor under desc=true returned %v, want ErrCursorSortMismatch", err)
+	}
+	// Descending-minted cursor, replayed ascending: refused.
+	if _, err := s.ListRolesPage(ctx, tn.ID, &descCursor, 10, false, ""); !errors.Is(err, ErrCursorSortMismatch) {
+		t.Fatalf("replaying a descending-minted cursor under desc=false returned %v, want ErrCursorSortMismatch", err)
+	}
+	// Same direction both times: accepted.
+	if _, err := s.ListRolesPage(ctx, tn.ID, &ascCursor, 10, false, ""); err != nil {
+		t.Fatalf("replaying an ascending-minted cursor under desc=false (matching) returned %v, want nil", err)
+	}
+	if _, err := s.ListRolesPage(ctx, tn.ID, &descCursor, 10, true, ""); err != nil {
+		t.Fatalf("replaying a descending-minted cursor under desc=true (matching) returned %v, want nil", err)
+	}
+}
 
 // TestEntitlementPageNonUniqueSortKey is the decisive test for spec §4.2.
 // entitlement's ORDER BY key is role_id, which is NOT unique (one role has many
@@ -49,7 +239,7 @@ func TestEntitlementPageNonUniqueSortKey(t *testing.T) {
 		if pages > 20 {
 			t.Fatal("pagination did not terminate after 20 pages of limit=1 over 5 rows")
 		}
-		page, err := s.ListEntitlementsPage(ctx, tn.ID, cursor, 1)
+		page, err := s.ListEntitlementsPage(ctx, tn.ID, cursor, 1, false)
 		if err != nil {
 			t.Fatalf("page %d: %v", pages, err)
 		}
@@ -60,13 +250,13 @@ func TestEntitlementPageNonUniqueSortKey(t *testing.T) {
 			seen[e.ID]++
 		}
 		last := page[len(page)-1]
-		c := EntitlementCursor(last)
+		c := EntitlementCursor(last, false)
 		cursor = &c
 	}
 
 	for id := range want {
 		switch seen[id] {
-		case 1: // exactly once — correct
+		case 1: // exactly once, correct
 		case 0:
 			t.Errorf("entitlement %s was SKIPPED across a page boundary", id)
 		default:
@@ -118,7 +308,7 @@ func TestListEntitlementsPageUnboundedReturnsEverything(t *testing.T) {
 		t.Fatalf("seed %d entitlements: %v", n, err)
 	}
 
-	all, err := s.ListEntitlementsPage(ctx, tn.ID, nil, 0)
+	all, err := s.ListEntitlementsPage(ctx, tn.ID, nil, 0, false)
 	if err != nil {
 		t.Fatalf("ListEntitlementsPage(nil, 0): %v", err)
 	}
@@ -145,7 +335,7 @@ func TestConcurrentInsertDuringPagination(t *testing.T) {
 		}
 	}
 
-	first, err := s.ListMCPServersPage(ctx, tn.ID, nil, 1)
+	first, err := s.ListMCPServersPage(ctx, tn.ID, nil, 1, false, "")
 	if err != nil || len(first) != 1 || first[0].Name != "srv-a" {
 		t.Fatalf("first page = %+v, err=%v; want [srv-a]", first, err)
 	}
@@ -160,8 +350,8 @@ func TestConcurrentInsertDuringPagination(t *testing.T) {
 		}
 	}
 
-	c := MCPServerCursor(first[0])
-	rest, err := s.ListMCPServersPage(ctx, tn.ID, &c, 100)
+	c := MCPServerCursor(first[0], false)
+	rest, err := s.ListMCPServersPage(ctx, tn.ID, &c, 100, false, "")
 	if err != nil {
 		t.Fatalf("second page: %v", err)
 	}
@@ -202,7 +392,7 @@ func TestRolePageWalk(t *testing.T) {
 		if pages > 20 {
 			t.Fatal("pagination did not terminate after 20 pages of limit=2 over 4 roles")
 		}
-		page, err := s.ListRolesPage(ctx, tn.ID, cursor, 2)
+		page, err := s.ListRolesPage(ctx, tn.ID, cursor, 2, false, "")
 		if err != nil {
 			t.Fatalf("page %d: %v", pages, err)
 		}
@@ -212,7 +402,7 @@ func TestRolePageWalk(t *testing.T) {
 		for _, r := range page {
 			got = append(got, r.Name)
 		}
-		c := RoleCursor(page[len(page)-1])
+		c := RoleCursor(page[len(page)-1], false)
 		cursor = &c
 	}
 
@@ -248,7 +438,7 @@ func TestArtifactPageStateFilterAcrossBoundary(t *testing.T) {
 		}
 		// Every other artifact goes pending.
 		if n == "a2" || n == "a4" || n == "a6" {
-			if _, err := s.SetArtifactSubmitted(ctx, tn.ID, a.ID, "submitter@example.com", []byte("[]")); err != nil {
+			if _, err := s.SetArtifactSubmitted(ctx, tn.ID, a.ID, "submitter@example.com", []byte("[]"), ""); err != nil {
 				t.Fatalf("submit %s: %v", n, err)
 			}
 		}
@@ -267,7 +457,7 @@ func TestArtifactPageStateFilterAcrossBoundary(t *testing.T) {
 		}
 	}
 
-	c := ArtifactCursor(page[len(page)-1])
+	c := ArtifactCursor(page[len(page)-1], false)
 	rest, err := s.ListArtifactsPage(ctx, tn.ID, ArtifactPageOpts{State: "pending", Cursor: &c, Limit: 100})
 	if err != nil {
 		t.Fatalf("second page: %v", err)
@@ -293,7 +483,7 @@ func TestArtifactPageSlimOmitsHeavyFieldsButKeepsApprovedFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.SetArtifactSubmitted(ctx, tn.ID, a.ID, "submitter@example.com", []byte("[]")); err != nil {
+	if _, err := s.SetArtifactSubmitted(ctx, tn.ID, a.ID, "submitter@example.com", []byte("[]"), ""); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	if _, _, err := s.SetArtifactApproved(ctx, tn.ID, a.ID, "approver@example.com", 0); err != nil {
@@ -385,7 +575,7 @@ func TestArtifactEntitlementPageNonUniqueSortKey(t *testing.T) {
 		if pages > 20 {
 			t.Fatal("pagination did not terminate after 20 pages of limit=1 over 4 rows")
 		}
-		page, err := s.ListArtifactEntitlementsPage(ctx, tn.ID, cursor, 1)
+		page, err := s.ListArtifactEntitlementsPage(ctx, tn.ID, cursor, 1, false)
 		if err != nil {
 			t.Fatalf("page %d: %v", pages, err)
 		}
@@ -395,7 +585,7 @@ func TestArtifactEntitlementPageNonUniqueSortKey(t *testing.T) {
 		for _, e := range page {
 			seen[e.ID]++
 		}
-		c := ArtifactEntitlementCursor(page[len(page)-1])
+		c := ArtifactEntitlementCursor(page[len(page)-1], false)
 		cursor = &c
 	}
 	for id := range want {
@@ -438,7 +628,7 @@ func TestListArtifactEntitlementsPageUnboundedReturnsEverything(t *testing.T) {
 		t.Fatalf("seed %d artifact entitlements: %v", n, err)
 	}
 
-	all, err := s.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0)
+	all, err := s.ListArtifactEntitlementsPage(ctx, tn.ID, nil, 0, false)
 	if err != nil {
 		t.Fatalf("ListArtifactEntitlementsPage(nil, 0): %v", err)
 	}
@@ -493,3 +683,126 @@ func TestListMCPServersByTenantUnboundedReturnsEverything(t *testing.T) {
 // and TestListArtifactRevisionsStillReturnsEverything moved to
 // paging_revisions.ee_test.go: revision pagination is Enterprise-only
 // (docs/specs/2026-08-19-orbeat-community-repo-generation-design.md §4).
+
+// TestArtifactSlimProjectionCarriesRealApprovedIdentity pins the VALUE of the
+// three approved identity columns in the slim list projection, following
+// TestArtifactSlimProjectionCarriesRealRowVersion's precedent: the parity
+// coverage above pins only that artifactSlimCols has the same column COUNT as
+// artifactCols, so replacing any of them with a same-shaped constant
+// (`'skill' AS approved_type`) satisfies a count check and slips through.
+//
+// The fixture renames and re-channels the artifact AFTER approval on purpose.
+// Without that step the live and approved identities are equal, and every
+// wrong projection (a constant, the live column, the wrong column) agrees
+// with the right one.
+func TestArtifactSlimProjectionCarriesRealApprovedIdentity(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tn := mustTenant(t, s)
+
+	a, err := s.CreateArtifact(ctx, Artifact{
+		TenantID: tn.ID, Type: "skill", Name: "slim-ident-old",
+		Content: "---\nname: slim-ident-old\ndescription: d\n---\nbody\n", Visibility: "role",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	approved, _, err := s.SetArtifactApproved(ctx, tn.ID, a.ID, "approver@example.com", 0)
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	approved.Name = "slim-ident-new"
+	approved.Visibility = "org"
+	edited, err := s.UpdateArtifact(ctx, approved, approved.RowVersion)
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if edited.Name == edited.ApprovedName || edited.Visibility == edited.ApprovedVisibility {
+		t.Fatalf("the fixture did not pull the live identity off the approved one "+
+			"(name %q/%q, visibility %q/%q); it cannot tell a right projection from a wrong one",
+			edited.Name, edited.ApprovedName, edited.Visibility, edited.ApprovedVisibility)
+	}
+
+	slim, err := s.ListArtifactsPage(ctx, tn.ID, ArtifactPageOpts{Limit: 100})
+	if err != nil || len(slim) != 1 {
+		t.Fatalf("slim list = %d rows, err=%v; want 1", len(slim), err)
+	}
+	got := slim[0]
+	if got.ApprovedName != "slim-ident-old" || got.ApprovedVisibility != "role" || got.ApprovedType != "skill" {
+		t.Fatalf("slim row approved identity = %q/%q/%q, want skill/slim-ident-old/role; "+
+			"the list row's pending-identity badge reads these without ?include=content",
+			got.ApprovedType, got.ApprovedName, got.ApprovedVisibility)
+	}
+	if got.Name != "slim-ident-new" || got.Visibility != "org" {
+		t.Fatalf("slim row live identity = %q/%q, want slim-ident-new/org", got.Name, got.Visibility)
+	}
+}
+
+// ---- Task 4: likeSearchArg / escapeLikeSpecials, pure unit tests ----
+
+// TestLikeSearchArgEmptyIsNoFilter pins likeSearchArg's zero case: an empty
+// search term must produce a nil bind value, not an empty-but-present
+// pattern like "%%" that would happen to also match everything but via a
+// different mechanism than "no filter": the two must be the SAME code path
+// (the doc comment's whole point), which this test can only fail to prove if
+// it checks the exact typed nil rather than merely "falsy".
+func TestLikeSearchArgEmptyIsNoFilter(t *testing.T) {
+	if got := likeSearchArg(""); got != nil {
+		t.Fatalf("likeSearchArg(\"\") = %#v, want nil (an empty ?q= must mean no filter)", got)
+	}
+}
+
+// TestLikeSearchArgWrapsWithWildcards pins the substring-match shape: a
+// non-empty term is wrapped in a literal '%' on each side so the ILIKE
+// predicate matches anywhere in the column, not just a prefix or an exact
+// value.
+func TestLikeSearchArgWrapsWithWildcards(t *testing.T) {
+	got, ok := likeSearchArg("abc").(string)
+	if !ok {
+		t.Fatalf("likeSearchArg(\"abc\") = %#v, want a string", got)
+	}
+	if got != "%abc%" {
+		t.Fatalf("likeSearchArg(\"abc\") = %q, want %q", got, "%abc%")
+	}
+}
+
+// TestEscapeLikeSpecials is the wildcard-escaping mutant's own pin, at the
+// pure-function level (search_test.go's TestListRolesSearchEscapesWildcards
+// is the HTTP-level proof that this actually reaches the query): a literal
+// '%' or '_' in a search term must survive as a LITERAL character in the
+// rendered pattern, escaped with a backslash, rather than acting as a
+// LIKE/ILIKE wildcard. The backslash-first case is the one a naive
+// "escape %, then _, then \" ordering gets wrong: escaping '\' AFTER '%'/'_'
+// would re-escape the backslashes those two escapes just introduced,
+// producing a broken pattern instead of a stricter one.
+func TestEscapeLikeSpecials(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"plain", "plain"},
+		{"foo_bar", `foo\_bar`},
+		{"100%off", `100\%off`},
+		{"both_%mixed", `both\_\%mixed`},
+		{`back\slash`, `back\\slash`},
+	}
+	for _, tc := range cases {
+		if got := escapeLikeSpecials(tc.in); got != tc.want {
+			t.Errorf("escapeLikeSpecials(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestLikeSearchArgEscapesBeforeWrapping composes the two functions the way
+// every page-SQL builder actually calls them: likeSearchArg must escape
+// FIRST and wrap in wildcards SECOND, never the reverse: wrapping first
+// would leave the two literal '%' delimiters this function adds
+// indistinguishable from a '%' the user typed, and escaping them along with
+// the user's own would break the substring match entirely.
+func TestLikeSearchArgEscapesBeforeWrapping(t *testing.T) {
+	got, ok := likeSearchArg("foo_bar").(string)
+	if !ok {
+		t.Fatalf("likeSearchArg(\"foo_bar\") = %#v, want a string", got)
+	}
+	want := `%foo\_bar%`
+	if got != want {
+		t.Fatalf("likeSearchArg(\"foo_bar\") = %q, want %q", got, want)
+	}
+}

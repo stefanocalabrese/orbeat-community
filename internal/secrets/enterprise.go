@@ -9,8 +9,14 @@ package secrets
 // The `community` build tag exists ONLY so this repo's own (Enterprise)
 // build — which still contains both this file and enterprise.ee.go — does
 // not fail on duplicate declarations; a generated Community tree, having no
-// .ee.go file left to collide with, compiles this unconditionally, tag
-// included. See internal/api/routes_enterprise.community.go for the
+// .ee.go file left to collide with, compiles this unconditionally — but NOT
+// "tag included", which is what this said until audit finding C7.
+// communitygen's stripCommunityBuildTag REMOVES the constraint on the way
+// out, and must: left in place, nothing ever sets `community`, so the file is
+// excluded from a plain `go build` and the symbol is undefined. A reader who
+// believed the old wording would conclude the strip is redundant and delete
+// it, publishing a public tree that does not compile.
+// See internal/api/routes_enterprise.community.go for the
 // toolchain-level proof this file plays no part in a normal `go build`
 // (TestCommunityRouteFileExcludedFromEnterpriseBuild) — the same mechanism
 // applies here.

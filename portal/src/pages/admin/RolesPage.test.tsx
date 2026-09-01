@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
@@ -81,7 +81,11 @@ test("create submits and clears the input", async () => {
   await user.type(input, "new-role");
   await user.click(screen.getByRole("button", { name: /create/i }));
 
-  await screen.findByDisplayValue("");
+  // Not findByDisplayValue(""): Task 5's search box (aria-label "Search
+  // roles") is also an empty-valued input on this page now, which would make
+  // that query ambiguous. Waiting on the SAME input handle scopes this to
+  // the field the create form actually clears.
+  await waitFor(() => expect(input).toHaveValue(""));
   const post = fetchSpy.mock.calls.find(([, init]) => init?.method === "POST");
   expect(post, "a POST should have been sent").toBeDefined();
   expect(String(post![0])).toMatch(/roles/); // hit the roles endpoint, not some other
@@ -139,9 +143,27 @@ test("delete: confirming issues DELETE for the confirmed role's id, exactly once
 
   await user.click(screen.getByRole("button", { name: "Delete contractors" }));
 
-  expect(confirmSpy).toHaveBeenCalledWith(
-    'Delete role "contractors"? This also revokes every MCP server and artifact entitlement granted to it.',
+  // The exact string, because the thing being gated is a CLAIM and not a
+  // behaviour. Until A10 (2026-08-30) this copy said the delete "also revokes
+  // every MCP server and artifact entitlement granted to it", which reads as
+  // the complete list of consequences and is not: the cascade also destroys
+  // every virtual key bound to the role, its quota and its metering history,
+  // and the virtual keys are the ones nothing can recover (see
+  // store.RevokedGrants). A confirm dialog is the last thing an admin reads
+  // before an irreversible action, so an assertion loose enough to survive a
+  // rewrite back to the two-child sentence would gate nothing.
+  const confirmText = confirmSpy.mock.calls[0]![0] as string;
+  expect(confirmText).toBe(
+    'Delete role "contractors"? The cascade destroys more than entitlements: every MCP server and ' +
+      "artifact entitlement granted to it, every virtual key bound to it, its quota and its usage " +
+      "history. This page reports only the two entitlement counts; the role.delete audit event lists " +
+      "all five, including the client_id of each Keycloak client this orphans.",
   );
+  // Named separately from the equality above so a future rewording that drops
+  // one of them fails on the term it dropped rather than on a wall of text.
+  for (const owed of ["virtual key", "quota", "usage history", "audit event"]) {
+    expect(confirmText).toContain(owed);
+  }
   // Exactly once: v1.23.0 found a Reload button defaulting to type="submit"
   // and resubmitting a stale PUT, caught ONLY by asserting call count rather
   // than merely "was called". toHaveLength pins the count, not just presence.

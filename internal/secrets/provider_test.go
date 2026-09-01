@@ -7,9 +7,9 @@ import (
 )
 
 func TestResolverDispatchesByScheme(t *testing.T) {
-	t.Setenv("ORBEAT_TEST_SECRET", "via-env")
+	t.Setenv("ORBEAT_UPSTREAM_TEST_SECRET", "via-env")
 	r := NewResolver()
-	got, err := r.Resolve(context.Background(), "env:ORBEAT_TEST_SECRET")
+	got, err := r.Resolve(context.Background(), "env:ORBEAT_UPSTREAM_TEST_SECRET")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}

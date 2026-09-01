@@ -50,6 +50,49 @@ async function gotoAdmin(page: Page, section: string) {
   await page.getByRole("link", { name: section }).click();
 }
 
+// The admin Artifacts list is one shared, size-capped (default 100 rows) list
+// for the whole e2e run, ordered (type, name). A row this test just created
+// can land beyond page 1 whenever enough same-or-earlier-sorting artifacts
+// exist concurrently, reproduced live: seeding 105 same-type rows ahead of
+// it in sort order made an equivalent getByText check fail, on an otherwise
+// unmodified test. "Load more" only renders while more pages exist
+// (ArtifactsPage.tsx's `hasNextPage`), so walking it is bounded by the list's
+// own exhaustion rather than by a clock, and the growth check after each
+// click is the same `expect.poll`-on-a-real-count technique
+// pagination.spec.ts already uses for this class of problem. This proves the
+// row exists anywhere the server actually reports it, instead of assuming it
+// landed on page 1.
+//
+// The row locator is scoped to a table CELL (`getByRole("cell", {name,
+// exact: true})`), not the original bare `getByText(name)`. Reproduced live:
+// a freshly created artifact's own content embeds `name: <name>` in its YAML
+// frontmatter (artifactContent below), and the CREATE FORM renders that
+// content into a `<textarea>` that briefly still carries it as a real DOM
+// text node while the form is closing after submit (confirmed with a
+// MutationObserver), long enough for a bare getByText(name) to match the
+// STILL-OPEN FORM instead of the table, passing even when the row never made
+// it onto any loaded page. A `cell` role never matches a `<textarea>`.
+async function expectArtifactRowVisible(page: Page, name: string, message: string): Promise<void> {
+  const row = page.getByRole("cell", { name, exact: true });
+  const loadMore = page.getByRole("button", { name: "Load more", exact: true });
+  // A bounded wait for the row on the CURRENTLY loaded page(s), long enough
+  // for the create mutation + form-close + table refetch to settle (the same
+  // thing the original single toBeVisible waited on), not a blind
+  // isVisible() snapshot, which would race the form still closing.
+  const appearedSoFar = () =>
+    row
+      .waitFor({ state: "visible", timeout: 2_000 })
+      .then(() => true)
+      .catch(() => false);
+  for (let i = 0; i < 50 && !(await appearedSoFar()); i++) {
+    if (!(await loadMore.isVisible().catch(() => false))) break;
+    const before = await page.locator("tbody tr").count();
+    await loadMore.click();
+    await expect.poll(() => page.locator("tbody tr").count(), { timeout: 15_000 }).toBeGreaterThan(before);
+  }
+  await expect(row, message).toBeVisible({ timeout: 5_000 });
+}
+
 // skill/subagent content must be valid YAML frontmatter (name + description);
 // a rule's content is plain markdown delivered verbatim into AGENTS.md.
 function artifactContent(type: string, name: string): string {
@@ -86,10 +129,11 @@ test("every artifact type × visibility combo the form offers is accepted by the
       await form.getByLabel("Visibility").selectOption(visibility);
       await page.getByRole("button", { name: /^create$/i }).click();
 
-      await expect(
-        page.getByText(name).first(),
+      await expectArtifactRowVisible(
+        page,
+        name,
         `the API rejected type="${type}" visibility="${visibility}", which the Artifacts form offers`,
-      ).toBeVisible({ timeout: 15_000 });
+      );
     }
   }
 });

@@ -15,6 +15,23 @@ COMPOSE="docker compose -f deploy/docker-compose.yml"
 # gate.
 export ORBEAT_ARTIFACT_REVISION_KEEP=3
 
+# Artifact deployment registry (docs/specs/2026-08-22-orbeat-artifact-
+# deployment-registry-design.md, gates G1-G4). Exported BEFORE the stack comes
+# up so it flows through the compose file's ${ORBEAT_DEPLOYMENT_REGISTRY:-}
+# passthrough into cmd/api, exactly like the revision cap above. `make up` and
+# the Playwright e2e job share that compose file WITHOUT this export, so they
+# keep the shipped default: off, no report route, nothing collected.
+#
+# It is on HERE and only here because this script is the only place a client
+# report can be observed end to end. Everything else stops at a boundary the
+# defect can hide behind: the API tests never build the applied set, the
+# syncclient tests never cross the wire, and a runbook that has not been run
+# catches nothing (v1.14.0 shipped a dead feature green behind three such
+# controls). The negotiation path this run therefore no longer exercises (the
+# client asking a server that answers false and sending nothing) is covered in
+# Go by internal/api's off-by-default gate and cmd/orbeat-sync's report tests.
+export ORBEAT_DEPLOYMENT_REGISTRY=true
+
 cleanup() {
   rc=$?
   # Dump container logs BEFORE tearing down — otherwise a failure (especially in
@@ -26,12 +43,16 @@ cleanup() {
   [ -n "${MP_TMP:-}" ] && rm -rf "$MP_TMP"
   [ -n "${SYNC_HOME:-}" ] && rm -rf "$SYNC_HOME"
   [ -n "${SYNC_PROJ:-}" ] && rm -rf "$SYNC_PROJ"
+  [ -n "${SYNC_PROJ_UNTAGGED:-}" ] && rm -rf "$SYNC_PROJ_UNTAGGED"
   [ -n "${SYNC_BIN:-}" ] && rm -rf "$SYNC_BIN"
   [ -n "${SYNC_BAD:-}" ] && rm -rf "$SYNC_BAD"
   [ -n "${SYNC_FATAL_A:-}" ] && rm -rf "$SYNC_FATAL_A"
   [ -n "${SYNC_FATAL_B:-}" ] && rm -rf "$SYNC_FATAL_B"
   [ -n "${SYNC_FRESH_A:-}" ] && rm -rf "$SYNC_FRESH_A"
   [ -n "${SYNC_FRESH_B:-}" ] && rm -rf "$SYNC_FRESH_B"
+  [ -n "${SYNC_G2:-}" ] && rm -rf "$SYNC_G2"
+  [ -n "${SYNC_G2_PROJ:-}" ] && rm -rf "$SYNC_G2_PROJ"
+  [ -n "${SYNC_PIN:-}" ] && rm -rf "$SYNC_PIN"
   # Must stay LAST in cleanup(): its trailing `|| true` is what stops a failing
   # guard above from overriding the script's real exit status under errexit.
   # Appending below it turns a GREEN run red whenever the appended guard's
@@ -67,6 +88,49 @@ current_row_version() {
   echo "$rv"
 }
 
+# deployments_json <token> <artifact-id>: the aggregate deployment body for one
+# artifact (GET /v1/admin/artifacts/{id}/deployments), guarded so a 401, a 404 or
+# an unregistered route fails HERE with the body printed, rather than feeding
+# `null` into a jq comparison twenty lines later that then reads as a registry
+# bug. jq is used unqualified, as it already is throughout the sync gates below.
+#
+# The guard checks a field every response carries, not `.installs != null`: the
+# interesting answers are zeroes, and a check that a zero satisfies is a check
+# that an absent body also satisfies.
+deployments_json() {
+  local tok="$1" aid="$2" body
+  body=$(curl -s -H "Authorization: Bearer $tok" "http://localhost:8080/v1/admin/artifacts/$aid/deployments")
+  echo "$body" | jq -e 'has("installs") and has("latestRevision") and has("byRevision") and has("observable")' >/dev/null \
+    || { echo "FAIL: no deployment aggregate for $aid: $body" >&2; exit 1; }
+  echo "$body"
+}
+
+# latest_revision_num <token> <artifact-id>: MAX(revision) as the artifact's own
+# revision history reports it (GET /v1/admin/artifacts/{id}/revisions).
+#
+# EVERY REVISION ASSERTION IN THIS FILE IS DERIVED THROUGH HERE, NEVER WRITTEN AS
+# A LITERAL. What that buys, precisely: the expected number changes when the
+# artifact's history changes, so a registry storing a constant fails the moment
+# the fixture approves anything, and the assertion cannot be quietly "fixed" by
+# editing a number to match what the code did.
+#
+# What it does NOT buy, measured rather than assumed: it does not catch a server
+# that stores MAX(revision_num) instead of the value it was sent. The client is
+# only ever SERVED MAX, so the two agree on every report a real binary can
+# produce. That mutant was run through this whole script and passed. G1b exists
+# for it, and needs a caller the real client cannot be.
+#
+# `max` over the list rather than the first element: the ordering is the
+# endpoint's business, and this gate must not silently start measuring something
+# else the day it changes.
+latest_revision_num() {
+  local tok="$1" aid="$2" body n
+  body=$(curl -s -H "Authorization: Bearer $tok" "http://localhost:8080/v1/admin/artifacts/$aid/revisions")
+  n=$(echo "$body" | jq -r '[.revisions[].revision] | max')
+  [ -n "$n" ] && [ "$n" != "null" ] || { echo "FAIL: could not resolve a revision number for $aid: $body" >&2; exit 1; }
+  echo "$n"
+}
+
 # ── Marketplace artifact validation (Phase 2-a) ────────────────────────────────
 echo "==> validating the generated Claude Code marketplace"
 MP_TMP=$(mktemp -d)
@@ -88,6 +152,15 @@ rm -rf "$MP_TMP"
 echo "    marketplace OK: name=orbeat, plugin source + mcp url correct"
 
 echo "==> bringing stack up"
+# down -v FIRST, unconditionally. This script's fixtures are not idempotent
+# against a populated database: the very first admin create asserts 201, and a
+# leftover smoke-github row makes it a 409 on the slug-collision check added in
+# v1.17.0. Measured 2026-08-23: a `git push` killed mid-hook left a stack
+# running, and the next push's smoke job failed on exactly that 409, a red that
+# described nothing about the code. The converse is worse and untested, since a
+# stale row could equally let an assertion pass that should have failed.
+# Costs nothing on a clean host or in CI, where there is no stack to remove.
+$COMPOSE down -v >/dev/null 2>&1 || true
 $COMPOSE up --build -d
 
 echo "==> waiting for api health"
@@ -221,7 +294,7 @@ get_token() { # $1=username $2=password -> echoes access_token
 # The window: a 5-minute expiry, minus Token.Valid()'s 60s skew
 # (internal/syncclient/token.go:22-28), means loadValidToken starts failing around
 # T+4min. Keycloak's own 5-minute default caps the real JWT independently. Either
-# failure returns before the render block (cmd/sync/main.go:249-252), so the run
+# failure returns before the render block (cmd/orbeat-sync/main.go:249-252), so the run
 # exits 1 with NO JSON — which would mask a scenario expecting exit 2 as an
 # unexplainable red.
 seed_sync_token() {
@@ -735,6 +808,66 @@ rule_approve_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
 [ "$rule_approve_status" = "200" ] || { echo "FAIL: approve smoke-rule (boss2) status $rule_approve_status"; exit 1; }
 echo "    smoke-rule approved (boss2) => 200"
 
+# ── Org-visibility rule gate ───────────────────────────────────────────────────
+# A rule is the one artifact type with no Channel 1: marketplace.RenderArtifactsPlugin
+# has no `rule` case. So before ListActiveOrgRules an org-visibility rule was dropped
+# by Channel 1 and excluded from Channel 2 for being org visibility, and reached
+# NOBODY, starting from the default value of `visibility`. This block creates one with
+# NO entitlement at all: alice can only receive it if org rules are universal.
+echo "==> admin creates an ORG-visibility rule (no entitlement, reaches everyone or nobody)"
+org_rule_resp=$(curl -s -w '\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"type":"rule","name":"smoke-org-rule","description":"d","content":"Everyone follows this. ORG-RULE-BODY-EVERYONE","visibility":"org"}' \
+  http://localhost:8080/v1/admin/artifacts)
+org_rule_status=$(printf '%s' "$org_rule_resp" | tail -n1)
+org_rule_body=$(printf '%s' "$org_rule_resp" | sed '$d')
+[ "$org_rule_status" = "201" ] || { echo "FAIL: create org rule $org_rule_status: $org_rule_body"; exit 1; }
+if command -v jq >/dev/null 2>&1; then
+  ORG_RULE_ID=$(echo "$org_rule_body" | jq -r '.id')
+else
+  ORG_RULE_ID=$(echo "$org_rule_body" | grep -o '"id":"[^"]*"' | head -n1 | sed 's/"id":"//;s/"//')
+fi
+[ -n "$ORG_RULE_ID" ] || { echo "FAIL: could not resolve org rule id: $org_rule_body"; exit 1; }
+org_rule_submit_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "http://localhost:8080/v1/admin/artifacts/$ORG_RULE_ID/submit")
+[ "$org_rule_submit_status" = "200" ] || { echo "FAIL: submit smoke-org-rule status $org_rule_submit_status"; exit 1; }
+ORG_RULE_RV=$(current_row_version "$ADMIN_TOKEN" "$ORG_RULE_ID")
+org_rule_approve_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $BOSS2_TOKEN" -H "If-Match: \"$ORG_RULE_RV\"" \
+  "http://localhost:8080/v1/admin/artifacts/$ORG_RULE_ID/approve")
+[ "$org_rule_approve_status" = "200" ] || { echo "FAIL: approve smoke-org-rule (boss2) status $org_rule_approve_status"; exit 1; }
+echo "    smoke-org-rule created, submitted, approved, and entitled to NOBODY"
+
+# The control for the assertion further down. smoke-skill (created ~line 479) is
+# never submitted, so asserting IT is absent from sync proves nothing: approval
+# gating already excludes it. This one is approved, so its absence from Channel 2
+# can only be the visibility rule doing its job.
+echo "==> admin creates and approves an ORG-visibility SKILL (must stay on Channel 1 only)"
+org_skill_resp=$(curl -s -w '\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"type":"skill","name":"smoke-org-skill","description":"d","content":"---\nname: smoke-org-skill\ndescription: d\n---\nORG-SKILL-BODY-CHANNEL1","visibility":"org"}' \
+  http://localhost:8080/v1/admin/artifacts)
+org_skill_status=$(printf '%s' "$org_skill_resp" | tail -n1)
+org_skill_body=$(printf '%s' "$org_skill_resp" | sed '$d')
+[ "$org_skill_status" = "201" ] || { echo "FAIL: create org skill $org_skill_status: $org_skill_body"; exit 1; }
+if command -v jq >/dev/null 2>&1; then
+  ORG_SKILL_ID=$(echo "$org_skill_body" | jq -r '.id')
+else
+  ORG_SKILL_ID=$(echo "$org_skill_body" | grep -o '"id":"[^"]*"' | head -n1 | sed 's/"id":"//;s/"//')
+fi
+[ -n "$ORG_SKILL_ID" ] || { echo "FAIL: could not resolve org skill id: $org_skill_body"; exit 1; }
+org_skill_submit_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "http://localhost:8080/v1/admin/artifacts/$ORG_SKILL_ID/submit")
+[ "$org_skill_submit_status" = "200" ] || { echo "FAIL: submit smoke-org-skill status $org_skill_submit_status"; exit 1; }
+ORG_SKILL_RV=$(current_row_version "$ADMIN_TOKEN" "$ORG_SKILL_ID")
+org_skill_approve_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $BOSS2_TOKEN" -H "If-Match: \"$ORG_SKILL_RV\"" \
+  "http://localhost:8080/v1/admin/artifacts/$ORG_SKILL_ID/approve")
+[ "$org_skill_approve_status" = "200" ] || { echo "FAIL: approve smoke-org-skill (boss2) status $org_skill_approve_status"; exit 1; }
+echo "    smoke-org-skill approved (Channel 1 only)"
+
 # Re-fetch alice's access token before the sync-consumption section. The token
 # grabbed at the top of this run (~450 lines / several minutes ago) can outlive
 # Keycloak's ~5-min access-token lifetime on a slow runner. Every assertion below
@@ -756,6 +889,21 @@ echo "$sync_rule_body" | grep -q '"type":"rule"' || { echo "FAIL: smoke-rule not
 echo "$sync_rule_body" | grep -q 'RULE-BODY-NO-SECRETS' || { echo "FAIL: rule verbatim content missing from sync: $sync_rule_body"; exit 1; }
 echo "    smoke-rule present in sync post-approval (type:rule, verbatim content)"
 
+# The decisive one: alice holds no grant on this artifact, so it can only be here
+# because org rules are universal on this channel.
+echo "$sync_rule_body" | grep -q '"name":"smoke-org-rule"' \
+  || { echo "FAIL: approved ORG-visibility rule missing from sync (it reaches nobody): $sync_rule_body"; exit 1; }
+echo "$sync_rule_body" | grep -q 'ORG-RULE-BODY-EVERYONE' \
+  || { echo "FAIL: org rule verbatim content missing from sync: $sync_rule_body"; exit 1; }
+# An APPROVED org skill must still NOT be here: it has a Channel 1, and duplicating
+# it would install it twice. This is what stops the fix from becoming "org
+# everything", and it is keyed on smoke-org-skill rather than smoke-skill because
+# smoke-skill is never submitted, so its absence would prove only that approval
+# gating works.
+echo "$sync_rule_body" | grep -q '"name":"smoke-org-skill"' \
+  && { echo "FAIL: an approved org-visibility SKILL leaked onto Channel 2: $sync_rule_body"; exit 1; }
+echo "    smoke-org-rule present for an unentitled user, and no org skill leaked"
+
 # ── orbeat-sync BINARY gate: the API→client seam (the v1.14.0 hole) ────────────
 #
 # Everything above stops at the API: it proves the server SERVES the artifacts.
@@ -772,7 +920,7 @@ echo "==> orbeat-sync binary gate: the real client consumes what the API just se
 # Build into a throwaway dir (registered in the cleanup trap), not the
 # developer's ./bin — a smoke run shouldn't leave a stray binary behind.
 SYNC_BIN=$(mktemp -d)
-go build -o "$SYNC_BIN/orbeat-sync" ./cmd/sync
+go build -o "$SYNC_BIN/orbeat-sync" ./cmd/orbeat-sync
 SYNC_HOME=$(mktemp -d)
 SYNC_PROJ=$(mktemp -d)
 mkdir -p "$SYNC_HOME/.claude" "$SYNC_HOME/.config/orbeat"
@@ -799,6 +947,8 @@ grep -q 'RULE-BODY-NO-SECRETS' "$SYNC_PROJ/AGENTS.md" \
   || { echo "FAIL: rule content missing from $SYNC_PROJ/AGENTS.md"; exit 1; }
 grep -q 'Pre-existing dev content' "$SYNC_PROJ/AGENTS.md" \
   || { echo "FAIL: the dev's own AGENTS.md content was clobbered"; exit 1; }
+grep -q 'ORG-RULE-BODY-EVERYONE' "$SYNC_PROJ/AGENTS.md" \
+  || { echo "FAIL: the org-visibility rule never reached $SYNC_PROJ/AGENTS.md via the real binary"; exit 1; }
 grep -q '@AGENTS.md' "$SYNC_PROJ/CLAUDE.md" \
   || { echo "FAIL: no @AGENTS.md import in $SYNC_PROJ/CLAUDE.md"; exit 1; }
 echo "    rule distributed to AGENTS.md + CLAUDE.md import; dev content preserved"
@@ -809,6 +959,248 @@ echo "    rule distributed to AGENTS.md + CLAUDE.md import; dev content preserve
 test -f "$SYNC_HOME/.claude/agents/smoke-gov.md" \
   || { echo "FAIL: subagent smoke-gov.md not written — a rule-entitled sync must still deliver file-backed artifacts (this is the v1.14.0 defect)"; exit 1; }
 echo "    file-backed subagent delivered alongside the rule (the v1.14.0 regression)"
+
+# ── Per-rule project targeting gate (migration 00024) ─────────────────────────
+#
+# A rule can name the PROJECT TAGS it applies to; the tags themselves are local,
+# declared by the developer. The decisive shape is two projects that differ ONLY
+# in their tags, plus an untargeted rule as the control: without that control, a
+# missing rule in the untagged project would equally prove the project is simply
+# not being managed, which is the assertion-that-cannot-fail this repo keeps
+# rediscovering.
+echo "==> tagging the existing project [go] and registering a second, untagged one"
+HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" project add "$SYNC_PROJ" --tag go >/dev/null \
+  || { echo "FAIL: project add --tag go"; exit 1; }
+SYNC_PROJ_UNTAGGED=$(mktemp -d)
+HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" project add "$SYNC_PROJ_UNTAGGED" >/dev/null \
+  || { echo "FAIL: registering the untagged project"; exit 1; }
+HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" project list | grep -q "$SYNC_PROJ \[go\]" \
+  || { echo "FAIL: project list does not show the tag: $(HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" project list)"; exit 1; }
+
+echo "==> admin creates a rule targeted at [go], entitled to orbeat-user"
+tgt_resp=$(curl -s -w '\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"type":"rule","name":"smoke-targeted-rule","description":"d","content":"Go projects only. TARGETED-RULE-BODY","visibility":"role","targetTags":["go"]}' \
+  http://localhost:8080/v1/admin/artifacts)
+tgt_status=$(printf '%s' "$tgt_resp" | tail -n1)
+tgt_body=$(printf '%s' "$tgt_resp" | sed '$d')
+[ "$tgt_status" = "201" ] || { echo "FAIL: create targeted rule $tgt_status: $tgt_body"; exit 1; }
+if command -v jq >/dev/null 2>&1; then
+  TGT_ID=$(echo "$tgt_body" | jq -r '.id')
+else
+  TGT_ID=$(echo "$tgt_body" | grep -o '"id":"[^"]*"' | head -n1 | sed 's/"id":"//;s/"//')
+fi
+[ -n "$TGT_ID" ] || { echo "FAIL: could not resolve targeted rule id: $tgt_body"; exit 1; }
+tgt_ent_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"roleId\":\"$ROLE_ID\",\"artifactId\":\"$TGT_ID\"}" \
+  http://localhost:8080/v1/admin/artifact-entitlements)
+case "$tgt_ent_status" in 201|409) ;; *) echo "FAIL: entitle targeted rule status $tgt_ent_status"; exit 1 ;; esac
+tgt_submit_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$TGT_ID/submit")
+[ "$tgt_submit_status" = "200" ] || { echo "FAIL: submit targeted rule status $tgt_submit_status"; exit 1; }
+TGT_RV=$(current_row_version "$ADMIN_TOKEN" "$TGT_ID")
+tgt_approve_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $BOSS2_TOKEN" -H "If-Match: \"$TGT_RV\"" \
+  "http://localhost:8080/v1/admin/artifacts/$TGT_ID/approve")
+[ "$tgt_approve_status" = "200" ] || { echo "FAIL: approve targeted rule status $tgt_approve_status"; exit 1; }
+
+echo "==> sync: the targeted rule reaches ONLY the [go] project, the untargeted one reaches both"
+HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" sync >/dev/null 2>&1 \
+  || { echo "FAIL: sync after targeting exited non-zero"; exit 1; }
+grep -q 'TARGETED-RULE-BODY' "$SYNC_PROJ/AGENTS.md" \
+  || { echo "FAIL: the [go]-targeted rule never reached the tagged project"; exit 1; }
+grep -q 'TARGETED-RULE-BODY' "$SYNC_PROJ_UNTAGGED/AGENTS.md" 2>/dev/null \
+  && { echo "FAIL: a [go]-targeted rule reached an UNTAGGED project"; exit 1; }
+# The control. Without it, the assertion above passes on a project that is not
+# being managed at all.
+grep -q 'RULE-BODY-NO-SECRETS' "$SYNC_PROJ_UNTAGGED/AGENTS.md" \
+  || { echo "FAIL: the untargeted rule never reached the untagged project, so its lack of the targeted rule proves nothing"; exit 1; }
+echo "    targeting held: tagged project has both rules, untagged project has only the untargeted one"
+
+# ── Global-scope rule gate (migration 00025) ─────────────────────────────────
+#
+# A global rule belongs in the user-level instruction files every project
+# inherits, not in any project. The decisive pair is again both directions: it
+# must appear in ~/.claude/CLAUDE.md AND be absent from the project's AGENTS.md,
+# because a client that wrote every rule everywhere would satisfy the first half.
+echo "==> admin creates a GLOBAL-scope rule entitled to orbeat-user"
+glob_resp=$(curl -s -w '\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"type":"rule","name":"smoke-global-rule","description":"d","content":"Ask before force-pushing. GLOBAL-RULE-BODY","visibility":"role","ruleScope":"global"}' \
+  http://localhost:8080/v1/admin/artifacts)
+glob_status=$(printf '%s' "$glob_resp" | tail -n1)
+glob_body=$(printf '%s' "$glob_resp" | sed '$d')
+[ "$glob_status" = "201" ] || { echo "FAIL: create global rule $glob_status: $glob_body"; exit 1; }
+if command -v jq >/dev/null 2>&1; then
+  GLOB_ID=$(echo "$glob_body" | jq -r '.id')
+else
+  GLOB_ID=$(echo "$glob_body" | grep -o '"id":"[^"]*"' | head -n1 | sed 's/"id":"//;s/"//')
+fi
+[ -n "$GLOB_ID" ] || { echo "FAIL: could not resolve global rule id: $glob_body"; exit 1; }
+# A global rule with target tags is refused: tags select projects and a global
+# rule is written into none.
+glob_bad_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"type":"rule","name":"smoke-bad-global","description":"d","content":"x","ruleScope":"global","targetTags":["go"]}' \
+  http://localhost:8080/v1/admin/artifacts)
+[ "$glob_bad_status" = "400" ] || { echo "FAIL: a global rule with targetTags returned $glob_bad_status, want 400"; exit 1; }
+glob_ent_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"roleId\":\"$ROLE_ID\",\"artifactId\":\"$GLOB_ID\"}" \
+  http://localhost:8080/v1/admin/artifact-entitlements)
+case "$glob_ent_status" in 201|409) ;; *) echo "FAIL: entitle global rule status $glob_ent_status"; exit 1 ;; esac
+glob_submit_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$GLOB_ID/submit")
+[ "$glob_submit_status" = "200" ] || { echo "FAIL: submit global rule status $glob_submit_status"; exit 1; }
+GLOB_RV=$(current_row_version "$ADMIN_TOKEN" "$GLOB_ID")
+glob_approve_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $BOSS2_TOKEN" -H "If-Match: \"$GLOB_RV\"" \
+  "http://localhost:8080/v1/admin/artifacts/$GLOB_ID/approve")
+[ "$glob_approve_status" = "200" ] || { echo "FAIL: approve global rule status $glob_approve_status"; exit 1; }
+
+echo "==> sync: the global rule lands in the user-level file, never in a project"
+HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" sync >/dev/null 2>&1 \
+  || { echo "FAIL: sync after adding a global rule exited non-zero"; exit 1; }
+grep -q 'GLOBAL-RULE-BODY' "$SYNC_HOME/.claude/CLAUDE.md" \
+  || { echo "FAIL: the global rule never reached $SYNC_HOME/.claude/CLAUDE.md"; exit 1; }
+grep -q 'GLOBAL-RULE-BODY' "$SYNC_PROJ/AGENTS.md" \
+  && { echo "FAIL: a global rule was ALSO written into a project, so it applies twice"; exit 1; }
+# The control: the project rule is still in the project, so the absence above is
+# scope doing its job rather than the project having stopped being managed.
+grep -q 'RULE-BODY-NO-SECRETS' "$SYNC_PROJ/AGENTS.md" \
+  || { echo "FAIL: the project rule vanished, so the global-rule assertion proves nothing"; exit 1; }
+echo "    global rule in ~/.claude/CLAUDE.md, absent from the project, project rule still in place"
+
+# Put the fixture back: later gates in this script assume one registered project
+# with no tags. Removing strips the managed blocks from the throwaway directory,
+# which is also the documented behaviour of `project remove`.
+HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" project remove "$SYNC_PROJ_UNTAGGED" >/dev/null \
+  || { echo "FAIL: deregistering the untagged project"; exit 1; }
+HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" project add "$SYNC_PROJ" >/dev/null \
+  || { echo "FAIL: clearing the tag from the primary project"; exit 1; }
+rm -rf "$SYNC_PROJ_UNTAGGED"
+
+# ── G1a: the deployment registry recorded what the real binary just applied ───
+#
+# The registry is on for this run (ORBEAT_DEPLOYMENT_REGISTRY, exported at the
+# top of this file). One sync has happened, from one machine, so the aggregate
+# for smoke-gov must be exactly one install.
+#
+# ASSERT THE NUMBER, NOT THE PRESENCE. "A row landed" is the easy assertion and
+# it passes on a registry recording the wrong version, which is the way this
+# feature is most likely to ship broken: the whole product question is "who is
+# still on the old one". So the histogram is compared as a WHOLE value, with a
+# revision read out of the artifact's revision history rather than typed here.
+GOV_REV1=$(latest_revision_num "$ADMIN_TOKEN" "$GOV_ID")
+gov_dep1=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID")
+echo "$gov_dep1" | jq -e '.installs == 1 and .users == 1' >/dev/null \
+  || { echo "FAIL: one real sync from one machine must record 1 install / 1 user for smoke-gov; got $gov_dep1"; exit 1; }
+echo "$gov_dep1" | jq -e --argjson r "$GOV_REV1" '.latestRevision == $r' >/dev/null \
+  || { echo "FAIL: latestRevision is not the newest revision the history reports ($GOV_REV1); got $gov_dep1"; exit 1; }
+# The whole array, not a lookup into it: `any(.revision == $r)` passes on a
+# histogram that ALSO carries bars nobody reported.
+echo "$gov_dep1" | jq -e --argjson r "$GOV_REV1" '.byRevision == [{"revision":$r,"installs":1}]' >/dev/null \
+  || { echo "FAIL: the histogram must be exactly one install at revision $GOV_REV1; got $gov_dep1"; exit 1; }
+echo "$gov_dep1" | jq -e '.behindLatest == 0 and .observable == true' >/dev/null \
+  || { echo "FAIL: a machine on the newest revision is not behind, and a role-visibility artifact is observable; got $gov_dep1"; exit 1; }
+echo "$gov_dep1" | jq -e '.oldestReportedAt != null' >/dev/null \
+  || { echo "FAIL: a recorded install must carry a reported_at, or its count is unfalsifiable; got $gov_dep1"; exit 1; }
+echo "    G1a: the real client's report landed. smoke-gov at 1 install / 1 user / revision $GOV_REV1, behindLatest 0"
+
+# ── G1b: the number the client SENT is the number the registry STORED ─────────
+#
+# THE ONE THING NO REAL-BINARY GATE IN THIS FILE CAN OBSERVE, WHICH IS WHY THIS
+# ONE DOES NOT USE THE BINARY. The sync payload's revision IS
+# MAX(revision_num): it is a correlated subquery inside distArtifactCols
+# (internal/store/artifact.go), so every report a real client can produce
+# carries exactly the latest revision. A server that ignored the payload and
+# stored MAX(revision_num) itself is therefore indistinguishable from a correct
+# one on every other assertion here. That is measured, not argued: exactly that
+# mutant was run through this whole script and it PASSED, including the
+# behind-latest window below.
+#
+# So the report that carries a NON-latest revision has to come from a caller the
+# real client cannot be. It still goes through the real route, the real router
+# and alice's real token, and the divergence it creates is the whole point: a
+# registry recording the wrong version is the way this feature ships broken, and
+# "a row landed" cannot see it.
+#
+# It cleans up after itself with a second report from the same install carrying
+# an EMPTY artifact list, which is how an install says it holds none of them,
+# and asserts the aggregate comes back to the exact body G1a read. That equality
+# is a free second red-proof of the replace's DELETE half.
+G1B_INSTALL=11111111-1111-4111-8111-111111111111
+g1b_post=$(curl -s -w '\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"installId\":\"$G1B_INSTALL\",\"artifacts\":[{\"artifactId\":\"$GOV_ID\",\"revision\":1}]}" \
+  http://localhost:8080/v1/sync/deployments)
+g1b_status=$(printf '%s' "$g1b_post" | tail -n1)
+g1b_body=$(printf '%s' "$g1b_post" | sed '$d')
+[ "$g1b_status" = "200" ] || { echo "FAIL: POST /v1/sync/deployments returned $g1b_status: $g1b_body"; exit 1; }
+echo "$g1b_body" | jq -e '.recorded == 1 and .dropped == 0' >/dev/null \
+  || { echo "FAIL: an entitled artifact at a real revision must be recorded, not dropped; got $g1b_body"; exit 1; }
+gov_dep1b=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID")
+# The histogram must carry a bar at 1 AND a bar at $GOV_REV1. A server storing
+# MAX collapses both installs onto $GOV_REV1 and reports behindLatest 0.
+echo "$gov_dep1b" | jq -e --argjson r "$GOV_REV1" \
+  '.installs == 2 and .byRevision == [{"revision":$r,"installs":1},{"revision":1,"installs":1}] and .behindLatest == 1' >/dev/null \
+  || { echo "FAIL: a report carrying revision 1 must be stored as revision 1 and counted behind the latest; got $gov_dep1b"; exit 1; }
+# Two installs, one user: the only place in this file where the two counts
+# differ, which is what makes them separately meaningful rather than a pair of
+# names for the same number.
+echo "$gov_dep1b" | jq -e '.users == 1' >/dev/null \
+  || { echo "FAIL: both installs belong to alice, so users must be 1; got $gov_dep1b"; exit 1; }
+g1b_clear_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"installId\":\"$G1B_INSTALL\",\"artifacts\":[]}" \
+  http://localhost:8080/v1/sync/deployments)
+[ "$g1b_clear_status" = "200" ] \
+  || { echo "FAIL: clearing the throwaway install returned $g1b_clear_status"; exit 1; }
+gov_dep1_again=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID")
+[ "$gov_dep1_again" = "$gov_dep1" ] \
+  || { echo "FAIL: an empty report must clear exactly that install's rows and leave every other row alone; want $gov_dep1 got $gov_dep1_again"; exit 1; }
+echo "    G1b: a report carrying revision 1 was stored as revision 1 (2 installs, 1 user, behindLatest 1), and an empty report cleared exactly that install"
+
+# ── G2: APPLIED, not served ──────────────────────────────────────────────────
+#
+# A second install in a fresh HOME with agents/smoke-gov.md pre-created as an
+# UNMANAGED file (no manifest entry). Reconcile refuses to clobber a file it
+# does not manage and lands it in res.Skipped, so this machine is SERVED
+# smoke-gov and never applies it, while smoke-rule does land in its project.
+#
+# BOTH DELTAS, BECAUSE NEITHER ONE DISCRIMINATES ALONE. "smoke-gov did not move"
+# is equally true of a client that reports nothing at all; "smoke-rule went up"
+# is equally true of a client reporting everything it was served. Deltas rather
+# than absolutes because this install's rows share the aggregate with G1a's.
+SYNC_G2=$(mktemp -d); SYNC_G2_PROJ=$(mktemp -d)
+mkdir -p "$SYNC_G2/.claude/agents" "$SYNC_G2/.config/orbeat"
+seed_sync_token "$SYNC_G2"
+printf 'UNMANAGED-LOCAL-EDIT\n' > "$SYNC_G2/.claude/agents/smoke-gov.md"
+HOME="$SYNC_G2" "$SYNC_BIN/orbeat-sync" project add "$SYNC_G2_PROJ" >/dev/null
+
+g2_gov_before=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID" | jq -r '.installs')
+g2_rule_before=$(deployments_json "$ADMIN_TOKEN" "$RULE_ID" | jq -r '.installs')
+set +e
+g2_out=$(HOME="$SYNC_G2" "$SYNC_BIN/orbeat-sync" sync 2>&1)
+g2_rc=$?
+set -e
+[ "$g2_rc" = "0" ] \
+  || { echo "FAIL: the G2 sync exited $g2_rc (want 0: an unmanaged collision is a skip, not a failure); output: $g2_out"; exit 1; }
+# The two premises, asserted rather than assumed. Had Reconcile clobbered the
+# file, smoke-gov WOULD have been applied and the first delta would be measuring
+# nothing; had the rule not landed, the sibling delta would be vacuous.
+grep -q 'UNMANAGED-LOCAL-EDIT' "$SYNC_G2/.claude/agents/smoke-gov.md" \
+  || { echo "FAIL: the unmanaged file was clobbered, so G2 has no skip left to observe"; exit 1; }
+grep -q 'RULE-BODY-NO-SECRETS' "$SYNC_G2_PROJ/AGENTS.md" \
+  || { echo "FAIL: the G2 install's rule never landed, so its sibling delta would be vacuous"; exit 1; }
+g2_gov_after=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID" | jq -r '.installs')
+g2_rule_after=$(deployments_json "$ADMIN_TOKEN" "$RULE_ID" | jq -r '.installs')
+[ "$g2_gov_after" = "$g2_gov_before" ] \
+  || { echo "FAIL: a SKIPPED artifact was recorded as deployed: smoke-gov installs went $g2_gov_before to $g2_gov_after"; exit 1; }
+[ "$g2_rule_after" = "$((g2_rule_before + 1))" ] \
+  || { echo "FAIL: the applied rule was not recorded: smoke-rule installs went $g2_rule_before to $g2_rule_after, want $((g2_rule_before + 1))"; exit 1; }
+echo "    G2: applied not served, the skipped smoke-gov held at $g2_gov_after installs while smoke-rule rose to $g2_rule_after"
 
 # --json must put exactly one parseable object on STDOUT and nothing else. The
 # Go tests render into a bytes.Buffer, so they structurally cannot see a stray
@@ -868,7 +1260,7 @@ echo "$partial_json" | jq -e '.seeds.failures | length == 0' >/dev/null \
   || { echo "FAIL: .seeds.failures must be empty; got $(echo "$partial_json" | jq -c '.seeds.failures')"; exit 1; }
 echo "$partial_json" | jq -e '.artifacts.failures | length == 0' >/dev/null \
   || { echo "FAIL: .artifacts.failures must be empty; got $(echo "$partial_json" | jq -c '.artifacts.failures')"; exit 1; }
-# All three sections ran: null means "this reconciler never ran" (cmd/sync/outcome.go:16-20),
+# All three sections ran: null means "this reconciler never ran" (cmd/orbeat-sync/outcome.go:16-20),
 # which is the fatal signature, not the partial one.
 echo "$partial_json" | jq -e '.artifacts != null and .seeds != null and .rules != null' >/dev/null \
   || { echo "FAIL: a partial run must have run all three reconcilers; got $(echo "$partial_json" | jq -c '{artifacts,seeds,rules}')"; exit 1; }
@@ -902,7 +1294,7 @@ echo "    repaired project retried on the next run => exit 0, block + body + imp
 # projects.json at the LIVE projects — the registered roots live outside HOME — so
 # rewrite it to a throwaway project, or a fatal run could mutate the healthy state
 # asserted above. The fresh projects exist for that isolation only; they are not an
-# assertion surface (cmd/sync/main_test.go covers "no block after a fatal abort" in
+# assertion surface (cmd/orbeat-sync/main_test.go covers "no block after a fatal abort" in
 # Go, and as a bare negative here it would pass on a binary that did nothing).
 #
 # Use `cp -a "$SRC/." "$DST/"`, never `cp -a "$SRC" "$DST"` — the latter creates
@@ -921,6 +1313,24 @@ seed_sync_token "$SYNC_FATAL_A"
 # gate exists to catch.
 rm "$SYNC_FATAL_A/.claude/agents/smoke-gov.md"
 printf 'not json at all\n' > "$SYNC_FATAL_A/.claude/.orbeat-sync-manifest.json"
+
+# G3: A FATAL RUN REPORTS NOTHING, AND THEREFORE DELETES NOTHING. A report is a
+# REPLACE: it removes every row this install previously reported that is not in
+# the body. On this path Reconcile returns before its write loop runs at all, so
+# the applied set is empty for a reason that has nothing to do with what is on
+# disk, and a client that reported it anyway would wipe a healthy machine's rows
+# and read as a de-entitlement that never happened.
+#
+# The fixture was built with `cp -a "$SYNC_HOME/."`, so it inherits SYNC_HOME's
+# install.json and would report under the SAME install id. That inheritance is
+# the only reason this gate can observe the wipe, so it is asserted rather than
+# relied on: a future change that stopped copying the state dir would leave the
+# comparison below passing while proving nothing.
+[ "$(jq -r '.installId' "$SYNC_FATAL_A/.config/orbeat/install.json")" \
+   = "$(jq -r '.installId' "$SYNC_HOME/.config/orbeat/install.json")" ] \
+  || { echo "FAIL: the fatal fixture does not share SYNC_HOME's install id, so G3 could not observe a wipe"; exit 1; }
+g3_before=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID")
+
 set +e
 fatal_a_out=$(HOME="$SYNC_FATAL_A" "$SYNC_BIN/orbeat-sync" sync 2>&1)
 fatal_a_rc=$?
@@ -933,6 +1343,15 @@ test ! -f "$SYNC_FATAL_A/.claude/agents/smoke-gov.md" \
 test -f "$SYNC_HOME/.claude/agents/smoke-gov.md" \
   || { echo "FAIL: the fatal scenario mutated the healthy sync home"; exit 1; }
 echo "    corrupt manifest => exit 2, aborted before any write, healthy home intact"
+
+# Byte-identical, not "still non-zero": reported_at moves on every upsert, so an
+# unconditional report is visible here even in the case where it re-sent exactly
+# the same set. Nothing between the g3_before capture and this line touches the
+# registry: the assertions above only stat files.
+g3_after=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID")
+[ "$g3_before" = "$g3_after" ] \
+  || { echo "FAIL: a fatal run changed the registry; before=$g3_before after=$g3_after"; exit 1; }
+echo "    G3: the fatal run filed no report, so the smoke-gov aggregate is byte-identical across it"
 
 SYNC_FATAL_B=$(mktemp -d); SYNC_FRESH_B=$(mktemp -d)
 cp -a "$SYNC_HOME/." "$SYNC_FATAL_B/"
@@ -1076,4 +1495,587 @@ doctor_problems=$(echo "$doctor_json" | jq -r '.problems')
   || { echo "FAIL: doctor reported $doctor_problems problem(s) on the healthy tree: $doctor_json"; exit 1; }
 echo "    orbeat-sync doctor --json => exit 0, .problems == 0 on the restored, healthy tree"
 
-echo "==> SMOKE PASS: api + gateway healthy, postgres up, Keycloak auth /v1/me 200 + no-token 401, /v1/catalog 200 + no-token 401, admin CRUD + entitlement→catalog + 403 RBAC + audit pagination + audit export (json/csv/400) + structured JSON logs + audit dual-emit, gateway /mcp 401 no-token + metadata + real upstream tool round-trip (smoke-upstream__echo), portal healthz + SPA shell, marketplace artifact validated, artifact publish round-trip, sync/config 200 + no-token 401, artifact approval gate (unapproved hidden from sync, boss2 approval distributes, self-approve 403), artifact rollback (v2 approved+distributed, roll back to rev 1 restores v1 content), revision pruning gate (KEEP=$ORBEAT_ARTIFACT_REVISION_KEEP enforced end-to-end through cmd/api: $PRUNE_APPROVALS approvals on a dedicated throwaway artifact leave exactly $ORBEAT_ARTIFACT_REVISION_KEEP revisions), rule artifact gate (Phase 3 Slice B: create → submit → boss2 approve → entitled rule present in sync with type:rule + verbatim content), orbeat-sync BINARY gate (the real client reconciles the live stack's artifacts: rule → AGENTS.md + CLAUDE.md import with dev content preserved, file-backed subagent delivered alongside it — the v1.14.0 regression — idempotent re-sync, and the v1.15.0 partial-failure contract: a broken project exits 1 with a 'failed:' line while healthy work still lands, plus the failure-path contract (partial --json with section-pinned failures, a repaired project retried, a corrupt manifest exiting 2 before any write, an escaping path exiting 2 after the writes with the cascade stopped and JSON still emitted, and --dry-run changing nothing), and orbeat-sync doctor --json on the restored healthy tree reporting exit 0 with zero problems)"
+# ── Artifact identity through approval (spec 2026-08-22) ──────────────────────
+#
+# A rename on an approved artifact is now accepted and DEFERRED. The working
+# copy drops to draft, and every entitled developer keeps receiving the OLD
+# name carrying the OLD body until a second admin approves the change. The name
+# is the file path on a developer's disk (agents/<name>.md), so a distribution
+# query reading the live row instead of the approved snapshot moves a file on
+# every machine with no reviewer in the loop.
+#
+# WHY THIS BLOCK RUNS LAST, and not inside the governance section around line
+# 504 where the plan for this slice placed it. The claim is about what the
+# CLIENT receives, and the real orbeat-sync binary is not built until the top of
+# the binary gate far above. Renaming smoke-gov up there would also have to
+# survive every scenario in between, and two of them are coupled to its file
+# name by construction: F4 asserts .artifacts.updated == 1 on the stated fixture
+# "alice is served exactly ONE file-backed artifact", and F3/F4/F5 each ablate
+# agents/smoke-gov.md by that literal path. Running here costs no extra stack
+# cycle, the doctor block above just restored SYNC_HOME to a healthy fully
+# synced tree, and nothing downstream reads smoke-gov again.
+#
+# jq is used unqualified below, as it already is throughout the binary gate: a
+# run without it has failed long before reaching this line.
+echo "==> identity gate: a rename on an approved artifact is deferred to approval, end to end"
+
+# alice's ACCESS_TOKEN was minted at the top of this script, and Keycloak's
+# default access-token lifetime is 5 minutes, so by this point in a run it may
+# already be expired. A 401 here would read as a distribution bug. Mint a fresh
+# one for the reads below, and re-seed the sync home's credential cache for the
+# same reason (seed_sync_token's own doc comment describes that window).
+IDENT_TOKEN=$(get_token alice alice) || true
+[ -n "$IDENT_TOKEN" ] || { echo "FAIL: could not mint a fresh alice token for the identity gate"; exit 1; }
+seed_sync_token "$SYNC_HOME"
+
+GOV_NEW_NAME=smoke-gov-renamed
+
+# The state every claim below is measured against, asserted so a later failure
+# cannot be blamed on a precondition nobody checked.
+test -f "$SYNC_HOME/.claude/agents/smoke-gov.md" \
+  || { echo "FAIL: precondition: agents/smoke-gov.md is not on disk before the identity gate"; exit 1; }
+
+# 1. Rename through the real API. The PUT carries a new BODY as well as a new
+#    name, so identity and content stay separable in every assertion below: an
+#    implementation that defers one but not the other is visible rather than
+#    hidden behind a single "unchanged" check.
+GOV_RV3=$(current_row_version "$ADMIN_TOKEN" "$GOV_ID")
+ident_rename_status=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -H "If-Match: \"$GOV_RV3\"" \
+  -d "{\"type\":\"subagent\",\"name\":\"$GOV_NEW_NAME\",\"description\":\"d\",\"content\":\"---\nname: $GOV_NEW_NAME\ndescription: d\n---\nRENAMED-BODY\",\"visibility\":\"role\"}" \
+  "http://localhost:8080/v1/admin/artifacts/$GOV_ID")
+[ "$ident_rename_status" = "200" ] \
+  || { echo "FAIL: renaming an approved artifact returned $ident_rename_status, want 200 (the identity lock should be gone)"; exit 1; }
+
+# 2. Preconditions INSIDE the gate, never the gate itself. A run where the
+#    rename silently did nothing would satisfy every "still the old name"
+#    assertion that follows, which is precisely the shape of a gate that cannot
+#    fail. Prove the live row actually moved, that the working copy went back to
+#    draft, and that the API reports the identity it is still distributing.
+ident_after_rename=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$GOV_ID")
+[ "$(echo "$ident_after_rename" | jq -r '.name')" = "$GOV_NEW_NAME" ] \
+  || { echo "FAIL: the live name did not change, so nothing below can be evidence: $ident_after_rename"; exit 1; }
+[ "$(echo "$ident_after_rename" | jq -r '.approvalState')" = "draft" ] \
+  || { echo "FAIL: an identity edit must return the working copy to draft: $ident_after_rename"; exit 1; }
+[ "$(echo "$ident_after_rename" | jq -r '.approvedName')" = "smoke-gov" ] \
+  || { echo "FAIL: approvedName must still report the distributed name: $ident_after_rename"; exit 1; }
+echo "    rename accepted => 200, live name=$GOV_NEW_NAME, state=draft, approvedName=smoke-gov"
+
+# 3. The API still serves the OLD pair. Both halves, and both directions: the
+#    old name and body present, the new name and body absent. Asserting only
+#    the presence of the old name passes on a payload carrying BOTH.
+ident_sync_pending=$(curl -s -H "Authorization: Bearer $IDENT_TOKEN" http://localhost:8080/v1/sync/artifacts)
+echo "$ident_sync_pending" | jq -e '[.artifacts[] | select(.name=="smoke-gov")] | length == 1' >/dev/null \
+  || { echo "FAIL: an unapproved rename changed what /v1/sync/artifacts serves: $ident_sync_pending"; exit 1; }
+echo "$ident_sync_pending" | jq -e --arg n "$GOV_NEW_NAME" '[.artifacts[] | select(.name==$n)] | length == 0' >/dev/null \
+  || { echo "FAIL: the new name reached distribution before approval: $ident_sync_pending"; exit 1; }
+echo "$ident_sync_pending" | jq -e '.artifacts[] | select(.name=="smoke-gov") | .content | contains("APPROVED-BODY")' >/dev/null \
+  || { echo "FAIL: sync serves the old name but not the approved body: $ident_sync_pending"; exit 1; }
+echo "$ident_sync_pending" | jq -e '[.artifacts[] | select(.content | contains("RENAMED-BODY"))] | length == 0' >/dev/null \
+  || { echo "FAIL: the unapproved body reached distribution: $ident_sync_pending"; exit 1; }
+echo "    /v1/sync/artifacts still serves smoke-gov + APPROVED-BODY, and neither the new name nor the new body"
+
+# 4. THE REAL BINARY still receives the old pair. ABLATE BEFORE MEASURING, the
+#    same discipline F5 documents: without the rm, "agents/smoke-gov.md is
+#    present" is true whether the sync ran or not. After it, the old path can
+#    only come back from a real reconcile, while a distribution reading the LIVE
+#    row would create agents/smoke-gov-renamed.md and leave the old path
+#    missing. Both assertions therefore discriminate, in opposite directions.
+rm "$SYNC_HOME/.claude/agents/smoke-gov.md"
+set +e
+ident_sync1_out=$(HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" sync 2>&1)
+ident_sync1_rc=$?
+set -e
+[ "$ident_sync1_rc" = "0" ] \
+  || { echo "FAIL: orbeat-sync sync exited $ident_sync1_rc while a rename was pending; output: $ident_sync1_out"; exit 1; }
+test -f "$SYNC_HOME/.claude/agents/smoke-gov.md" \
+  || { echo "FAIL: the real client stopped delivering agents/smoke-gov.md while the rename is unapproved; output: $ident_sync1_out"; exit 1; }
+test ! -f "$SYNC_HOME/.claude/agents/$GOV_NEW_NAME.md" \
+  || { echo "FAIL: the real client wrote agents/$GOV_NEW_NAME.md from an UNAPPROVED rename"; exit 1; }
+grep -q 'APPROVED-BODY' "$SYNC_HOME/.claude/agents/smoke-gov.md" \
+  || { echo "FAIL: agents/smoke-gov.md came back without the approved body"; exit 1; }
+grep -q 'RENAMED-BODY' "$SYNC_HOME/.claude/agents/smoke-gov.md" \
+  && { echo "FAIL: the unapproved body landed on disk under the old name"; exit 1; }
+echo "    the real orbeat-sync binary still writes agents/smoke-gov.md with APPROVED-BODY"
+
+# 5. Approve the rename. boss submitted, boss2 approves, so separation of duties
+#    is genuinely exercised. A fresh rowVersion at each step: the 00013 trigger
+#    bumped it on the PUT and again on the submit.
+ident_submit_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$GOV_ID/submit")
+[ "$ident_submit_status" = "200" ] || { echo "FAIL: submit the renamed smoke-gov status $ident_submit_status"; exit 1; }
+GOV_RV4=$(current_row_version "$ADMIN_TOKEN" "$GOV_ID")
+ident_approve_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $BOSS2_TOKEN" -H "If-Match: \"$GOV_RV4\"" \
+  "http://localhost:8080/v1/admin/artifacts/$GOV_ID/approve")
+[ "$ident_approve_status" = "200" ] \
+  || { echo "FAIL: approving the rename (boss2) returned $ident_approve_status, want 200"; exit 1; }
+
+# G1c: THE TARGET MOVED AND THE MACHINE HAS NOT. Approval appended a revision;
+# the sync home has not run since, so latestRevision and the machine's recorded
+# revision are required to differ, and by exactly the artifact's own history.
+# This is the state an operator actually opens this page in: somebody approved
+# something and the fleet has not caught up.
+#
+# WHAT IT CATCHES, stated narrowly because the neighbouring claim was wrong once
+# already: a READ that renders the histogram from the newest approved revision
+# rather than from the stored rows, and any implementation that can only ever
+# answer "everybody is current". It does NOT catch a WRITE that substitutes
+# MAX(revision_num) for the reported value: that row was written while MAX was
+# still $GOV_REV1, so the mutant records $GOV_REV1 too. Measured, by running it.
+# G1b is the gate for that one.
+#
+# It runs BEFORE step 6's sync deliberately: the window is one approval wide and
+# closes the moment the client reports again.
+GOV_REV2=$(latest_revision_num "$ADMIN_TOKEN" "$GOV_ID")
+[ "$GOV_REV2" -gt "$GOV_REV1" ] \
+  || { echo "FAIL: approving the rename did not append a revision ($GOV_REV1 then $GOV_REV2), so G1c has nothing to measure"; exit 1; }
+gov_dep2=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID")
+echo "$gov_dep2" | jq -e --argjson r "$GOV_REV2" '.latestRevision == $r' >/dev/null \
+  || { echo "FAIL: latestRevision did not follow the new approval to $GOV_REV2; got $gov_dep2"; exit 1; }
+echo "$gov_dep2" | jq -e --argjson r "$GOV_REV1" '.byRevision == [{"revision":$r,"installs":1}]' >/dev/null \
+  || { echo "FAIL: the install has not re-synced, so it must still stand recorded at revision $GOV_REV1; got $gov_dep2"; exit 1; }
+echo "$gov_dep2" | jq -e '.behindLatest == 1 and .installs == 1' >/dev/null \
+  || { echo "FAIL: one install on an older revision is one install behind; got $gov_dep2"; exit 1; }
+echo "    G1c: approval moved latestRevision to $GOV_REV2 while the machine stayed recorded at $GOV_REV1 (behindLatest 1)"
+
+# 6. Only now does the pair flip, in the API and on disk together.
+ident_sync_flipped=$(curl -s -H "Authorization: Bearer $IDENT_TOKEN" http://localhost:8080/v1/sync/artifacts)
+echo "$ident_sync_flipped" | jq -e --arg n "$GOV_NEW_NAME" '[.artifacts[] | select(.name==$n)] | length == 1' >/dev/null \
+  || { echo "FAIL: the approved rename did not reach /v1/sync/artifacts: $ident_sync_flipped"; exit 1; }
+echo "$ident_sync_flipped" | jq -e '[.artifacts[] | select(.name=="smoke-gov")] | length == 0' >/dev/null \
+  || { echo "FAIL: the old name is still being distributed after approval: $ident_sync_flipped"; exit 1; }
+echo "$ident_sync_flipped" | jq -e --arg n "$GOV_NEW_NAME" '.artifacts[] | select(.name==$n) | .content | contains("RENAMED-BODY")' >/dev/null \
+  || { echo "FAIL: the new name is distributed without the newly approved body: $ident_sync_flipped"; exit 1; }
+set +e
+ident_sync2_out=$(HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" sync 2>&1)
+ident_sync2_rc=$?
+set -e
+[ "$ident_sync2_rc" = "0" ] \
+  || { echo "FAIL: orbeat-sync sync exited $ident_sync2_rc after the rename was approved; output: $ident_sync2_out"; exit 1; }
+test -f "$SYNC_HOME/.claude/agents/$GOV_NEW_NAME.md" \
+  || { echo "FAIL: the approved rename never reached the real client's disk; output: $ident_sync2_out"; exit 1; }
+grep -q 'RENAMED-BODY' "$SYNC_HOME/.claude/agents/$GOV_NEW_NAME.md" \
+  || { echo "FAIL: agents/$GOV_NEW_NAME.md does not carry the newly approved body"; exit 1; }
+# The rename MOVES the file. Leaving the old path behind would give every
+# developer two subagents with the same description, one of them frozen at the
+# pre-rename body forever, since nothing would ever manage it again.
+test ! -f "$SYNC_HOME/.claude/agents/smoke-gov.md" \
+  || { echo "FAIL: the old path survived the approved rename; a rename must move the file, not duplicate it"; exit 1; }
+echo "    approval flips the pair: sync serves $GOV_NEW_NAME + RENAMED-BODY, and the real client moved agents/smoke-gov.md to agents/$GOV_NEW_NAME.md"
+
+# G1d: the re-sync closes the gap, at the NEW number. Together with G1c
+# this is the assertion a constant-storing registry cannot satisfy: the same
+# install is required to be recorded at two different revisions across one
+# approval and one sync.
+gov_dep3=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID")
+echo "$gov_dep3" | jq -e --argjson r "$GOV_REV2" '.installs == 1 and .byRevision == [{"revision":$r,"installs":1}] and .behindLatest == 0' >/dev/null \
+  || { echo "FAIL: after re-syncing, the install must stand at revision $GOV_REV2 with nothing behind; got $gov_dep3"; exit 1; }
+echo "    G1d: the re-synced machine moved to revision $GOV_REV2, behindLatest 0"
+
+# ── G4: replace semantics make a de-entitlement visible ───────────────────────
+#
+# Revoke alice's grant and sync. The client no longer applies the artifact, so
+# it is absent from the report, and a report is a REPLACE: the row goes and the
+# aggregate falls to zero installs. An upsert-only implementation would leave a
+# row no later run could ever clear, and this page would go on counting a
+# machine that gave the artifact back, which is the failure mode a registry
+# exists to not have.
+#
+# LAST IN THE FILE, deliberately. It takes the artifact out of alice's catalog
+# and its file off the sync home's disk, and nothing below reads either.
+echo "==> G4: revoking the grant, and the registry following it to zero"
+gov_ent_list=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8080/v1/admin/artifact-entitlements)
+GOV_ENT_ID=$(echo "$gov_ent_list" | jq -r --arg a "$GOV_ID" --arg r "$ROLE_ID" \
+  'first(.artifactEntitlements[] | select(.artifactId==$a and .roleId==$r) | .id)')
+[ -n "$GOV_ENT_ID" ] && [ "$GOV_ENT_ID" != "null" ] \
+  || { echo "FAIL: could not find the smoke-gov artifact entitlement to revoke: $gov_ent_list"; exit 1; }
+gov_revoke_status=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+  -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifact-entitlements/$GOV_ENT_ID")
+[ "$gov_revoke_status" = "204" ] \
+  || { echo "FAIL: revoking the artifact entitlement returned $gov_revoke_status, want 204"; exit 1; }
+seed_sync_token "$SYNC_HOME"
+set +e
+g4_out=$(HOME="$SYNC_HOME" "$SYNC_BIN/orbeat-sync" sync 2>&1)
+g4_rc=$?
+set -e
+[ "$g4_rc" = "0" ] || { echo "FAIL: the post-revocation sync exited $g4_rc (want 0); output: $g4_out"; exit 1; }
+# The premise: the client really did stop holding it. Without this, "zero
+# installs" is also what a sync that never ran would produce.
+test ! -f "$SYNC_HOME/.claude/agents/$GOV_NEW_NAME.md" \
+  || { echo "FAIL: the revoked artifact is still on disk, so a zero here would not be about a de-entitlement; output: $g4_out"; exit 1; }
+gov_dep4=$(deployments_json "$ADMIN_TOKEN" "$GOV_ID")
+echo "$gov_dep4" | jq -e '.installs == 0 and .users == 0 and .byRevision == [] and .behindLatest == 0' >/dev/null \
+  || { echo "FAIL: the revoked artifact must fall to zero installs; got $gov_dep4"; exit 1; }
+echo "$gov_dep4" | jq -e '.oldestReportedAt == null' >/dev/null \
+  || { echo "FAIL: with no rows left there is no oldest report; got $gov_dep4"; exit 1; }
+# THE ZERO IS A REAL ZERO, NOT A BLIND SPOT. latestRevision still names the
+# artifact's newest approved version and observable is still true, so this is
+# not the "orbeat cannot see this artifact" answer wearing the same numbers,
+# which is the one confusion the response shape exists to prevent.
+echo "$gov_dep4" | jq -e --argjson r "$GOV_REV2" '.latestRevision == $r and .observable == true' >/dev/null \
+  || { echo "FAIL: the artifact should still be observable at revision $GOV_REV2; got $gov_dep4"; exit 1; }
+echo "    G4: the revoked grant took the install with it, 0 installs on an artifact still observable at revision $GOV_REV2"
+
+# ── Artifact version pinning (docs/specs/2026-08-22-orbeat-artifact-version-
+# pinning-design.md) ────────────────────────────────────────────────────────
+#
+# LAST IN THE FILE, after G4, for the same reason the identity gate above runs
+# last: F3, F4 and F5 ablate agents/smoke-gov.md by that literal path, and F4
+# asserts .artifacts.updated == 1 on the stated fixture "alice is served
+# exactly ONE file-backed artifact" (smoke-gov). A role-visibility
+# file-backed artifact entitled to orbeat-user, placed before that block,
+# would break both. This section owns its own artifacts (smoke-pin,
+# smoke-pin-prune) and its own sync HOME (SYNC_PIN, not SYNC_HOME), so
+# nothing above it needs to change and nothing here can perturb an assertion
+# above it.
+echo "==> artifact version pinning: client pin, admin floor, pruned degradation, prune ignoring the registry"
+
+SYNC_PIN=$(mktemp -d)
+mkdir -p "$SYNC_PIN/.claude/agents" "$SYNC_PIN/.config/orbeat"
+seed_sync_token "$SYNC_PIN"
+
+# Fresh tokens: this section runs after every gate above it, several minutes
+# into the run, and boss/boss2's tokens from earlier sections may already be
+# past Keycloak's ~5-min access-token lifetime (the identity gate's own
+# comment records the same concern).
+PIN_ADMIN_TOKEN=$(get_token boss boss)
+[ -n "$PIN_ADMIN_TOKEN" ] || { echo "FAIL: could not fetch a fresh admin token for the pinning section"; exit 1; }
+PIN_BOSS2_TOKEN=$(get_token boss2 boss2)
+[ -n "$PIN_BOSS2_TOKEN" ] || { echo "FAIL: could not fetch a fresh boss2 token for the pinning section"; exit 1; }
+
+echo "==> admin creates a role-visibility subagent (draft) entitled to orbeat-user, for gates 1 and 2"
+pin_resp=$(curl -s -w '\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"subagent","name":"smoke-pin","description":"d","content":"---\nname: smoke-pin\ndescription: d\n---\nPIN-V1-BODY","visibility":"role"}' \
+  http://localhost:8080/v1/admin/artifacts)
+pin_status=$(printf '%s' "$pin_resp" | tail -n1)
+pin_body=$(printf '%s' "$pin_resp" | sed '$d')
+[ "$pin_status" = "201" ] || { echo "FAIL: create smoke-pin $pin_status: $pin_body"; exit 1; }
+PIN_ID=$(echo "$pin_body" | jq -r '.id')
+[ -n "$PIN_ID" ] && [ "$PIN_ID" != "null" ] || { echo "FAIL: could not resolve smoke-pin id: $pin_body"; exit 1; }
+echo "    draft subagent smoke-pin created id=$PIN_ID"
+
+pin_ent_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"roleId\":\"$ROLE_ID\",\"artifactId\":\"$PIN_ID\"}" \
+  http://localhost:8080/v1/admin/artifact-entitlements)
+case "$pin_ent_status" in
+  201|409) : ;;
+  *) echo "FAIL: create smoke-pin entitlement status $pin_ent_status"; exit 1 ;;
+esac
+echo "    orbeat-user entitled to smoke-pin ($pin_ent_status)"
+
+echo "==> approving smoke-pin twice, with distinguishable bodies (PIN-V1-BODY, then PIN-V2-BODY)"
+pin_submit1_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$PIN_ID/submit")
+[ "$pin_submit1_status" = "200" ] || { echo "FAIL: submit smoke-pin v1 status $pin_submit1_status"; exit 1; }
+PIN_RV1=$(current_row_version "$PIN_ADMIN_TOKEN" "$PIN_ID")
+pin_approve1_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_BOSS2_TOKEN" -H "If-Match: \"$PIN_RV1\"" \
+  "http://localhost:8080/v1/admin/artifacts/$PIN_ID/approve")
+[ "$pin_approve1_status" = "200" ] || { echo "FAIL: approve smoke-pin v1 (boss2) status $pin_approve1_status"; exit 1; }
+PIN_REV1=$(latest_revision_num "$PIN_ADMIN_TOKEN" "$PIN_ID")
+echo "    smoke-pin PIN-V1-BODY approved => revision $PIN_REV1"
+
+PIN_RV2A=$(current_row_version "$PIN_ADMIN_TOKEN" "$PIN_ID")
+pin_put2_status=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -H "If-Match: \"$PIN_RV2A\"" \
+  -d '{"type":"subagent","name":"smoke-pin","description":"d","content":"---\nname: smoke-pin\ndescription: d\n---\nPIN-V2-BODY","visibility":"role"}' \
+  "http://localhost:8080/v1/admin/artifacts/$PIN_ID")
+[ "$pin_put2_status" = "200" ] || { echo "FAIL: edit smoke-pin to v2 status $pin_put2_status"; exit 1; }
+pin_submit2_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$PIN_ID/submit")
+[ "$pin_submit2_status" = "200" ] || { echo "FAIL: resubmit smoke-pin v2 status $pin_submit2_status"; exit 1; }
+PIN_RV2B=$(current_row_version "$PIN_ADMIN_TOKEN" "$PIN_ID")
+pin_approve2_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_BOSS2_TOKEN" -H "If-Match: \"$PIN_RV2B\"" \
+  "http://localhost:8080/v1/admin/artifacts/$PIN_ID/approve")
+[ "$pin_approve2_status" = "200" ] || { echo "FAIL: approve smoke-pin v2 (boss2) status $pin_approve2_status"; exit 1; }
+PIN_REV2=$(latest_revision_num "$PIN_ADMIN_TOKEN" "$PIN_ID")
+[ "$PIN_REV2" -gt "$PIN_REV1" ] \
+  || { echo "FAIL: the v2 approval did not append a revision ($PIN_REV1 then $PIN_REV2), so gate 1 has nothing to pin below"; exit 1; }
+echo "    smoke-pin PIN-V2-BODY approved => revision $PIN_REV2"
+
+echo "==> gate 1: an unpinned sync serves the newest revision (PIN-V2-BODY)"
+set +e
+unpinned_out=$(HOME="$SYNC_PIN" "$SYNC_BIN/orbeat-sync" sync 2>&1)
+unpinned_rc=$?
+set -e
+[ "$unpinned_rc" = "0" ] || { echo "FAIL: the unpinned sync exited $unpinned_rc; output: $unpinned_out"; exit 1; }
+grep -q 'PIN-V2-BODY' "$SYNC_PIN/.claude/agents/smoke-pin.md" \
+  || { echo "FAIL: an unpinned sync did not serve the newest revision (PIN-V2-BODY)"; exit 1; }
+echo "    unpinned sync => PIN-V2-BODY on disk"
+
+echo "==> gate 1: orbeat-sync pin subagent/smoke-pin --revision 1"
+seed_sync_token "$SYNC_PIN"
+set +e
+pinset_out=$(HOME="$SYNC_PIN" "$SYNC_BIN/orbeat-sync" pin subagent/smoke-pin --revision 1 2>&1)
+pinset_rc=$?
+set -e
+[ "$pinset_rc" = "0" ] || { echo "FAIL: orbeat-sync pin --revision 1 exited $pinset_rc; output: $pinset_out"; exit 1; }
+echo "$pinset_out" | grep -q 'Pinned subagent/smoke-pin to revision 1' \
+  || { echo "FAIL: pin set did not confirm the pin; output: $pinset_out"; exit 1; }
+echo "    smoke-pin locally pinned to revision 1"
+
+# Remove the target file BEFORE the sync that is supposed to restore V1: "V1
+# is present" must not be able to pass on the V2 file the unpinned sync above
+# left behind. F5 (:1209-1219) documents the same discipline for the same
+# reason.
+rm "$SYNC_PIN/.claude/agents/smoke-pin.md"
+seed_sync_token "$SYNC_PIN"
+set +e
+gate1_out=$(HOME="$SYNC_PIN" "$SYNC_BIN/orbeat-sync" sync 2>&1)
+gate1_rc=$?
+set -e
+[ "$gate1_rc" = "0" ] || { echo "FAIL: sync after pinning smoke-pin to revision 1 exited $gate1_rc; output: $gate1_out"; exit 1; }
+grep -q 'PIN-V1-BODY' "$SYNC_PIN/.claude/agents/smoke-pin.md" \
+  || { echo "FAIL: the pinned sync did not serve revision 1 (PIN-V1-BODY); output: $gate1_out"; exit 1; }
+# THE HALF THAT MAKES THIS NON-VACUOUS: "V1 present" alone also passes on an
+# implementation that writes BOTH V1 and V2, or one that never touched the
+# file at all had the previous step not removed it.
+grep -q 'PIN-V2-BODY' "$SYNC_PIN/.claude/agents/smoke-pin.md" \
+  && { echo "FAIL: the pinned sync served revision 1 but the file still carries V2 content"; exit 1; }
+echo "    gate 1: pin --revision 1 => sync serves PIN-V1-BODY and does not contain PIN-V2-BODY"
+
+echo "==> gate 1: raising smoke-pin's admin floor to revision $PIN_REV2 overrides the client pin"
+PIN_FLOOR_RV=$(current_row_version "$PIN_ADMIN_TOKEN" "$PIN_ID")
+floor_status=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -H "If-Match: \"$PIN_FLOOR_RV\"" \
+  -d "{\"minRevision\":$PIN_REV2}" \
+  "http://localhost:8080/v1/admin/artifacts/$PIN_ID/min-revision")
+[ "$floor_status" = "200" ] || { echo "FAIL: raising smoke-pin's floor to $PIN_REV2 status $floor_status"; exit 1; }
+echo "    smoke-pin floor raised to revision $PIN_REV2"
+
+rm "$SYNC_PIN/.claude/agents/smoke-pin.md"
+seed_sync_token "$SYNC_PIN"
+set +e
+gate1b_out=$(HOME="$SYNC_PIN" "$SYNC_BIN/orbeat-sync" sync 2>&1)
+gate1b_rc=$?
+set -e
+# An overridden pin is a warning, never a failure (spec §9.3, the sync guide's
+# own exit-contract line): the mutant this catches is one that turns an
+# admin's floor override into a retryable failure the developer did nothing
+# to cause.
+[ "$gate1b_rc" = "0" ] \
+  || { echo "FAIL: sync under the floor override exited $gate1b_rc (want 0: an overridden pin is a warning, never a failure); output: $gate1b_out"; exit 1; }
+grep -q 'PIN-V2-BODY' "$SYNC_PIN/.claude/agents/smoke-pin.md" \
+  || { echo "FAIL: the floor did not raise the served revision back to $PIN_REV2 (PIN-V2-BODY); output: $gate1b_out"; exit 1; }
+grep -q 'PIN-V1-BODY' "$SYNC_PIN/.claude/agents/smoke-pin.md" \
+  && { echo "FAIL: the file still carries the below-floor content after the floor was raised"; exit 1; }
+echo "$gate1b_out" | grep -q "smoke-pin: held at revision 1, this sync served revision $PIN_REV2 instead (floor)" \
+  || { echo "FAIL: the floor override did not print a warning naming the pin, the served revision and floor; output: $gate1b_out"; exit 1; }
+echo "    gate 1: the floor moved the served revision to $PIN_REV2, exit 0, warning names the pin, the served revision and floor"
+
+echo "==> gate 2: --json for the same floor-overridden run reports the pin as structured data"
+rm "$SYNC_PIN/.claude/agents/smoke-pin.md"
+seed_sync_token "$SYNC_PIN"
+set +e
+gate2_json=$(HOME="$SYNC_PIN" "$SYNC_BIN/orbeat-sync" sync --json 2>/dev/null)
+gate2_rc=$?
+set -e
+# THE PAIRING IS THE POINT (smoke.sh's own F1 convention, :1180-1181): a
+# mutant that stops emitting JSON would still pass a bare rc check, and a
+# mutant that hardcodes .exitCode would still pass a bare rc check too if the
+# process itself silently swallowed a real failure, so both are asserted,
+# independently, from the SAME run.
+[ "$gate2_rc" = "0" ] || { echo "FAIL: sync --json under the floor override exited $gate2_rc (want 0); output: $gate2_json"; exit 1; }
+echo "$gate2_json" | jq -e . >/dev/null \
+  || { echo "FAIL: sync --json emitted no parseable JSON: $gate2_json"; exit 1; }
+[ "$(echo "$gate2_json" | jq -r '.exitCode')" = "0" ] \
+  || { echo "FAIL: .exitCode was $(echo "$gate2_json" | jq -r '.exitCode'), want 0"; exit 1; }
+# Selected by name, not asserted as the whole array: .artifacts.pins carries
+# one entry per HELD pin, and smoke-pin-prune's own pin (gate 3/11, below)
+# will add a second entry to this same array once it exists. Asserting the
+# whole array as a singleton here would pass now and break the moment gate
+# 3/11's fixture is created, for a reason that has nothing to do with what
+# this gate is testing.
+echo "$gate2_json" | jq -e --argjson r "$PIN_REV2" --arg n "subagent/smoke-pin" \
+  '[.artifacts.pins[] | select(.name==$n)] == [{"name":$n,"requested":1,"served":$r,"reason":"floor"}]' >/dev/null \
+  || { echo "FAIL: .artifacts.pins did not carry the exact floor override for smoke-pin; got $gate2_json"; exit 1; }
+grep -q 'PIN-V2-BODY' "$SYNC_PIN/.claude/agents/smoke-pin.md" \
+  || { echo "FAIL: the --json run did not also write the floored revision to disk"; exit 1; }
+# A WARNING, AND SPECIFICALLY NOT A FAILURE. Measured 2026-08-23: routing the
+# pin lines into .artifacts.failures instead of .artifacts.warnings leaves the
+# exit code at 0, because reconcileAll owns the exit code and this list does
+# not feed it, so every assertion above stays green while --json reports a
+# routine floor override as a partial failure. That contradicts the v1.15.0
+# exit contract on the one surface a CI loop reads: exit 0 says "nothing to
+# retry" and a non-empty failures array says the opposite. The pins array
+# alone cannot catch it either, since it is populated identically both ways.
+echo "$gate2_json" | jq -e '.artifacts.failures == []' >/dev/null \
+  || { echo "FAIL: an overridden pin landed in .artifacts.failures; it is a warning at exit 0, never a failure: $gate2_json"; exit 1; }
+echo "$gate2_json" | jq -e --arg n "subagent/smoke-pin" \
+  '[.artifacts.warnings[] | select(contains($n))] | length == 1' >/dev/null \
+  || { echo "FAIL: the floor override did not appear as exactly one .artifacts.warnings line naming subagent/smoke-pin: $gate2_json"; exit 1; }
+echo "    gate 2: .artifacts.pins == [{requested:1, served:$PIN_REV2, reason:floor}], process rc and .exitCode both 0, the override a warning and .artifacts.failures empty"
+
+# ── Gates 3 and 11 share one fixture, smoke-pin-prune, and are interleaved on
+# purpose: gate 11 needs a real artifact_deployment row naming a revision
+# WHILE that revision still exists, which is only true through the third
+# approval (KEEP=3 means the fourth approval's prune is the first one that
+# deletes anything); gate 3 needs the fixture pruned past what the pin names,
+# which is only true once five approvals have landed. One fixture, one
+# ordered story, rather than two fixtures that would have to agree on when
+# pruning starts by construction rather than by reading the same code this
+# section is proving.
+echo "==> admin creates a second role-visibility subagent, smoke-pin-prune, entitled to orbeat-user, for gates 3 and 11"
+PIN_ADMIN_TOKEN=$(get_token boss boss)
+[ -n "$PIN_ADMIN_TOKEN" ] || { echo "FAIL: could not refresh the admin token before the prune fixture"; exit 1; }
+PIN_BOSS2_TOKEN=$(get_token boss2 boss2)
+[ -n "$PIN_BOSS2_TOKEN" ] || { echo "FAIL: could not refresh the boss2 token before the prune fixture"; exit 1; }
+
+prune2_resp=$(curl -s -w '\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"skill","name":"smoke-pin-prune","description":"d","content":"---\nname: smoke-pin-prune\ndescription: d\n---\nPIN-PRUNE-V1","visibility":"role"}' \
+  http://localhost:8080/v1/admin/artifacts)
+prune2_status=$(printf '%s' "$prune2_resp" | tail -n1)
+prune2_body=$(printf '%s' "$prune2_resp" | sed '$d')
+[ "$prune2_status" = "201" ] || { echo "FAIL: create smoke-pin-prune $prune2_status: $prune2_body"; exit 1; }
+PRUNE2_ID=$(echo "$prune2_body" | jq -r '.id')
+[ -n "$PRUNE2_ID" ] && [ "$PRUNE2_ID" != "null" ] || { echo "FAIL: could not resolve smoke-pin-prune id: $prune2_body"; exit 1; }
+echo "    draft subagent smoke-pin-prune created id=$PRUNE2_ID"
+
+prune2_ent_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"roleId\":\"$ROLE_ID\",\"artifactId\":\"$PRUNE2_ID\"}" \
+  http://localhost:8080/v1/admin/artifact-entitlements)
+case "$prune2_ent_status" in
+  201|409) : ;;
+  *) echo "FAIL: create smoke-pin-prune entitlement status $prune2_ent_status"; exit 1 ;;
+esac
+echo "    orbeat-user entitled to smoke-pin-prune ($prune2_ent_status)"
+
+# submit (boss) + approve (boss2) revision 1, already created as a draft above.
+prune2_submit1_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/submit")
+[ "$prune2_submit1_status" = "200" ] || { echo "FAIL: submit smoke-pin-prune v1 status $prune2_submit1_status"; exit 1; }
+PRUNE2_RV1=$(current_row_version "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+prune2_approve1_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_BOSS2_TOKEN" -H "If-Match: \"$PRUNE2_RV1\"" \
+  "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/approve")
+[ "$prune2_approve1_status" = "200" ] || { echo "FAIL: approve smoke-pin-prune v1 (boss2) status $prune2_approve1_status"; exit 1; }
+
+echo "==> approving smoke-pin-prune to a total of 3 (revision 1 not yet prunable at KEEP=$ORBEAT_ARTIFACT_REVISION_KEEP)"
+for i in 2 3; do
+  prune2_rv=$(current_row_version "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+  prune2_put_status=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+    -H "If-Match: \"$prune2_rv\"" \
+    -d "{\"type\":\"skill\",\"name\":\"smoke-pin-prune\",\"description\":\"d\",\"content\":\"---\nname: smoke-pin-prune\ndescription: d\n---\nPIN-PRUNE-V$i\",\"visibility\":\"role\"}" \
+    "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID")
+  [ "$prune2_put_status" = "200" ] || { echo "FAIL: edit smoke-pin-prune iteration $i status $prune2_put_status"; exit 1; }
+  prune2_submit_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer $PIN_ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/submit")
+  [ "$prune2_submit_status" = "200" ] || { echo "FAIL: submit smoke-pin-prune iteration $i status $prune2_submit_status"; exit 1; }
+  prune2_rv2=$(current_row_version "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+  prune2_approve_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer $PIN_BOSS2_TOKEN" -H "If-Match: \"$prune2_rv2\"" \
+    "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/approve")
+  [ "$prune2_approve_status" = "200" ] || { echo "FAIL: approve smoke-pin-prune iteration $i status $prune2_approve_status"; exit 1; }
+done
+PRUNE2_REV3=$(latest_revision_num "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+echo "    smoke-pin-prune approved 3 times (revisions 1..$PRUNE2_REV3, none pruned yet)"
+
+echo "==> gate 11: pin smoke-pin-prune to revision 1 while it still exists, and sync: this files a real artifact_deployment row naming revision 1"
+seed_sync_token "$SYNC_PIN"
+set +e
+prune2_pinset_out=$(HOME="$SYNC_PIN" "$SYNC_BIN/orbeat-sync" pin skill/smoke-pin-prune --revision 1 2>&1)
+prune2_pinset_rc=$?
+set -e
+[ "$prune2_pinset_rc" = "0" ] || { echo "FAIL: orbeat-sync pin skill/smoke-pin-prune --revision 1 exited $prune2_pinset_rc; output: $prune2_pinset_out"; exit 1; }
+rm -f "$SYNC_PIN/.claude/skills/smoke-pin-prune/SKILL.md"
+seed_sync_token "$SYNC_PIN"
+set +e
+g11_sync_out=$(HOME="$SYNC_PIN" "$SYNC_BIN/orbeat-sync" sync 2>&1)
+g11_sync_rc=$?
+set -e
+[ "$g11_sync_rc" = "0" ] || { echo "FAIL: the pinned sync for smoke-pin-prune exited $g11_sync_rc; output: $g11_sync_out"; exit 1; }
+grep -q 'PIN-PRUNE-V1' "$SYNC_PIN/.claude/skills/smoke-pin-prune/SKILL.md" \
+  || { echo "FAIL: smoke-pin-prune pinned to revision 1 did not serve PIN-PRUNE-V1; output: $g11_sync_out"; exit 1; }
+# THE PRECONDITION GATE 11 DEPENDS ON: the report really did land, and really
+# does name revision 1, before the prune below has any chance to touch it.
+# Asserted rather than assumed, the same discipline the identity gate's own
+# preconditions (:1324-1327) follow.
+prune2_dep_before=$(deployments_json "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+echo "$prune2_dep_before" | jq -e '.installs == 1 and .byRevision == [{"revision":1,"installs":1}]' >/dev/null \
+  || { echo "FAIL: precondition: no real artifact_deployment row names smoke-pin-prune at revision 1 before the prune; got $prune2_dep_before"; exit 1; }
+echo "    gate 11 precondition: the real client's report recorded smoke-pin-prune at revision 1 (1 install)"
+
+echo "==> gate 11: one more approval prunes revision 1 out from under that report"
+prune2_rv4=$(current_row_version "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+prune2_put4_status=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -H "If-Match: \"$prune2_rv4\"" \
+  -d '{"type":"skill","name":"smoke-pin-prune","description":"d","content":"---\nname: smoke-pin-prune\ndescription: d\n---\nPIN-PRUNE-V4","visibility":"role"}' \
+  "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID")
+[ "$prune2_put4_status" = "200" ] || { echo "FAIL: edit smoke-pin-prune iteration 4 status $prune2_put4_status"; exit 1; }
+prune2_submit4_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/submit")
+[ "$prune2_submit4_status" = "200" ] || { echo "FAIL: submit smoke-pin-prune iteration 4 status $prune2_submit4_status"; exit 1; }
+prune2_rv4b=$(current_row_version "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+prune2_approve4_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_BOSS2_TOKEN" -H "If-Match: \"$prune2_rv4b\"" \
+  "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/approve")
+[ "$prune2_approve4_status" = "200" ] || { echo "FAIL: approve smoke-pin-prune iteration 4 status $prune2_approve4_status"; exit 1; }
+
+prune2_revs4=$(curl -s -H "Authorization: Bearer $PIN_ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/revisions")
+prune2_count4=$(echo "$prune2_revs4" | jq -r '.revisions | length')
+[ "$prune2_count4" = "$ORBEAT_ARTIFACT_REVISION_KEEP" ] \
+  || { echo "FAIL: smoke-pin-prune has $prune2_count4 revisions after 4 approvals, want exactly $ORBEAT_ARTIFACT_REVISION_KEEP; got $prune2_revs4"; exit 1; }
+echo "$prune2_revs4" | jq -e '[.revisions[].revision] | index(1) == null' >/dev/null \
+  || { echo "FAIL: revision 1 survived the prune despite being referenced by a real artifact_deployment row: pruning must not consult the registry: $prune2_revs4"; exit 1; }
+echo "    gate 11: revision 1 is gone and exactly $ORBEAT_ARTIFACT_REVISION_KEEP revisions survive, even though a real deployment report names it: pruning ignores the registry"
+
+echo "==> approving smoke-pin-prune once more (5 total) to set up gate 3's pruned-pin degradation"
+prune2_rv5=$(current_row_version "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+prune2_put5_status=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -H "If-Match: \"$prune2_rv5\"" \
+  -d '{"type":"skill","name":"smoke-pin-prune","description":"d","content":"---\nname: smoke-pin-prune\ndescription: d\n---\nPIN-PRUNE-V5","visibility":"role"}' \
+  "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID")
+[ "$prune2_put5_status" = "200" ] || { echo "FAIL: edit smoke-pin-prune iteration 5 status $prune2_put5_status"; exit 1; }
+prune2_submit5_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/submit")
+[ "$prune2_submit5_status" = "200" ] || { echo "FAIL: submit smoke-pin-prune iteration 5 status $prune2_submit5_status"; exit 1; }
+prune2_rv5b=$(current_row_version "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+prune2_approve5_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $PIN_BOSS2_TOKEN" -H "If-Match: \"$prune2_rv5b\"" \
+  "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/approve")
+[ "$prune2_approve5_status" = "200" ] || { echo "FAIL: approve smoke-pin-prune iteration 5 status $prune2_approve5_status"; exit 1; }
+PRUNE2_LATEST=$(latest_revision_num "$PIN_ADMIN_TOKEN" "$PRUNE2_ID")
+PRUNE2_OLDEST=$((PRUNE2_LATEST - ORBEAT_ARTIFACT_REVISION_KEEP + 1))
+echo "    smoke-pin-prune approved 5 times total, latest=$PRUNE2_LATEST"
+
+echo "==> gate 3: the pin (still requesting revision 1, held from gate 11) now degrades to the oldest surviving revision ($PRUNE2_OLDEST), reason pruned"
+rm -f "$SYNC_PIN/.claude/skills/smoke-pin-prune/SKILL.md"
+seed_sync_token "$SYNC_PIN"
+set +e
+gate3_json=$(HOME="$SYNC_PIN" "$SYNC_BIN/orbeat-sync" sync --json 2>/dev/null)
+gate3_rc=$?
+set -e
+[ "$gate3_rc" = "0" ] || { echo "FAIL: sync under the pruned pin exited $gate3_rc (want 0); output: $gate3_json"; exit 1; }
+echo "$gate3_json" | jq -e . >/dev/null \
+  || { echo "FAIL: sync --json emitted no parseable JSON for gate 3: $gate3_json"; exit 1; }
+[ "$(echo "$gate3_json" | jq -r '.exitCode')" = "0" ] \
+  || { echo "FAIL: gate 3's .exitCode was $(echo "$gate3_json" | jq -r '.exitCode'), want 0"; exit 1; }
+# Selected by name, not asserted as the whole array: smoke-pin's own pin
+# (gate 1/2, above) is still held, and this same sync still reports its
+# floor override too, so .artifacts.pins carries two entries here.
+echo "$gate3_json" | jq -e --argjson s "$PRUNE2_OLDEST" --arg n "skill/smoke-pin-prune" \
+  '[.artifacts.pins[] | select(.name==$n)] == [{"name":$n,"requested":1,"served":$s,"reason":"pruned"}]' >/dev/null \
+  || { echo "FAIL: .artifacts.pins did not report the pruned degradation to revision $PRUNE2_OLDEST; got $gate3_json"; exit 1; }
+grep -q "PIN-PRUNE-V$PRUNE2_OLDEST" "$SYNC_PIN/.claude/skills/smoke-pin-prune/SKILL.md" \
+  || { echo "FAIL: the served bytes are not revision $PRUNE2_OLDEST's (PIN-PRUNE-V$PRUNE2_OLDEST); output: $gate3_json"; exit 1; }
+grep -q 'PIN-PRUNE-V1' "$SYNC_PIN/.claude/skills/smoke-pin-prune/SKILL.md" \
+  && { echo "FAIL: the requested-but-pruned revision 1 content is on disk, not the degraded revision"; exit 1; }
+prune2_revs_final=$(curl -s -H "Authorization: Bearer $PIN_ADMIN_TOKEN" "http://localhost:8080/v1/admin/artifacts/$PRUNE2_ID/revisions")
+echo "$prune2_revs_final" | jq -e --argjson lo "$PRUNE2_OLDEST" --argjson hi "$PRUNE2_LATEST" \
+  '([.revisions[].revision] | sort) == [$lo, ($lo+1), $hi]' >/dev/null \
+  || { echo "FAIL: the surviving revisions are not the contiguous suffix $PRUNE2_OLDEST..$PRUNE2_LATEST; got $prune2_revs_final"; exit 1; }
+echo "    gate 3: served bytes are revision $PRUNE2_OLDEST's, reason pruned, surviving revisions are the contiguous suffix $PRUNE2_OLDEST..$PRUNE2_LATEST"
+
+echo "==> SMOKE PASS: api + gateway healthy, postgres up, Keycloak auth /v1/me 200 + no-token 401, /v1/catalog 200 + no-token 401, admin CRUD + entitlement→catalog + 403 RBAC + audit pagination + audit export (json/csv/400) + structured JSON logs + audit dual-emit, gateway /mcp 401 no-token + metadata + real upstream tool round-trip (smoke-upstream__echo), portal healthz + SPA shell, marketplace artifact validated, artifact publish round-trip, sync/config 200 + no-token 401, artifact approval gate (unapproved hidden from sync, boss2 approval distributes, self-approve 403), artifact rollback (v2 approved+distributed, roll back to rev 1 restores v1 content), revision pruning gate (KEEP=$ORBEAT_ARTIFACT_REVISION_KEEP enforced end-to-end through cmd/api: $PRUNE_APPROVALS approvals on a dedicated throwaway artifact leave exactly $ORBEAT_ARTIFACT_REVISION_KEEP revisions), rule artifact gate (Phase 3 Slice B: create → submit → boss2 approve → entitled rule present in sync with type:rule + verbatim content), org-visibility rule gate (an approved rule entitled to NOBODY reaches an unentitled user on Channel 2 and lands in their AGENTS.md via the real binary, while an APPROVED org skill stays off Channel 2), per-rule project targeting gate (a rule targeted at [go] reaches only the project registered with --tag go, with an untargeted rule reaching both as the control that keeps the negative assertion honest), global-scope rule gate (a global rule lands in ~/.claude/CLAUDE.md and in no project, with the project rule still in place as the control, and a global rule carrying targetTags refused with 400), orbeat-sync BINARY gate (the real client reconciles the live stack's artifacts: rule → AGENTS.md + CLAUDE.md import with dev content preserved, file-backed subagent delivered alongside it (the v1.14.0 regression), idempotent re-sync, and the v1.15.0 partial-failure contract: a broken project exits 1 with a 'failed:' line while healthy work still lands, plus the failure-path contract (partial --json with section-pinned failures, a repaired project retried, a corrupt manifest exiting 2 before any write, an escaping path exiting 2 after the writes with the cascade stopped and JSON still emitted, and --dry-run changing nothing), and orbeat-sync doctor --json on the restored healthy tree reporting exit 0 with zero problems), artifact identity through approval (renaming an approved artifact returns 200 and DEFERS: /v1/sync/artifacts and the real orbeat-sync binary both keep delivering agents/smoke-gov.md with the approved body while the rename is unapproved, then boss2 approves and the pair flips, the client moving the file to agents/smoke-gov-renamed.md), artifact deployment registry (ORBEAT_DEPLOYMENT_REGISTRY on for this run only: G1a the real binary's report recorded 1 install at smoke-gov's own revision $GOV_REV1; G1b a report carrying revision 1 was stored as 1, not collapsed onto the latest, and an empty report cleared exactly that install; G1c approval moved latestRevision to $GOV_REV2 with the unsynced machine still at $GOV_REV1 and behindLatest 1; G1d the re-sync closed it to $GOV_REV2 with behindLatest 0; G2 a second install whose unmanaged-file collision skipped smoke-gov recorded its rule and NOT the artifact it was served; G3 the corrupt-manifest run at exit 2 filed no report and left the aggregate byte-identical; G4 revoking the grant took the row with it, 0 installs on an artifact still observable at revision $GOV_REV2), artifact version pinning (gate 1 orbeat-sync pin subagent/smoke-pin --revision 1 serves PIN-V1-BODY and not PIN-V2-BODY, then an admin floor at revision $PIN_REV2 overrides it back to PIN-V2-BODY at exit 0 with a warning naming the pin, the served revision and floor; gate 2 --json on that same floor-overridden run carries .artifacts.pins == [{requested:1, served:$PIN_REV2, reason:floor}] with process rc and .exitCode both asserted, the override standing as exactly one warning line with .artifacts.failures empty (an override is never a retryable failure); gate 11 a real artifact_deployment row filed while revision 1 still existed did not save it from the next approval's prune, which left exactly $ORBEAT_ARTIFACT_REVISION_KEEP revisions with revision 1 gone; gate 3 the same held pin degraded to the oldest surviving revision $PRUNE2_OLDEST, reason pruned, once 5 approvals left the contiguous suffix $PRUNE2_OLDEST..$PRUNE2_LATEST)"

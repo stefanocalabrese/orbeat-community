@@ -5,6 +5,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -27,5 +28,18 @@ func main() {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	log.Println("example-upstream: listening on :9000")
-	log.Fatal(http.ListenAndServe(":9000", mux))
+	// Explicit timeouts rather than http.ListenAndServe, whose zero-value
+	// Server has none: a half-open connection holds a goroutine and its
+	// buffers forever (audit B36). This is a test fixture, but it is the only
+	// server in the tree that was written without them, and a fixture is
+	// where the next person copies from.
+	httpSrv := &http.Server{
+		Addr:              ":9000",
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(httpSrv.ListenAndServe())
 }

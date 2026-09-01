@@ -75,6 +75,24 @@ test("no role-visibility artifacts: Create is disabled and an empty-state hint s
   expect(screen.getByRole("button", { name: /^create$/i })).toBeDisabled();
 });
 
+// B35: `roleArtifacts` is filtered from only the artifacts LOADED so far
+// (page 1). When more pages exist, zero role-visibility artifacts on THIS
+// page does not mean zero exist — the copy must not claim otherwise.
+test("role-visibility artifacts may exist on a later page: the hint says so instead of falsely claiming none exist at all", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+    const url = String(input);
+    if (url.includes("/v1/admin/roles")) return Promise.resolve(json({ roles: [{ id: "r1", name: "orbeat-user" }], limit: 100, nextCursor: "" }));
+    if (url.includes("/v1/admin/artifacts")) return Promise.resolve(json({ artifacts: [{ id: "a9", name: "org-only", visibility: "org", type: "skill", description: "", content: "", memoryScope: null, memorySeed: null, version: "1", status: "active" }], limit: 1, nextCursor: "cursor-2" }));
+    return Promise.resolve(json({ artifactEntitlements: [], limit: 100, nextCursor: "" }));
+  });
+  const user = userEvent.setup();
+  renderPage();
+  await user.click(await screen.findByRole("button", { name: /new entitlement/i }));
+  expect(screen.queryByText(/no role-visibility artifacts exist yet/i)).not.toBeInTheDocument();
+  expect(screen.getByText(/more artifacts exist that have not loaded yet/i)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /^create$/i })).toBeDisabled();
+});
+
 test("create posts the selected role + artifact", async () => {
   const user = userEvent.setup();
   renderPage();

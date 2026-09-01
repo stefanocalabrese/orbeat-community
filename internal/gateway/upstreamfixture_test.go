@@ -127,3 +127,50 @@ func newSSEUpstreamFixture(t *testing.T) *sseUpstreamFixture {
 func (f *sseUpstreamFixture) CloseClientConnections() {
 	f.httpSrv.CloseClientConnections()
 }
+
+// structuredEchoArgs is the structured upstream tool's typed input. Text
+// becomes the result's unstructured Content, Payload becomes the typed Out
+// value the SDK marshals into CallToolResult.StructuredContent, and MetaValue
+// (when non-empty) is attached as the result's _meta.
+type structuredEchoArgs struct {
+	Text      string `json:"text"`
+	Payload   string `json:"payload"`
+	MetaValue string `json:"metaValue"`
+}
+
+// structuredEchoOut is the structured upstream tool's typed output. The SDK's
+// generic mcp.AddTool marshals it into CallToolResult.StructuredContent
+// automatically (go-sdk mcp/server.go, "Marshal the output and put the
+// RawMessage in the StructuredContent field"), which is exactly how a
+// well-built upstream comes to carry a structuredContent field at all. Using
+// the generic AddTool rather than hand-setting the field is deliberate: the
+// fixture must reproduce the real shape, not a shape only this test can make.
+type structuredEchoOut struct {
+	Payload string `json:"payload"`
+}
+
+// newStructuredUpstreamFixture starts a Streamable-HTTP MCP upstream serving
+// one `structured_echo` tool whose result carries Content, StructuredContent
+// and _meta at once. Every other upstream fixture in this file returns Content
+// alone, so none of them can tell a result interceptor that governs the whole
+// result from one that governs only res.Content.
+func newStructuredUpstreamFixture(t *testing.T) *upstreamFixture {
+	t.Helper()
+	f := &upstreamFixture{}
+
+	srv := mcp.NewServer(&mcp.Implementation{Name: "structured-upstream", Version: "0.0.1"}, nil)
+	mcp.AddTool(srv, &mcp.Tool{Name: "structured_echo", Description: "echoes text, a structured payload and _meta"},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in structuredEchoArgs) (*mcp.CallToolResult, structuredEchoOut, error) {
+			res := &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: in.Text}}}
+			if in.MetaValue != "" {
+				res.Meta = mcp.Meta{"upstreamNote": in.MetaValue}
+			}
+			return res, structuredEchoOut{Payload: in.Payload}, nil
+		})
+
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	f.httpSrv = httptest.NewServer(mcpHandler)
+	f.URL = f.httpSrv.URL
+	t.Cleanup(f.httpSrv.Close)
+	return f
+}

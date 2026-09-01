@@ -17,13 +17,14 @@ import (
 type bucket struct {
 	lim      *rate.Limiter
 	lastUsed time.Time
-	// rejectLogged is true once a rejection for this key has already been
-	// logged in the current unbroken rejection streak (Task 7, spec §9: log
-	// at most once per key per window, not per rejection). Reset to false the
-	// moment the key is allowed again, so the NEXT streak logs once more.
-	// Piggybacks on the bucket the Limiter already keeps (bounded by ttl +
-	// maxEntries) instead of a second, separately-unbounded map.
-	rejectLogged bool
+	// lastLogged is when this key last produced a sampled rejection log line,
+	// zero if it never has (spec §9: log at most once per key per window, not
+	// per rejection). The window is wall-clock, logSampleInterval wide; see
+	// sample.go for why, and for the measurement that retired the flag this
+	// field replaced. Piggybacks on the bucket the Limiter already keeps
+	// (bounded by ttl + maxEntries) instead of a second, separately-unbounded
+	// map.
+	lastLogged time.Time
 }
 
 // Limiter maps keys to token buckets, bounded by ttl and maxEntries.
@@ -101,24 +102,34 @@ func (l *Limiter) Allow(key string) (bool, time.Duration) {
 // as possible". Deriving the hint from Reserve would charge a token for the
 // rejection itself, so a client hammering above the limit would push its own
 // recovery outward on every rejected request and never recover.
+//
+// Like ConcurrencyLimiter.Acquire, it does not participate in sampling: it
+// used to call decideAt and drop the third return, which stamped lastLogged on
+// behalf of a caller that was never going to log, silencing the next real
+// AllowAtSampled for a whole logSampleInterval. Same defect, same file pair,
+// found by grepping the class after fixing the concurrency half.
 func (l *Limiter) AllowAt(key string, now time.Time) (bool, time.Duration) {
-	allowed, retryAfter, _ := l.decideAt(key, now)
+	allowed, retryAfter, _ := l.decideAt(key, now, false)
 	return allowed, retryAfter
 }
 
 // AllowAtSampled is AllowAt plus a third return, logRejection: true only for
-// the FIRST rejection in an unbroken streak for key (Task 7, spec §9: "log at
-// most once per key per window, not per rejection"). A streak IS the window
-// here — the token bucket already guarantees no allowed request lands between
-// two rejections until the client's own rate actually drops, so "no allowed
-// call since the last log" and "still inside the same over-limit window" are
-// the same condition, with no extra wall-clock arithmetic needed.
+// the first rejection for key within logSampleInterval of the last one that
+// logged (Task 7, spec §9: "log at most once per key per window, not per
+// rejection"). The window is wall-clock, measured on the SAME now the bucket
+// decision uses, which is what makes it deterministically testable with no
+// sleeping.
+//
+// It used to be a per-streak flag any allowed request cleared, on the claim
+// that a streak IS the window. That claim was false and the sampler was
+// defeated by ordinary sustained overload; sample.go carries the measurement
+// and the replacement's reasoning.
 //
 // It delegates to the SAME locked decision as AllowAt (via decideAt) rather
 // than re-deriving allowed/retryAfter independently, so the two can never
 // disagree and a rejection is never double-charged against the bucket.
 func (l *Limiter) AllowAtSampled(key string, now time.Time) (allowed bool, retryAfter time.Duration, logRejection bool) {
-	return l.decideAt(key, now)
+	return l.decideAt(key, now, true)
 }
 
 // AllowSampled is AllowAtSampled(key, time.Now()).
@@ -129,7 +140,11 @@ func (l *Limiter) AllowSampled(key string) (bool, time.Duration, bool) {
 // decideAt is the single locked decision point AllowAt and AllowAtSampled
 // both delegate to, so their allow/reject/retryAfter outcomes can never drift
 // apart from each other.
-func (l *Limiter) decideAt(key string, now time.Time) (bool, time.Duration, bool) {
+//
+// sample tells it whether the caller will actually write the line. False means
+// the sampler is neither read nor stamped, so a non-reporting caller cannot
+// spend a reporting one's budget; see AllowAt.
+func (l *Limiter) decideAt(key string, now time.Time, sample bool) (bool, time.Duration, bool) {
 	if l.rps <= 0 {
 		return true, 0, false
 	}
@@ -146,13 +161,19 @@ func (l *Limiter) decideAt(key string, now time.Time) (bool, time.Duration, bool
 	b.lastUsed = now
 
 	if b.lim.AllowN(now, 1) {
-		// The client got through: the NEXT rejection (if any) starts a new
-		// streak and should log again.
-		b.rejectLogged = false
+		// Deliberately does NOT touch lastLogged. An admitted request is what
+		// the old flag reset, and resetting on it is exactly what let a client
+		// steadily over the limit log every rejection: rate.Limiter refills
+		// continuously, so one request in every 1/rps seconds gets through.
 		return true, 0, false
 	}
-	logRejection := !b.rejectLogged
-	b.rejectLogged = true
+	logRejection := sample && sampleLog(b.lastLogged, now)
+	if logRejection {
+		// Stamped only when a line is actually written. Stamping on every
+		// rejection would keep pushing the window out under sustained
+		// overload and silence every line after the first.
+		b.lastLogged = now
+	}
 	tokens := b.lim.TokensAt(now)
 	need := 1 - tokens
 	if need < 0 {

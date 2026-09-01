@@ -34,7 +34,7 @@ test("lists a pending artifact with findings and an Approve button", async () =>
       id: "p1", type: "skill", name: "risky", description: "d",
       content: "proposed body", memoryScope: null, memorySeed: null, version: "",
       visibility: "org", approvalState: "pending", approved: false,
-      submittedBy: "alice", rowVersion: 1,
+      submittedBy: "alice", rowVersion: 1, minRevision: 0, findingsAcknowledged: false,
       scanFindings: [{ rule: "size", message: "content exceeds 64KiB", severity: "warn" }],
     },
   ]);
@@ -49,7 +49,7 @@ test("a pending rule artifact renders a styled type chip (no undefined class)", 
       id: "r1", type: "rule", name: "org-std", description: "d",
       content: "Use tabs.", memoryScope: null, memorySeed: null, version: "",
       visibility: "role", approvalState: "pending", approved: false,
-      submittedBy: "alice", rowVersion: 1,
+      submittedBy: "alice", rowVersion: 1, minRevision: 0, findingsAcknowledged: false,
     },
   ]);
   expect(await screen.findByText("org-std")).toBeInTheDocument();
@@ -86,7 +86,7 @@ test("shows the currently-live content in the diff pane alongside the proposed c
       id: "p2", type: "skill", name: "rev", description: "d",
       content: "new proposed body", memoryScope: null, memorySeed: null, version: "",
       visibility: "org", approvalState: "pending", approved: false,
-      submittedBy: "bob", approvedContent: "old live body", rowVersion: 1,
+      submittedBy: "bob", approvedContent: "old live body", rowVersion: 1, minRevision: 0, findingsAcknowledged: false,
     },
   ]);
   expect(await screen.findByText("new proposed body")).toBeInTheDocument();

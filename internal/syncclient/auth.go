@@ -2,7 +2,6 @@ package syncclient
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -154,8 +153,8 @@ func (a *Authenticator) requestDeviceCode(ctx context.Context, endpoint string) 
 		return deviceAuthResp{}, fmt.Errorf("device authorization: status %d", resp.StatusCode)
 	}
 	var da deviceAuthResp
-	if err := json.NewDecoder(resp.Body).Decode(&da); err != nil {
-		return deviceAuthResp{}, fmt.Errorf("device authorization: decode: %w", err)
+	if err := decodeJSONCapped(resp.Body, maxJSONBodyBytes, &da); err != nil {
+		return deviceAuthResp{}, fmt.Errorf("device authorization: %w", err)
 	}
 	return da, nil
 }
@@ -172,8 +171,8 @@ func (a *Authenticator) poll(ctx context.Context, endpoint string, form url.Valu
 	}
 	defer resp.Body.Close()
 	var tr tokenResp
-	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		return tokenResp{}, resp.StatusCode, fmt.Errorf("token endpoint: decode: %w", err)
+	if err := decodeJSONCapped(resp.Body, maxJSONBodyBytes, &tr); err != nil {
+		return tokenResp{}, resp.StatusCode, fmt.Errorf("token endpoint: %w", err)
 	}
 	return tr, resp.StatusCode, nil
 }

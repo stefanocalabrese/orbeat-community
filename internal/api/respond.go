@@ -46,6 +46,34 @@ func writeLimitReached(w http.ResponseWriter, e limitError) {
 	})
 }
 
+// idpAssertionRequiredCode is the machine-readable body field the portal
+// checks to switch into the "confirm you renamed this in the identity
+// provider" checkbox flow (admin_roles.go's idpAssertionRequiredError,
+// docs/plans/orbeat-role-rename-2026-08-27.md's decision: "the portal
+// learns the mode from a 400, not a capability endpoint").
+const idpAssertionRequiredCode = "idp_rename_assertion_required"
+
+// writeIdpAssertionRequired writes idpAssertionRequiredError's 400 body: the
+// standard error envelope plus the "code" field above, the same shape
+// writeLimitReached/writeBlocked use for THEIR extra data.
+func writeIdpAssertionRequired(w http.ResponseWriter, e idpAssertionRequiredError) {
+	writeJSON(w, http.StatusBadRequest, map[string]any{
+		"error": map[string]string{"message": e.Error()},
+		"code":  idpAssertionRequiredCode,
+	})
+}
+
+// writeFindingsAckRequired writes a findingsAckRequiredError's 409 body: the
+// standard error envelope plus the "code" field naming WHICH acknowledgment
+// (author's or approver's) is missing or stale, the same shape
+// writeIdpAssertionRequired uses for the role-rename slice's own 400.
+func writeFindingsAckRequired(w http.ResponseWriter, e findingsAckRequiredError) {
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"error": map[string]string{"message": e.Error()},
+		"code":  e.code,
+	})
+}
+
 // validationError is a client-input error that maps to HTTP 400. Handlers (or
 // in-transaction closures) return it to reject a request with a clear message
 // without leaking internals.
@@ -83,11 +111,26 @@ func (e limitError) Error() string {
 // fail maps a domain or database error to an HTTP response:
 //   - preconditionRequiredError        → 428
 //   - versionMismatchError             → 412
+//   - findingsDigestMismatchError      → 412 (the acknowledge-findings endpoint's own precondition)
+//   - findingsAckRequiredError         → 409, with the machine-readable author/approverFindingsAckRequiredCode
+//   - idpAssertionRequiredError        → 400, with the machine-readable idpAssertionRequiredCode
+//   - idpUnavailableError              → 502
 //   - store.ErrNotFound                → 404
 //   - store.ErrVersionMismatch         → 412
+//   - store.ErrNameTaken               → 409
+//   - store.ErrCursorSortMismatch      → 400 (a well-formed cursor minted under a different sort)
 //   - unique_violation (pg 23505)      → 409
 //   - foreign_key_violation (pg 23503) → 400
 //   - everything else                  → 500 (internal details not leaked)
+//
+// The 23505 arm is split in two. A duplicate against
+// store.ApprovedIdentityUniqueIndex is not the duplicate an admin can see:
+// the row holding the contested identity is called something else in the
+// admin list, so "already exists" sends them looking for a name that is not
+// there. This arm is the FLOOR under that, not the whole answer. A handler
+// that knows which pair collided returns a conflictError naming it, and
+// conflictError is matched earlier in the switch, so the specific sentence
+// wins wherever one exists and every other caller still gets a true one.
 func fail(w http.ResponseWriter, err error) {
 	var pgErr *pgconn.PgError
 	var vErr validationError
@@ -96,6 +139,10 @@ func fail(w http.ResponseWriter, err error) {
 	var lErr limitError
 	var pcErr preconditionRequiredError
 	var vmErr versionMismatchError
+	var fdmErr findingsDigestMismatchError
+	var farErr findingsAckRequiredError
+	var iarErr idpAssertionRequiredError
+	var iuErr idpUnavailableError
 	switch {
 	case errors.As(err, &vErr):
 		writeError(w, http.StatusBadRequest, vErr.msg)
@@ -107,6 +154,14 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusPreconditionRequired, pcErr.msg)
 	case errors.As(err, &vmErr):
 		writeError(w, http.StatusPreconditionFailed, vmErr.msg)
+	case errors.As(err, &fdmErr):
+		writeError(w, http.StatusPreconditionFailed, fdmErr.msg)
+	case errors.As(err, &farErr):
+		writeFindingsAckRequired(w, farErr)
+	case errors.As(err, &iarErr):
+		writeIdpAssertionRequired(w, iarErr)
+	case errors.As(err, &iuErr):
+		writeError(w, http.StatusBadGateway, iuErr.msg)
 	case errors.As(err, &cErr):
 		writeError(w, http.StatusConflict, cErr.msg)
 	case errors.Is(err, store.ErrNotFound):
@@ -114,6 +169,12 @@ func fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrVersionMismatch):
 		writeError(w, http.StatusPreconditionFailed,
 			"the resource changed since you loaded it; reload and reapply your change")
+	case errors.Is(err, store.ErrNameTaken):
+		writeError(w, http.StatusConflict, "a role in this tenant already has this name")
+	case errors.Is(err, store.ErrCursorSortMismatch):
+		writeError(w, http.StatusBadRequest, "cursor does not match the requested sort")
+	case errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == store.ApprovedIdentityUniqueIndex:
+		writeError(w, http.StatusConflict, approvedIdentityTaken)
 	case errors.As(err, &pgErr) && pgErr.Code == "23505":
 		writeError(w, http.StatusConflict, "already exists")
 	case errors.As(err, &pgErr) && pgErr.Code == "23503":

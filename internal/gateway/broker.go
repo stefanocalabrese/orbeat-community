@@ -141,6 +141,39 @@ func connectUpstream(ctx context.Context, srv store.MCPServer, secret string, ca
 	client := mcp.NewClient(gatewayImplementation(), &mcp.ClientOptions{KeepAlive: keepAlive})
 	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
+		// fable-audit B38(a): owned (upstreamTransport's per-CA clone, non-nil
+		// only when srv carries a tls_ca_ref) has no owner to close it on this
+		// path -- the caller only ever receives *upstreamConn.transport on
+		// SUCCESS, and dialUpstream's dialOutcome (server.go) carries nothing
+		// for it either, so a failed client.Connect leaves owned's pooled
+		// connections with nothing that will ever call
+		// CloseIdleConnections on them.
+		//
+		// VERIFIED against go-sdk@v1.7.0's own Client.Connect (mcp/client.go):
+		// most of its failure branches already tear the connection down some
+		// other way before returning here -- a non-2xx HTTP status leaves
+		// checkResponse's response body undrained (mcp/streamable.go), which
+		// makes net/http itself discard rather than pool that connection, and
+		// every ordinary handleSend failure (a bad/unparseable body from a
+		// non-MCP server, the common case) runs cs.Close() first. The one
+		// gap actually reachable in the SDK's own source: Client.Connect's
+		// SEP-2575 discover branch can return an error AFTER a successful,
+		// fully-drained (genuinely pooled) discover round trip -- when
+		// subscriptionsListen fails -- WITHOUT ever calling cs.Close(), and
+		// that path is gated on ClientOptions.ToolListChangedHandler/
+		// PromptListChangedHandler/ResourceListChangedHandler, none of which
+		// this gateway's own mcp.NewClient call above ever sets. So this is
+		// live defensive code for the contract client.Connect actually
+		// documents ("an error leaves nothing for the caller to clean up"),
+		// not a currently-reachable leak in THIS deployment's own call
+		// shape -- and the fix is unconditionally safe either way:
+		// CloseIdleConnections is a no-op on a transport that never dialed
+		// anything, so this costs nothing on the ordinary (non-CA,
+		// owned == nil) failure path or on a connection net/http already
+		// discarded itself.
+		if owned != nil {
+			owned.CloseIdleConnections()
+		}
 		return nil, fmt.Errorf("gateway: connect upstream %s: %w", srv.Name, err)
 	}
 	return &upstreamConn{serverID: srv.ID, slug: slug, session: session, transport: owned}, nil
@@ -159,16 +192,52 @@ func defaultedSchema(s any) any {
 }
 
 // registerProxies lists the upstream's tools and registers a namespaced
-// passthrough proxy for each on gw. Returns the gateway-facing tool names.
-// Arguments and results are forwarded verbatim (raw json), preserving
-// forward-compat fields. markDirty is invoked when a proxied call hits a
-// closed upstream connection (the SDK keepalive auto-closes dead sessions),
-// flagging the owning gateway session for eviction + rebuild. tr instruments
-// each proxied call with a span (fable-audit §7 #14) — nil is tolerated (no
-// span, otherwise unchanged), matching this package's nil-safe metrics/limiter
-// fields, so a Server built as a bare struct literal without New() (several
-// existing tests) still works.
-func registerProxies(ctx context.Context, gw *mcp.Server, conn *upstreamConn, markDirty func(), tr trace.Tracer) ([]string, error) {
+// passthrough proxy for each entitled tool on gw -- entitled, not every
+// upstream tool: fable-audit B11's first half ("session build filters by
+// server visibility; per-tool AllowedTools is applied only at call time, so
+// a caller entitled to `echo` sees the `danger` tool with its full schema").
+// Session build already skipped whole SERVERS the caller cannot see
+// (buildSession's visible/candidates filter, server.go); this is the same
+// filtering one level down, per TOOL, using the exact same predicate
+// (toolCallAllowed) rbacMiddleware's own call-time check is defined in terms
+// of -- registration and per-call enforcement can never disagree, because
+// there is only ever one decision function, not two copies of it. A tool
+// this session is not entitled to is simply never added to gw, so the SDK's
+// own built-in tools/list handler cannot enumerate it and a tools/call
+// naming it fails at the SDK's own routing layer rather than reaching
+// rbacMiddleware at all -- a stronger closure than a call-time deny, and the
+// one the /v1/catalog `allowedTools` the portal already filters on is
+// supposed to agree with.
+//
+// sess == nil bypasses this filter entirely (every upstream tool is
+// registered, byte-identical to before this fix): several existing
+// broker_test.go/intercept_test.go call sites build no *session at all and
+// must see unchanged behaviour, mirroring interceptResult's own nil-safe
+// contract one field further up this file's call chain. Every real caller
+// (buildSession) always passes a live session.
+//
+// Returns the gateway-facing tool names actually registered. Arguments are
+// forwarded verbatim (raw json), preserving forward-compat fields; the whole
+// result passes through s.interceptResult (Task 3 of docs/plans/
+// orbeat-runtime-interception-2026-08-25.md) before returning to the
+// client -- see the closure below for what that does and does not
+// guarantee.
+// markDirty is invoked when a proxied call hits a closed upstream connection
+// (the SDK keepalive auto-closes dead sessions), flagging the owning gateway
+// session for eviction + rebuild. tr instruments each proxied call with a
+// span (fable-audit §7 #14) -- nil is tolerated (no span, otherwise
+// unchanged), matching this package's nil-safe metrics/limiter fields, so a
+// Server built as a bare struct literal without New() (several existing
+// tests) still works.
+//
+// s and sess thread the result-interception hook through: s.interceptResult
+// is nil-safe on a nil s (several existing broker_test.go tests call this
+// function directly with s == nil, and must see byte-identical behaviour to
+// before this task), and sess is needed only to audit a finding through
+// s.auditCallFinding (intercept.go), which -- like rbacMiddleware's own
+// audit calls -- writes through the real store, so it is never invoked when
+// s is nil or s.interceptor is unconfigured.
+func registerProxies(ctx context.Context, gw *mcp.Server, conn *upstreamConn, markDirty func(), tr trace.Tracer, s *Server, sess *session) ([]string, error) {
 	var names []string
 	// Tools follows NextCursor across every page (audit G9): a single
 	// ListTools call returns only page 1, silently dropping any tool beyond
@@ -178,6 +247,18 @@ func registerProxies(ctx context.Context, gw *mcp.Server, conn *upstreamConn, ma
 			return nil, fmt.Errorf("gateway: list upstream tools (%s): %w", conn.slug, err)
 		}
 		proxyName := Namespace(conn.slug, ut.Name)
+		if sess != nil && !toolCallAllowed(proxyName, map[string]string{conn.slug: conn.serverID}, sess.entitlements, sess.keyID, sess.keyNarrow) {
+			// Not entitled: never registered, so it never appears in
+			// tools/list and a tools/call naming it never even reaches
+			// rbacMiddleware (fable-audit B11). sess.slugToServer is not yet
+			// populated for conn's OWN slug at this point in buildSession's
+			// loop (that assignment happens only after registerProxies
+			// returns), so a one-entry map built from conn's own known
+			// (slug, serverID) is used instead of sess.slugToServer -- the
+			// same predicate toolCallAllowed always uses, just given the one
+			// fact this call site already has on hand.
+			continue
+		}
 		gw.AddTool(
 			&mcp.Tool{Name: proxyName, Description: ut.Description, InputSchema: defaultedSchema(ut.InputSchema)},
 			func(callCtx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -213,6 +294,40 @@ func registerProxies(ctx context.Context, gw *mcp.Server, conn *upstreamConn, ma
 				}
 				if errors.Is(err, mcp.ErrConnectionClosed) {
 					markDirty()
+				}
+				// Runtime call interception, RESULT direction (Task 3 of
+				// docs/plans/orbeat-runtime-interception-2026-08-25.md; the
+				// ARGUMENT direction is interceptArguments, rbac_middleware.go,
+				// which runs BEFORE this call is ever proxied to the upstream).
+				// s.interceptResult is nil-safe -- s is nil in every
+				// broker_test.go call site that doesn't exercise interception,
+				// and it is a further no-op whenever s.interceptor itself is
+				// unconfigured -- so this line changes nothing for a
+				// deployment with ORBEAT_INTERCEPT unset.
+				//
+				// IMPORTANT: a "block" finding here does NOT prevent a leak.
+				// The upstream tool has already run by the time this line
+				// executes -- if its result carries a secret, that secret has
+				// already left whatever system produced it. Withholding the
+				// result only stops the AGENT from seeing what the upstream
+				// already returned; it cannot un-send the call or un-return
+				// the response. See interceptResult's doc comment
+				// (intercept.go) and design spec §3 for the argument/result
+				// asymmetry this states plainly. Only a successful call has a
+				// result worth scanning: err != nil already carries nothing to
+				// intercept, and mutating res in that case would risk masking
+				// the real error behind unrelated content-policy noise.
+				//
+				// res is passed WHOLE and mutated in place, not res.Content in
+				// and out. That is the fix for docs/plans/orbeat-comment-sweep-
+				// fixes-2026-08-28.md Bug 1: an mcp.CallToolResult also carries
+				// StructuredContent and _meta, and while this line read
+				// "res.Content = s.interceptResult(..., res.Content)" those two
+				// were neither scanned nor withheld, so a blocked result handed
+				// the agent a refusal in "content" with the upstream's
+				// structured payload alongside it in the same response.
+				if err == nil && res != nil {
+					s.interceptResult(spanCtx, sess, proxyName, res)
 				}
 				return res, err
 			},
